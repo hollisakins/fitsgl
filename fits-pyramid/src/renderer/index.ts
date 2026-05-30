@@ -7,7 +7,7 @@
  */
 
 export { FitsViewer } from './viewer.js';
-export type { FitsViewerOptions } from './viewer.js';
+export type { FitsViewerOptions, ViewerFrameInfo } from './viewer.js';
 
 export { Camera } from './camera.js';
 export type { Point, WorldBounds } from './camera.js';

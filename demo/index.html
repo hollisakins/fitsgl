@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FITS Pyramid Viewer — demo</title>
+    <style>
+      :root {
+        --bg: #0a0c10;
+        --panel: #14181f;
+        --border: #262c36;
+        --text: #d6dbe3;
+        --muted: #8a93a3;
+        --accent: #5aa9ff;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        -webkit-font-smoothing: antialiased;
+      }
+      #app { display: flex; flex-direction: column; height: 100vh; }
+
+      #topbar, #bottombar {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 8px 14px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+      }
+      #bottombar { border-top: 1px solid var(--border); border-bottom: none; }
+
+      #title { font-weight: 600; letter-spacing: 0.02em; }
+      #title .dim { color: var(--muted); font-weight: 400; }
+
+      .field { display: flex; align-items: center; gap: 6px; }
+      .field label { color: var(--muted); }
+      .field input {
+        width: 92px;
+        padding: 4px 6px;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        font: inherit;
+      }
+      .field input:focus { outline: none; border-color: var(--accent); }
+      button {
+        padding: 4px 12px;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover { border-color: var(--accent); color: #fff; }
+      .spacer { flex: 1 1 auto; }
+      .hint { color: var(--muted); }
+
+      #stage { position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden; }
+      #view { display: block; width: 100%; height: 100%; cursor: grab; }
+      #view:active { cursor: grabbing; }
+
+      #status {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 24px;
+        color: var(--muted);
+        pointer-events: none;
+      }
+      #status.hidden { display: none; }
+      #status.error { color: #ff8a8a; }
+
+      #bottombar { color: var(--muted); flex-wrap: wrap; gap: 6px 20px; }
+      .stat { white-space: nowrap; }
+      .stat b { color: var(--text); font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <span id="title">FITS Pyramid Viewer <span class="dim">— demo</span></span>
+        <div class="field">
+          <label for="stretch-min">min</label>
+          <input id="stretch-min" type="number" step="any" inputmode="decimal" />
+        </div>
+        <div class="field">
+          <label for="stretch-max">max</label>
+          <input id="stretch-max" type="number" step="any" inputmode="decimal" />
+        </div>
+        <button id="auto-btn" title="Stretch to the 1st–99th percentile of the data in view">Auto</button>
+        <span class="spacer"></span>
+        <span class="hint">drag&nbsp;=&nbsp;pan&nbsp;·&nbsp;scroll&nbsp;=&nbsp;zoom</span>
+      </header>
+
+      <div id="stage">
+        <canvas id="view"></canvas>
+        <div id="status">loading pyramid…</div>
+      </div>
+
+      <footer id="bottombar">
+        <span class="stat">zoom <b id="stat-zoom">—</b></span>
+        <span class="stat">center <b id="stat-center">—</b></span>
+        <span class="stat">level <b id="stat-level">—</b></span>
+        <span class="stat">compression <b id="stat-compression">—</b></span>
+        <span class="stat">tiles <b id="stat-tiles">—</b></span>
+        <span class="stat">fps <b id="stat-fps">—</b></span>
+        <span class="stat">fetched <b id="stat-bytes">0 B</b></span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

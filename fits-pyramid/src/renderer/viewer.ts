@@ -15,6 +15,7 @@
 import type { TilePyramid } from '../fpack/tile-source.js';
 import type { Manifest } from '../manifest.js';
 import { Camera } from './camera.js';
+import type { WorldBounds } from './camera.js';
 import { createProgram, createUnitQuadVAO } from './gl-util.js';
 import { TILE_VERT } from './shaders/tile.vert.js';
 import { TILE_FRAG } from './shaders/tile.frag.js';
@@ -39,9 +40,48 @@ const DEFAULT_TEXTURE_BUDGET = 200;
 /** Wheel sensitivity: zoom factor per deltaY unit (exponential). */
 const WHEEL_ZOOM_RATE = 0.0015;
 
+/**
+ * Read-only viewer state reported once per drawn frame. The viewer renders on
+ * demand (not a continuous loop), so `onFrame` fires only when something
+ * actually drew — which is exactly the signal a UI needs for an FPS readout, a
+ * live zoom/level indicator, or a "stretch the visible data" action.
+ */
+export interface ViewerFrameInfo {
+  /** Monotonic frame counter (also drives the LRU/eviction clock). */
+  frame: number;
+  /** Drawing-buffer pixels per world (native) pixel. 1.0 = native. */
+  zoom: number;
+  /** World point at the centre of the viewport (native pixels). */
+  centerX: number;
+  centerY: number;
+  /** Pyramid level chosen for this frame (`targetLevel`). */
+  level: number;
+  /** World-space rectangle currently visible. */
+  bounds: WorldBounds;
+  /** Number of tiles at `level` intersecting the viewport. */
+  visibleTileCount: number;
+}
+
 export interface FitsViewerOptions {
   /** GPU texture budget in tiles (LRU by last visible frame). Default 200. */
   textureBudget?: number;
+  /**
+   * Select pyramid levels at full device-pixel resolution (one texel per
+   * drawing-buffer pixel) rather than per CSS pixel. On a HiDPI/retina display
+   * this picks a level one octave finer when zoomed out — crisper, but ~4× the
+   * tiles and bytes — matching Leaflet's `detectRetina: true`. Default `false`:
+   * levels track the *perceived* (CSS) zoom, so zooming out drops to coarser
+   * levels sooner. Either way, zooming in to native still loads z=0.
+   */
+  hiDpiLevels?: boolean;
+  /**
+   * Called at the end of every drawn frame with read-only viewer state. Use it
+   * to drive a telemetry HUD or a visible-data action. Avoid *unconditionally*
+   * mutating the viewer from here: a mutation schedules another frame, which
+   * calls `onFrame` again — an infinite render loop. Exceptions thrown by the
+   * callback are caught and logged so a buggy HUD can't halt rendering.
+   */
+  onFrame?: (info: ViewerFrameInfo) => void;
 }
 
 export class FitsViewer {
@@ -57,6 +97,10 @@ export class FitsViewer {
   private readonly maxLevel: number;
   private readonly nativeW: number;
   private readonly nativeH: number;
+  private readonly onFrame?: (info: ViewerFrameInfo) => void;
+  private readonly hiDpiLevels: boolean;
+  /** devicePixelRatio of the backing store; kept in sync by syncCanvasSize. */
+  private dpr = 1;
 
   private readonly uRect: WebGLUniformLocation | null;
   private readonly uUV: WebGLUniformLocation | null;
@@ -91,6 +135,8 @@ export class FitsViewer {
     this.nativeH = nativeH;
     this.maxLevel = this.manifest.n_levels;
     this.geoms = buildLevelGeoms(this.manifest);
+    this.onFrame = options.onFrame;
+    this.hiDpiLevels = options.hiDpiLevels ?? false;
 
     const gl = canvas.getContext('webgl2');
     if (gl === null) {
@@ -216,6 +262,7 @@ export class FitsViewer {
   private syncCanvasSize(): void {
     const dpr =
       typeof window !== 'undefined' && window.devicePixelRatio ? window.devicePixelRatio : 1;
+    this.dpr = dpr;
     const rect = this.canvas.getBoundingClientRect();
     const cssW = rect.width || this.canvas.width || 1;
     const cssH = rect.height || this.canvas.height || 1;
@@ -288,10 +335,20 @@ export class FitsViewer {
     gl.uniform1i(this.uTile, 0);
     gl.activeTexture(gl.TEXTURE0);
 
-    const level = targetLevel(this.camera.zoom, this.maxLevel);
+    const bounds = this.camera.worldBounds();
+    // Select levels by perceived (CSS) zoom by default: `camera.zoom` is
+    // drawing-buffer px per world px, so on a HiDPI display it runs `dpr`× ahead
+    // of what the user sees and would keep z=0 resident far past native. Dividing
+    // by dpr drops to coarser levels as soon as the *displayed* image shrinks
+    // below native (Leaflet's default). `hiDpiLevels` opts back into full
+    // device-pixel crispness.
+    const selectionZoom = this.hiDpiLevels ? this.camera.zoom : this.camera.zoom / this.dpr;
+    const level = targetLevel(selectionZoom, this.maxLevel);
     const geom = this.geoms.get(level);
+    let visibleTileCount = 0;
     if (geom !== undefined) {
-      const tiles = visibleTiles(geom, this.camera.worldBounds());
+      const tiles = visibleTiles(geom, bounds);
+      visibleTileCount = tiles.length;
       for (const t of tiles) {
         const rect = tileWorldRect(geom, t.tileX, t.tileY);
         const entry = this.tiles.acquire(level, t.tileX, t.tileY);
@@ -317,6 +374,23 @@ export class FitsViewer {
     }
 
     this.tiles.evict(MAX_IDLE_FRAMES);
+
+    if (this.onFrame !== undefined) {
+      try {
+        this.onFrame({
+          frame: this.frameCounter,
+          zoom: this.camera.zoom,
+          centerX: this.camera.centerX,
+          centerY: this.camera.centerY,
+          level,
+          bounds,
+          visibleTileCount,
+        });
+      } catch (err) {
+        // A telemetry callback must never be able to stop the render loop.
+        console.error('FitsViewer: onFrame callback threw:', err);
+      }
+    }
   }
 
   /** Draw a world rectangle textured by `texture` over the [u0,v0]-[u1,v1] sub-rect. */

@@ -52,6 +52,16 @@ higher z halves resolution; `manifest.n_levels` = N is the deepest z (levels
 - **Target level** (`targetLevel`): `z = clamp(round(−log2(zoom)), 0, N)`, i.e.
   `2^z ≈ 1/zoom` so one tile texel ≈ one screen pixel. Zooming out raises z
   (coarser); zooming in past native pins z=0.
+  - **DPI handling.** `targetLevel` is pure and takes whatever zoom it's given;
+    the viewer feeds it **CSS-pixel zoom** (`camera.zoom / dpr`) by default, so
+    level selection tracks the *perceived* image size, not the device backing
+    store. Without this, a HiDPI display runs `dpr`× ahead and keeps z=0 resident
+    until the image is shrunk to `~0.35×` on screen (a 170 MB z=0 level's worth of
+    tiles while zoomed out); CSS-zoom selection drops to coarser levels at
+    `~0.71×` instead — ~4× fewer tiles/bytes, with native-and-in still on z=0.
+    `FitsViewerOptions.hiDpiLevels: true` opts back into device-pixel selection
+    (crisper on retina when zoomed out, 4× the tiles) — the equivalent of
+    Leaflet's `detectRetina: true`.
 - **Visible set** (`visibleTiles`): intersect the world viewport with the level's
   imaged area `[0, W_z·2^z) × [0, H_z·2^z)`, then `floor`-divide by the world tile
   span `256·2^z`. A `−1e-6` nudge on the exclusive max edge avoids pulling in an

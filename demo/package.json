@@ -1,0 +1,22 @@
+{
+  "name": "fits-pyramid-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Vite demo that renders a Phase 1 fpacked FITS pyramid through the Phase 2/3 browser stack — for end-to-end visual verification.",
+  "scripts": {
+    "build-pyramid": "bash scripts/build-test-pyramid.sh",
+    "build-lib": "npm --prefix ../fits-pyramid run build",
+    "predev": "npm run build-lib",
+    "dev": "vite",
+    "prebuild": "npm run build-lib",
+    "build": "vite build",
+    "preview": "vite preview",
+    "pretypecheck": "npm run build-lib",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

@@ -31,4 +31,8 @@ export type { WorkerLike, WorkerReply, WorkerRequest } from './fpack/worker-prot
 
 // Phase 3 — WebGL2 viewer
 export { FitsViewer, Camera } from './renderer/index.js';
-export type { FitsViewerOptions } from './renderer/index.js';
+export type { FitsViewerOptions, ViewerFrameInfo } from './renderer/index.js';
+// Phase 3 — tile-selection helpers (for tools/demos building on the viewer).
+export { targetLevel, visibleTiles, buildLevelGeoms, TILE_SIZE } from './renderer/index.js';
+export type { TileCoord, LevelGeom, WorldRect } from './renderer/index.js';
+export type { WorldBounds } from './renderer/index.js';
