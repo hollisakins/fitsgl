@@ -1,9 +1,10 @@
 /**
- * fits-pyramid — browser-side decoder for fpacked FITS tile pyramids.
+ * fits-pyramid — browser-side decoder + renderer for fpacked FITS tile pyramids.
  *
  * Phase 2a: standalone RICE_1 decompression (`riceDecompress`, `BitReader`).
  * Phase 2b: fpack file parsing + tile fetching over HTTP range requests
  * (`TilePyramid` is the high-level API; `FpackFile`/`TileEngine` are lower-level).
+ * Phase 3: WebGL2 viewer (`FitsViewer`) with pan/zoom and linear stretch.
  */
 
 // Phase 2a — RICE
@@ -27,3 +28,7 @@ export { LRUCache } from './lru.js';
 // Phase 2b — worker
 export { attachTileWorker } from './worker.js';
 export type { WorkerLike, WorkerReply, WorkerRequest } from './fpack/worker-protocol.js';
+
+// Phase 3 — WebGL2 viewer
+export { FitsViewer, Camera } from './renderer/index.js';
+export type { FitsViewerOptions } from './renderer/index.js';

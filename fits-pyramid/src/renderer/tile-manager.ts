@@ -1,0 +1,329 @@
+/**
+ * Tile selection math + GPU texture management.
+ *
+ * The selection logic is a set of pure functions (`targetLevel`,
+ * `visibleTiles`, `coarserFallback`, `selectEvictions`, the geometry helpers) so
+ * they can be unit-tested in Node without a GL context. The `TileManager` class
+ * wires those together with the actual `WebGL2RenderingContext` and the
+ * `TilePyramid`: it requests decoded `Float32Array` tiles, uploads them as R32F
+ * textures, tracks last-visible frame for LRU eviction, and dedupes in-flight
+ * requests.
+ *
+ * Level/zoom convention (matches the Phase 1 pyramid and the manifest): z=0 is
+ * native resolution; each step up in z halves resolution. A tile (z, tx, ty)
+ * covers `256 * 2^z` world (native) pixels per side starting at
+ * `(tx, ty) * 256 * 2^z`, except high-index edge tiles, which are smaller when
+ * the level's pixel dimensions are not a multiple of 256.
+ */
+
+import type { Manifest } from '../manifest.js';
+import type { TilePyramid } from '../fpack/tile-source.js';
+import type { WorldBounds } from './camera.js';
+import { createTileTexture } from './gl-util.js';
+
+/** fpack-internal tile edge, in level pixels (every pyramid level uses 256). */
+export const TILE_SIZE = 256;
+
+export interface TileCoord {
+  level: number;
+  tileX: number;
+  tileY: number;
+}
+
+export interface WorldRect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/** Per-level geometry needed for tile<->world math. */
+export interface LevelGeom {
+  z: number;
+  /** Level image dimensions in level pixels. */
+  levelW: number;
+  levelH: number;
+  /** Tile counts along each axis. */
+  nTilesX: number;
+  nTilesY: number;
+}
+
+/** Stable cache key for a tile, matching the engine's `level/x/y` form. */
+export function tileKey(level: number, tileX: number, tileY: number): string {
+  return `${level}/${tileX}/${tileY}`;
+}
+
+/** Build a z -> LevelGeom map from the manifest's per-level shape/tile counts. */
+export function buildLevelGeoms(manifest: Manifest): Map<number, LevelGeom> {
+  const map = new Map<number, LevelGeom>();
+  for (const lvl of manifest.levels) {
+    const [levelH, levelW] = lvl.shape;
+    const [nTilesY, nTilesX] = lvl.fpack_tile_count;
+    map.set(lvl.z, { z: lvl.z, levelW, levelH, nTilesX, nTilesY });
+  }
+  return map;
+}
+
+/**
+ * Pixel dimensions of a single tile, accounting for partial high-index edge
+ * tiles (astropy stores those at their true smaller size).
+ */
+export function tilePixelDims(
+  geom: LevelGeom,
+  tileX: number,
+  tileY: number,
+): { width: number; height: number } {
+  return {
+    width: Math.min(TILE_SIZE, geom.levelW - tileX * TILE_SIZE),
+    height: Math.min(TILE_SIZE, geom.levelH - tileY * TILE_SIZE),
+  };
+}
+
+/** World-space rectangle covered by a tile (native pixels). */
+export function tileWorldRect(
+  geom: LevelGeom,
+  tileX: number,
+  tileY: number,
+): WorldRect {
+  const f = 2 ** geom.z;
+  const px1 = Math.min((tileX + 1) * TILE_SIZE, geom.levelW);
+  const py1 = Math.min((tileY + 1) * TILE_SIZE, geom.levelH);
+  return {
+    x0: tileX * TILE_SIZE * f,
+    y0: tileY * TILE_SIZE * f,
+    x1: px1 * f,
+    y1: py1 * f,
+  };
+}
+
+/**
+ * Pick the pyramid level whose one tile-pixel maps to about one screen pixel:
+ * `2^z ≈ 1 / zoom`. Rounded to the nearest level and clamped to [0, maxLevel].
+ */
+export function targetLevel(zoom: number, maxLevel: number): number {
+  if (!(zoom > 0)) return maxLevel;
+  const z = Math.round(-Math.log2(zoom));
+  return Math.max(0, Math.min(maxLevel, z));
+}
+
+/**
+ * Tiles at `level` whose world rectangles intersect the viewport bounds.
+ * Returns an empty array if the viewport does not overlap the level's imaged
+ * area at all. Tiles are returned in row-major order (y outer, x inner).
+ */
+export function visibleTiles(geom: LevelGeom, bounds: WorldBounds): TileCoord[] {
+  const f = 2 ** geom.z;
+  const span = TILE_SIZE * f; // world pixels per full tile
+  const worldW = geom.levelW * f;
+  const worldH = geom.levelH * f;
+
+  // Intersect the (possibly inverted/negative) viewport with the imaged area.
+  const minX = Math.max(0, Math.min(bounds.x0, bounds.x1));
+  const maxX = Math.min(worldW, Math.max(bounds.x0, bounds.x1));
+  const minY = Math.max(0, Math.min(bounds.y0, bounds.y1));
+  const maxY = Math.min(worldH, Math.max(bounds.y0, bounds.y1));
+  if (maxX <= minX || maxY <= minY) return [];
+
+  const tx0 = Math.max(0, Math.floor(minX / span));
+  // maxX is an exclusive edge; nudge inward so a viewport ending exactly on a
+  // tile boundary does not pull in the next (empty) tile column.
+  const tx1 = Math.min(geom.nTilesX - 1, Math.floor((maxX - 1e-6) / span));
+  const ty0 = Math.max(0, Math.floor(minY / span));
+  const ty1 = Math.min(geom.nTilesY - 1, Math.floor((maxY - 1e-6) / span));
+
+  const tiles: TileCoord[] = [];
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      tiles.push({ level: geom.z, tileX: tx, tileY: ty });
+    }
+  }
+  return tiles;
+}
+
+/**
+ * Find the finest loaded coarser ancestor of a tile for progressive-refinement
+ * fallback while the target tile is still loading. Walks up one level at a time
+ * (each level halves the tile index) and returns the first ancestor for which
+ * `isLoaded` is true, or null if none up to `maxLevel` is available.
+ */
+export function coarserFallback(
+  level: number,
+  tileX: number,
+  tileY: number,
+  maxLevel: number,
+  isLoaded: (level: number, tileX: number, tileY: number) => boolean,
+): TileCoord | null {
+  for (let cl = level + 1; cl <= maxLevel; cl++) {
+    const k = cl - level;
+    const ctx = Math.floor(tileX / 2 ** k);
+    const cty = Math.floor(tileY / 2 ** k);
+    if (isLoaded(cl, ctx, cty)) return { level: cl, tileX: ctx, tileY: cty };
+  }
+  return null;
+}
+
+/**
+ * UV sub-rectangle of an ancestor tile's texture that corresponds to a
+ * (smaller) descendant tile's world rectangle. Used to draw a coarse tile into
+ * a fine tile's screen area. (0,0) = top-left of the texture, matching the
+ * non-flipped upload in `createTileTexture`.
+ */
+export function fallbackUV(target: WorldRect, ancestor: WorldRect): [number, number, number, number] {
+  const aw = ancestor.x1 - ancestor.x0;
+  const ah = ancestor.y1 - ancestor.y0;
+  // The pyramid is built by independent per-level block-reduce with remainder
+  // trimming, so a fine level's imaged area can extend a few native pixels past a
+  // coarser ancestor's at the high edge — making (target.x1 - ancestor.x0)/aw
+  // slightly exceed 1. Clamp so the sub-rect stays inside the ancestor texture.
+  const clamp01 = (t: number): number => Math.min(1, Math.max(0, t));
+  return [
+    clamp01((target.x0 - ancestor.x0) / aw),
+    clamp01((target.y0 - ancestor.y0) / ah),
+    clamp01((target.x1 - ancestor.x0) / aw),
+    clamp01((target.y1 - ancestor.y0) / ah),
+  ];
+}
+
+export interface EvictionEntry {
+  key: string;
+  lastVisibleFrame: number;
+}
+
+/**
+ * Pure eviction policy. A tile is dropped if it has not been visible for more
+ * than `maxIdle` frames; on top of that, if more than `budget` tiles remain,
+ * the least-recently-visible survivors are dropped until the budget is met.
+ * Tiles visible on the *current* frame are never budget-evicted — otherwise a
+ * viewport needing more than `budget` tiles would drop tiles it just drew and
+ * re-upload them next frame (thrash/flicker); the budget is allowed to be
+ * temporarily exceeded instead. Returns the keys to evict.
+ */
+export function selectEvictions(
+  entries: EvictionEntry[],
+  budget: number,
+  frame: number,
+  maxIdle: number,
+): string[] {
+  const evict = new Set<string>();
+  for (const e of entries) {
+    if (frame - e.lastVisibleFrame > maxIdle) evict.add(e.key);
+  }
+  let count = entries.length - evict.size; // resident after idle eviction
+  const candidates = entries
+    .filter((e) => !evict.has(e.key) && e.lastVisibleFrame !== frame)
+    .sort((a, b) => a.lastVisibleFrame - b.lastVisibleFrame); // oldest first
+  for (let i = 0; count > budget && i < candidates.length; i++) {
+    evict.add(candidates[i].key);
+    count--;
+  }
+  return [...evict];
+}
+
+interface TileTexture {
+  texture: WebGLTexture;
+  width: number;
+  height: number;
+  lastVisibleFrame: number;
+}
+
+/**
+ * Owns the GPU-side tile textures: requests decoded tiles from the pyramid,
+ * uploads them, tracks visibility for eviction, and dedupes concurrent
+ * requests. The selection math above does the deciding; this class does the IO
+ * and GL side effects.
+ */
+export class TileManager {
+  private readonly textures = new Map<string, TileTexture>();
+  private readonly inflight = new Set<string>();
+  /** Current render frame, set by the viewer at the start of each draw. */
+  frame = 0;
+  private destroyed = false;
+
+  constructor(
+    private readonly gl: WebGL2RenderingContext,
+    private readonly pyramid: TilePyramid,
+    private readonly geoms: Map<number, LevelGeom>,
+    readonly budget: number,
+    private readonly onTileLoaded: () => void,
+  ) {}
+
+  has(level: number, tileX: number, tileY: number): boolean {
+    return this.textures.has(tileKey(level, tileX, tileY));
+  }
+
+  /** Texture for a tile, marking it visible this frame, or undefined if absent. */
+  acquire(level: number, tileX: number, tileY: number): TileTexture | undefined {
+    const entry = this.textures.get(tileKey(level, tileX, tileY));
+    if (entry !== undefined) entry.lastVisibleFrame = this.frame;
+    return entry;
+  }
+
+  /** Kick off loading a tile if not already resident or in flight. */
+  request(level: number, tileX: number, tileY: number): void {
+    const key = tileKey(level, tileX, tileY);
+    if (this.textures.has(key) || this.inflight.has(key)) return;
+    const geom = this.geoms.get(level);
+    if (geom === undefined) return;
+    this.inflight.add(key);
+    this.pyramid
+      .getTile(level, tileX, tileY)
+      .then((data) => {
+        this.inflight.delete(key);
+        if (this.destroyed) return;
+        const { width, height } = tilePixelDims(geom, tileX, tileY);
+        // Tile dims are derived from the manifest's 256-px tiling; if the decoded
+        // length disagrees (e.g. a pyramid with a non-256 fpack tile size), the
+        // R32F upload would be undersized and sample as opaque black. Skip with a
+        // warning rather than render a wrong tile.
+        if (data.length !== width * height) {
+          console.warn(
+            `TileManager: tile ${key} decoded length ${data.length} != ${width}×${height}; skipping upload`,
+          );
+          return;
+        }
+        const texture = createTileTexture(this.gl, width, height, data);
+        this.textures.set(key, {
+          texture,
+          width,
+          height,
+          lastVisibleFrame: this.frame,
+        });
+        this.onTileLoaded();
+      })
+      .catch((err: unknown) => {
+        this.inflight.delete(key);
+        if (!this.destroyed) {
+          console.warn(`TileManager: failed to load tile ${key}:`, err);
+        }
+      });
+  }
+
+  /** Evict textures no longer needed, per `selectEvictions`. */
+  evict(maxIdle: number): void {
+    if (this.textures.size === 0) return;
+    const entries: EvictionEntry[] = [];
+    for (const [key, t] of this.textures) {
+      entries.push({ key, lastVisibleFrame: t.lastVisibleFrame });
+    }
+    for (const key of selectEvictions(entries, this.budget, this.frame, maxIdle)) {
+      const t = this.textures.get(key);
+      if (t !== undefined) {
+        this.gl.deleteTexture(t.texture);
+        this.textures.delete(key);
+      }
+    }
+  }
+
+  /** Number of resident textures (diagnostics/tests). */
+  get residentCount(): number {
+    return this.textures.size;
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    for (const t of this.textures.values()) this.gl.deleteTexture(t.texture);
+    this.textures.clear();
+    this.inflight.clear();
+  }
+}

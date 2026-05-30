@@ -1,0 +1,288 @@
+import { describe, it, expect } from 'vitest';
+import type { Manifest } from '../src/manifest.js';
+import {
+  targetLevel,
+  visibleTiles,
+  coarserFallback,
+  selectEvictions,
+  buildLevelGeoms,
+  tileWorldRect,
+  tilePixelDims,
+  fallbackUV,
+  tileKey,
+  type LevelGeom,
+} from '../src/renderer/tile-manager.js';
+
+/** A LevelGeom with sensible defaults for terse test construction. */
+function geom(partial: Partial<LevelGeom> & { z: number }): LevelGeom {
+  const levelW = partial.levelW ?? 512;
+  const levelH = partial.levelH ?? 512;
+  return {
+    z: partial.z,
+    levelW,
+    levelH,
+    nTilesX: partial.nTilesX ?? Math.ceil(levelW / 256),
+    nTilesY: partial.nTilesY ?? Math.ceil(levelH / 256),
+  };
+}
+
+describe('targetLevel', () => {
+  it('picks the level whose tile pixel ~ one screen pixel (2^z ~ 1/zoom)', () => {
+    const maxLevel = 4;
+    expect(targetLevel(1, maxLevel)).toBe(0); // native
+    expect(targetLevel(2, maxLevel)).toBe(0); // zoomed in -> still finest
+    expect(targetLevel(0.5, maxLevel)).toBe(1);
+    expect(targetLevel(0.25, maxLevel)).toBe(2);
+    expect(targetLevel(0.4, maxLevel)).toBe(1); // round(1.32) = 1
+    expect(targetLevel(0.1, maxLevel)).toBe(3); // round(3.32) = 3
+  });
+
+  it('clamps to [0, maxLevel]', () => {
+    expect(targetLevel(10, 4)).toBe(0);
+    expect(targetLevel(0.001, 4)).toBe(4);
+    expect(targetLevel(0, 4)).toBe(4);
+  });
+});
+
+describe('visibleTiles', () => {
+  const g = geom({ z: 0, levelW: 512, levelH: 512 }); // 2x2 tiles, span 256
+
+  it('returns all tiles when the viewport covers the whole image', () => {
+    const tiles = visibleTiles(g, { x0: 0, y0: 0, x1: 512, y1: 512 });
+    expect(tiles.map((t) => `${t.tileX},${t.tileY}`)).toEqual(['0,0', '1,0', '0,1', '1,1']);
+  });
+
+  it('returns a single tile for a sub-tile viewport', () => {
+    const tiles = visibleTiles(g, { x0: 10, y0: 10, x1: 200, y1: 200 });
+    expect(tiles).toEqual([{ level: 0, tileX: 0, tileY: 0 }]);
+  });
+
+  it('does not pull in the next tile when the viewport ends on a boundary', () => {
+    const tiles = visibleTiles(g, { x0: 0, y0: 0, x1: 256, y1: 256 });
+    expect(tiles).toEqual([{ level: 0, tileX: 0, tileY: 0 }]);
+  });
+
+  it('selects the far tile for a high-index viewport', () => {
+    const tiles = visibleTiles(g, { x0: 300, y0: 300, x1: 500, y1: 500 });
+    expect(tiles).toEqual([{ level: 0, tileX: 1, tileY: 1 }]);
+  });
+
+  it('clips a viewport that extends past the image to in-range tiles', () => {
+    const tiles = visibleTiles(g, { x0: -100, y0: -100, x1: 100, y1: 100 });
+    expect(tiles).toEqual([{ level: 0, tileX: 0, tileY: 0 }]);
+  });
+
+  it('returns nothing when the viewport does not overlap the imaged area', () => {
+    expect(visibleTiles(g, { x0: 600, y0: 600, x1: 800, y1: 800 })).toEqual([]);
+  });
+
+  it('works at a coarse level where one tile spans many world pixels', () => {
+    const g2 = geom({ z: 2, levelW: 128, levelH: 128, nTilesX: 1, nTilesY: 1 });
+    // span = 256 * 4 = 1024 world px; the single tile covers [0,512) (128*4).
+    const tiles = visibleTiles(g2, { x0: 0, y0: 0, x1: 512, y1: 512 });
+    expect(tiles).toEqual([{ level: 2, tileX: 0, tileY: 0 }]);
+  });
+
+  // A level whose pixel dims are not a multiple of 256: tile (1,1) is a partial
+  // edge tile covering world [256,300), so the imaged area stops at 300 even
+  // though a full second tile column would reach 512. This exercises the
+  // worldW/worldH clamp (which is a no-op on clean 2x2 levels).
+  const gPartial = geom({ z: 0, levelW: 300, levelH: 300, nTilesX: 2, nTilesY: 2 });
+
+  it('still selects a partial high-index edge tile that the viewport overlaps', () => {
+    const tiles = visibleTiles(gPartial, { x0: 260, y0: 260, x1: 280, y1: 280 });
+    expect(tiles).toEqual([{ level: 0, tileX: 1, tileY: 1 }]);
+  });
+
+  it('returns nothing for a viewport past the imaged area of a partial level', () => {
+    // [305,320] is beyond the 300-px imaged width; a regression clamping to
+    // nTilesX*span (=512) instead of worldW (=300) would wrongly return tile 1.
+    expect(visibleTiles(gPartial, { x0: 305, y0: 305, x1: 320, y1: 320 })).toEqual([]);
+  });
+});
+
+describe('tile <-> world geometry', () => {
+  it('computes full-tile world rects at native resolution', () => {
+    const g = geom({ z: 0, levelW: 512, levelH: 512 });
+    expect(tileWorldRect(g, 0, 0)).toEqual({ x0: 0, y0: 0, x1: 256, y1: 256 });
+    expect(tileWorldRect(g, 1, 1)).toEqual({ x0: 256, y0: 256, x1: 512, y1: 512 });
+  });
+
+  it('shrinks partial high-index edge tiles', () => {
+    const g = geom({ z: 0, levelW: 300, levelH: 300, nTilesX: 2, nTilesY: 2 });
+    expect(tilePixelDims(g, 1, 1)).toEqual({ width: 44, height: 44 });
+    expect(tileWorldRect(g, 1, 1)).toEqual({ x0: 256, y0: 256, x1: 300, y1: 300 });
+  });
+
+  it('a coarse level still spans the full native width', () => {
+    // 300px native -> z=1 image is 150px; one tile, covering world [0,300).
+    const g = geom({ z: 1, levelW: 150, levelH: 150, nTilesX: 1, nTilesY: 1 });
+    expect(tileWorldRect(g, 0, 0)).toEqual({ x0: 0, y0: 0, x1: 300, y1: 300 });
+  });
+
+  it('fallbackUV maps a fine tile into its ancestor texture sub-rect', () => {
+    const fine = { x0: 256, y0: 0, x1: 512, y1: 256 }; // z=0 tile (1,0)
+    const coarse = { x0: 0, y0: 0, x1: 512, y1: 512 }; // z=1 tile (0,0) covering it
+    expect(fallbackUV(fine, coarse)).toEqual([0.5, 0, 1, 0.5]);
+  });
+
+  it('fallbackUV subtracts the ancestor origin (non-origin ancestor)', () => {
+    // Ancestor not at (0,0): a regression dropping the `- ancestor.x0` term would
+    // give garbage (e.g. 300/256 ≈ 1.17) instead of these offsets.
+    const fine = { x0: 300, y0: 300, x1: 400, y1: 400 };
+    const ancestor = { x0: 256, y0: 256, x1: 512, y1: 512 };
+    expect(fallbackUV(fine, ancestor)).toEqual([0.171875, 0.171875, 0.5625, 0.5625]);
+  });
+
+  it('fallbackUV clamps to [0,1] when a fine edge tile overruns its ancestor', () => {
+    // Trimmed pyramid: fine level reaches world 1500, ancestor only 1496.
+    const fine = { x0: 1024, y0: 1024, x1: 1500, y1: 1500 };
+    const ancestor = { x0: 0, y0: 0, x1: 1496, y1: 1496 };
+    const [u0, v0, u1, v1] = fallbackUV(fine, ancestor);
+    expect(u1).toBe(1);
+    expect(v1).toBe(1);
+    expect(u0).toBeCloseTo(1024 / 1496, 9);
+    expect(v0).toBeCloseTo(1024 / 1496, 9);
+  });
+});
+
+describe('coarserFallback', () => {
+  const maxLevel = 4;
+
+  it('returns the finest loaded ancestor', () => {
+    const loaded = new Set([tileKey(1, 2, 1), tileKey(2, 1, 0)]);
+    const fb = coarserFallback(0, 5, 3, maxLevel, (l, x, y) => loaded.has(tileKey(l, x, y)));
+    // level 1 ancestor of (0,5,3) is (1, 2, 1) -> loaded, and it is the finest.
+    expect(fb).toEqual({ level: 1, tileX: 2, tileY: 1 });
+  });
+
+  it('skips unloaded ancestors and returns a coarser one', () => {
+    const loaded = new Set([tileKey(2, 1, 0)]);
+    const fb = coarserFallback(0, 5, 3, maxLevel, (l, x, y) => loaded.has(tileKey(l, x, y)));
+    expect(fb).toEqual({ level: 2, tileX: 1, tileY: 0 });
+  });
+
+  it('returns null when no ancestor is loaded', () => {
+    const fb = coarserFallback(0, 5, 3, maxLevel, () => false);
+    expect(fb).toBeNull();
+  });
+
+  it('returns null at the coarsest level (no ancestors exist)', () => {
+    const fb = coarserFallback(maxLevel, 0, 0, maxLevel, () => true);
+    expect(fb).toBeNull();
+  });
+});
+
+describe('selectEvictions', () => {
+  it('evicts tiles idle for more than maxIdle frames', () => {
+    const entries = [
+      { key: 'a', lastVisibleFrame: 100 },
+      { key: 'b', lastVisibleFrame: 30 }, // 100 - 30 = 70 > 60
+      { key: 'c', lastVisibleFrame: 45 }, // 100 - 45 = 55 <= 60
+    ];
+    expect(selectEvictions(entries, 1000, 100, 60).sort()).toEqual(['b']);
+  });
+
+  it('keeps a tile idle for exactly maxIdle frames, evicts at maxIdle+1', () => {
+    // Strict `>`: diff == maxIdle survives, diff == maxIdle+1 is evicted. Guards
+    // against a `>` -> `>=` off-by-one at the threshold.
+    const entries = [
+      { key: 'boundary', lastVisibleFrame: 40 }, // 100 - 40 = 60 == maxIdle -> keep
+      { key: 'past', lastVisibleFrame: 39 }, // 100 - 39 = 61 > maxIdle -> evict
+    ];
+    expect(selectEvictions(entries, 1000, 100, 60)).toEqual(['past']);
+  });
+
+  it('evicts least-recently-visible survivors past the budget, oldest first', () => {
+    // Keys ordered so recency (oldest first) is the REVERSE of alphabetical, so a
+    // regression evicting by insertion/alphabetical order instead of recency is
+    // caught: the two OLDEST (z@1, y@2) must be dropped, not a@9/b@8.
+    const entries = [
+      { key: 'a', lastVisibleFrame: 9 },
+      { key: 'b', lastVisibleFrame: 8 },
+      { key: 'y', lastVisibleFrame: 2 },
+      { key: 'z', lastVisibleFrame: 1 },
+    ];
+    expect(selectEvictions(entries, 2, 10, 60).sort()).toEqual(['y', 'z']);
+  });
+
+  it('never budget-evicts tiles visible on the current frame (no thrash)', () => {
+    // All four were drawn this frame (lastVisibleFrame === frame). Even though the
+    // budget is 2, none may be evicted — dropping a just-drawn tile would force an
+    // immediate re-upload next frame.
+    const entries = [
+      { key: 'a', lastVisibleFrame: 10 },
+      { key: 'b', lastVisibleFrame: 10 },
+      { key: 'c', lastVisibleFrame: 10 },
+      { key: 'd', lastVisibleFrame: 10 },
+    ];
+    expect(selectEvictions(entries, 2, 10, 60)).toEqual([]);
+  });
+
+  it('budget-evicts only stale tiles, sparing this-frame ones even over budget', () => {
+    const entries = [
+      { key: 'cur1', lastVisibleFrame: 20 }, // current frame -> protected
+      { key: 'cur2', lastVisibleFrame: 20 }, // current frame -> protected
+      { key: 'old1', lastVisibleFrame: 5 }, // stale, oldest -> evicted first
+      { key: 'old2', lastVisibleFrame: 6 }, // stale
+    ];
+    // budget 2, 4 resident -> drop 2 stale, oldest first.
+    expect(selectEvictions(entries, 2, 20, 60).sort()).toEqual(['old1', 'old2']);
+  });
+
+  it('combines idle + budget eviction without double-counting', () => {
+    const entries = [
+      { key: 'old', lastVisibleFrame: 0 }, // idle: 200 - 0 > 60
+      { key: 'p', lastVisibleFrame: 190 },
+      { key: 'q', lastVisibleFrame: 191 },
+      { key: 'r', lastVisibleFrame: 192 },
+    ];
+    // 'old' is idle-evicted; of the 3 survivors, budget 2 drops the oldest ('p').
+    expect(selectEvictions(entries, 2, 200, 60).sort()).toEqual(['old', 'p']);
+  });
+
+  it('evicts nothing when under budget and all recently visible', () => {
+    const entries = [
+      { key: 'a', lastVisibleFrame: 10 },
+      { key: 'b', lastVisibleFrame: 11 },
+    ];
+    expect(selectEvictions(entries, 200, 12, 60)).toEqual([]);
+  });
+});
+
+describe('buildLevelGeoms', () => {
+  it('derives per-level geometry from a manifest', () => {
+    const manifest: Manifest = {
+      version: 1,
+      source_file: 'm.fits',
+      native_shape: [512, 512],
+      fpack_tile_size: 256,
+      n_levels: 1,
+      levels: [
+        {
+          z: 0,
+          filename: 'm_z0.fits.fz',
+          compression: 'GZIP_2',
+          lossless: true,
+          shape: [512, 512],
+          fpack_tile_count: [2, 2],
+          pixel_scale_arcsec: 0.03,
+          wcs: {},
+        },
+        {
+          z: 1,
+          filename: 'm_z1.fits.fz',
+          compression: 'RICE_1',
+          lossless: false,
+          shape: [256, 256],
+          fpack_tile_count: [1, 1],
+          pixel_scale_arcsec: 0.06,
+          wcs: {},
+        },
+      ],
+    };
+    const geoms = buildLevelGeoms(manifest);
+    expect(geoms.get(0)).toEqual({ z: 0, levelW: 512, levelH: 512, nTilesX: 2, nTilesY: 2 });
+    expect(geoms.get(1)).toEqual({ z: 1, levelW: 256, levelH: 256, nTilesX: 1, nTilesY: 1 });
+  });
+});
