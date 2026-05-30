@@ -1,0 +1,383 @@
+"""Main pyramid-building pipeline.
+
+Converts a single FITS mosaic into an N+1 level pyramid of independently
+fpacked FITS files (astropy ``CompImageHDU``), one file per resolution level:
+
+- z=0   GZIP_2, quantization disabled -> LOSSLESS science-distribution product.
+- z>=1  RICE_1, quantize_level=16     -> lossy visualization tiles.
+
+Every level shares a 256x256 fpack-internal tile size. Each file is written and
+then read back to verify the pixels round-trip (exactly at z=0, within the
+quantization tolerance at z>0); a failed round-trip raises rather than emitting
+broken output.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import warnings
+from dataclasses import dataclass
+from multiprocessing import Pool
+from pathlib import Path
+
+import numpy as np
+from astropy.io import fits
+from astropy.nddata import block_reduce
+from astropy.wcs import WCS
+from astropy.wcs.utils import proj_plane_pixel_scales
+
+from .manifest import LevelInfo, Manifest, write_manifest
+
+#: fpack-internal tile size; the unit of HTTP byte ranges the browser requests.
+FPACK_TILE_SIZE = 256
+
+#: Default lossy quantization for z>0 RICE_1 levels.
+DEFAULT_QUANTIZE_LEVEL = 16
+
+#: GZIP_2 quantizes floats by default (quantize_level=16); setting it to 0
+#: disables quantization, which is what makes the z=0 product truly lossless.
+LOSSLESS_QUANTIZE_LEVEL = 0
+
+
+class StopAndAsk(Exception):
+    """Raised for inputs the spec says to stop and ask a human about.
+
+    Covers multiple ambiguous image HDUs, non-2D data, and SIP/TPV distortion
+    polynomials -- cases where silently guessing would risk a wrong science
+    product.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# Geometry helpers
+# --------------------------------------------------------------------------- #
+def n_levels(shape: tuple[int, int], tile_size: int = FPACK_TILE_SIZE) -> int:
+    """Number of downsampled levels N (so the pyramid has N+1 levels, z=0..N).
+
+    N = ceil(log2(max(image_dims) / tile_size)), clamped at 0 so an image that
+    already fits within a single tile produces just z=0.
+    """
+    maxdim = max(shape)
+    if maxdim <= tile_size:
+        return 0
+    return int(math.ceil(math.log2(maxdim / tile_size)))
+
+
+def _downsample(data: np.ndarray, factor: int) -> np.ndarray:
+    """Block-average by an integer factor, ignoring NaNs.
+
+    ``block_reduce`` trims any non-divisible remainder from the end of each
+    axis, which keeps the corner-origin WCS valid. Fully-NaN blocks reduce to
+    NaN (the expected RuntimeWarning is suppressed).
+    """
+    if factor == 1:
+        return np.asarray(data, dtype=np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        reduced = block_reduce(data, factor, func=np.nanmean)
+    return reduced.astype(np.float32)
+
+
+def _scale_wcs(wcs: WCS, factor: int) -> WCS:
+    """Scale a WCS for an image downsampled by ``factor``.
+
+    The pixel-scale matrix (CD if present, else CDELT) is multiplied by
+    ``factor``. CRPIX uses the exact block-average mapping
+
+        CRPIX_new = CRPIX_old / factor + (factor - 1) / (2 * factor)
+
+    rather than the naive ``CRPIX_old / factor``. The naive form leaves a
+    half-pixel astrometric offset (~0.06" for a 4x downsample at 0.03"/px); the
+    correction makes the center of downsampled pixel (0,0) land exactly on the
+    center of the native block it averages.
+    """
+    w = wcs.deepcopy()
+    if wcs.wcs.has_cd():
+        w.wcs.cd = wcs.wcs.cd * factor
+    else:
+        w.wcs.cdelt = wcs.wcs.cdelt * factor
+    w.wcs.crpix = wcs.wcs.crpix / factor + (factor - 1) / (2.0 * factor)
+    return w
+
+
+def _pixel_scale_arcsec(wcs: WCS) -> float:
+    """Mean pixel scale in arcsec/pixel from the WCS."""
+    scales = proj_plane_pixel_scales(wcs)  # degrees/pixel per axis
+    return float(np.mean(scales) * 3600.0)
+
+
+def _tile_count(shape: tuple[int, int], tile_size: int) -> list[int]:
+    """[n_tiles_y, n_tiles_x] for a given image shape and tile size."""
+    h, w = shape
+    return [math.ceil(h / tile_size), math.ceil(w / tile_size)]
+
+
+# --------------------------------------------------------------------------- #
+# Round-trip verification
+# --------------------------------------------------------------------------- #
+def estimate_noise(data: np.ndarray) -> float:
+    """Robust noise estimate (MAD-scaled) over finite pixels.
+
+    Used both to set the q>0 round-trip tolerance and by tests. MAD is robust
+    to the bright sources that would inflate a plain standard deviation.
+    """
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return 0.0
+    med = np.median(finite)
+    mad = np.median(np.abs(finite - med))
+    return float(1.4826 * mad)
+
+
+def quant_atol(data: np.ndarray) -> float:
+    """Absolute tolerance for a q=16 RICE round-trip.
+
+    The quantization step is ~noise_sigma/16, so the per-pixel error is well
+    under noise_sigma. We use one noise_sigma as a safe upper bound that still
+    flags gross corruption (which would be many sigma). A small floor handles
+    degenerate noiseless inputs.
+    """
+    sigma = estimate_noise(data)
+    return max(sigma, 1e-6)
+
+
+def _verify_roundtrip(original: np.ndarray, readback: np.ndarray, z: int) -> None:
+    """Verify a written level reads back correctly; raise if not.
+
+    NaN masks must match exactly on both compression paths. Finite pixels must
+    match exactly at z=0 (lossless guarantee) and within the q=16 tolerance at
+    z>0.
+    """
+    if not np.array_equal(np.isnan(original), np.isnan(readback)):
+        raise RuntimeError(
+            f"z={z}: NaN mask changed on round-trip (NaN handling broken)"
+        )
+    finite = np.isfinite(original)
+    if z == 0:
+        if not np.array_equal(original[finite], readback[finite]):
+            raise RuntimeError(
+                "z=0: GZIP_2 round-trip is not lossless -- "
+                "quantization is not disabled (expected quantize_level=0)"
+            )
+    else:
+        atol = quant_atol(original)
+        if not np.allclose(original[finite], readback[finite], rtol=0.0, atol=atol):
+            max_err = float(np.max(np.abs(original[finite] - readback[finite])))
+            raise RuntimeError(
+                f"z={z}: lossy round-trip exceeded tolerance "
+                f"(max_err={max_err:.6g} > atol={atol:.6g})"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Input reading / validation
+# --------------------------------------------------------------------------- #
+def _has_distortion(header: fits.Header, wcs: WCS) -> bool:
+    """Detect SIP or TPV distortion polynomials in the WCS."""
+    if wcs.sip is not None:
+        return True
+    for key in ("CTYPE1", "CTYPE2"):
+        val = str(header.get(key, ""))
+        if "-SIP" in val or "-TPV" in val:
+            return True
+    # TPV / distortion-paper coefficients.
+    if wcs.cpdis1 is not None or wcs.cpdis2 is not None:
+        return True
+    return False
+
+
+def _read_input(input_path: Path) -> tuple[np.ndarray, fits.Header]:
+    """Read and validate the input mosaic, returning (data, header).
+
+    Raises StopAndAsk for the ambiguous cases the spec defers to a human:
+    multiple image HDUs, non-2D data, or SIP/TPV distortion.
+    """
+    with fits.open(input_path) as hdul:
+        image_hdus = [
+            i
+            for i, hdu in enumerate(hdul)
+            if getattr(hdu, "data", None) is not None and hdu.data.ndim >= 2
+        ]
+        if not image_hdus:
+            raise StopAndAsk(f"{input_path}: no image data found in any HDU")
+        # Count genuinely-2D image HDUs to detect ambiguity.
+        two_d = [i for i in image_hdus if hdul[i].data.ndim == 2]
+        if len(two_d) > 1:
+            raise StopAndAsk(
+                f"{input_path}: multiple 2D image HDUs {two_d}; unclear which to "
+                "tile -- stop and ask which HDU is the science mosaic"
+            )
+        idx = two_d[0] if two_d else image_hdus[0]
+        data = np.asarray(hdul[idx].data)
+        header = hdul[idx].header.copy()
+
+    if data.ndim != 2:
+        raise StopAndAsk(
+            f"{input_path}: image HDU is {data.ndim}-D; only 2D mosaics are "
+            "supported -- stop and ask how to reduce it to 2D"
+        )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wcs = WCS(header)
+    if _has_distortion(header, wcs):
+        raise StopAndAsk(
+            f"{input_path}: WCS contains SIP/TPV distortion polynomials, which "
+            "this pipeline does not yet rescale -- stop and ask how to handle "
+            "distortion under downsampling"
+        )
+
+    # CompImageHDU works in native float; ensure a float dtype for downsampling
+    # and NaN handling.
+    if not np.issubdtype(data.dtype, np.floating):
+        data = data.astype(np.float32)
+    return data, header
+
+
+# --------------------------------------------------------------------------- #
+# Per-level worker (module-level so it is picklable for multiprocessing)
+# --------------------------------------------------------------------------- #
+@dataclass
+class _LevelTask:
+    z: int
+    factor: int
+    out_path: str
+    filename: str
+    tile_size: int
+    quantize_level: int
+    data: np.ndarray
+    header: fits.Header
+
+
+def _build_level(task: _LevelTask) -> dict:
+    """Build, write, and verify a single pyramid level. Returns a LevelInfo dict."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        native_wcs = WCS(task.header)
+
+    level = _downsample(task.data, task.factor)
+    level_wcs = _scale_wcs(native_wcs, task.factor)
+    level_header = level_wcs.to_header(relax=True)
+
+    if task.z == 0:
+        compression_type = "GZIP_2"
+        quantize_level = LOSSLESS_QUANTIZE_LEVEL
+        lossless = True
+    else:
+        compression_type = "RICE_1"
+        quantize_level = task.quantize_level
+        lossless = False
+
+    hdu = fits.CompImageHDU(
+        data=level,
+        header=level_header,
+        compression_type=compression_type,
+        tile_shape=(task.tile_size, task.tile_size),
+        quantize_level=quantize_level,
+    )
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(task.out_path, overwrite=True)
+
+    # Read back and verify before declaring the level good.
+    with fits.open(task.out_path) as hdul:
+        readback = np.asarray(hdul[1].data)
+    _verify_roundtrip(level, readback, task.z)
+
+    # Read the ACTUAL compression keyword so the manifest hint can never drift
+    # from the file. ZCMPTYPE lives in the compressed bintable header.
+    with fits.open(task.out_path, disable_image_compression=True) as hdul:
+        zcmptype = str(hdul[1].header["ZCMPTYPE"])
+
+    level_info = LevelInfo(
+        z=task.z,
+        filename=task.filename,
+        compression=zcmptype,
+        lossless=lossless,
+        shape=[int(level.shape[0]), int(level.shape[1])],
+        fpack_tile_count=_tile_count(level.shape, task.tile_size),
+        pixel_scale_arcsec=_pixel_scale_arcsec(level_wcs),
+        wcs={k: level_header[k] for k in level_header},
+    )
+    return level_info.to_dict()
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+def build_pyramid(
+    input_path: str | Path,
+    output_dir: str | Path | None = None,
+    *,
+    tile_size: int = FPACK_TILE_SIZE,
+    quantize_level: int = DEFAULT_QUANTIZE_LEVEL,
+    processes: int | None = None,
+) -> Manifest:
+    """Build a multi-resolution fpacked pyramid from one FITS mosaic.
+
+    Parameters
+    ----------
+    input_path
+        Path to the source FITS mosaic.
+    output_dir
+        Output directory. Defaults to ``<input_stem>_pyramid/`` beside the input.
+    tile_size
+        fpack-internal tile size (default 256).
+    quantize_level
+        RICE_1 quantization for z>0 levels (default 16). z=0 is always lossless.
+    processes
+        Worker process count. Defaults to one per level (capped at cpu count).
+
+    Returns
+    -------
+    Manifest
+        The written manifest, also serialized to ``output_dir/manifest.json``.
+    """
+    input_path = Path(input_path)
+    data, header = _read_input(input_path)
+
+    stem = input_path.stem
+    if output_dir is None:
+        output_dir = input_path.parent / f"{stem}_pyramid"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    N = n_levels(data.shape, tile_size)
+
+    tasks = []
+    for z in range(N + 1):
+        filename = f"{stem}_z{z}.fits.fz"
+        tasks.append(
+            _LevelTask(
+                z=z,
+                factor=2**z,
+                out_path=str(output_dir / filename),
+                filename=filename,
+                tile_size=tile_size,
+                quantize_level=quantize_level,
+                data=data,
+                header=header,
+            )
+        )
+
+    # One process per level -- CompImageHDU writing is not thread-safe within a
+    # level, and levels are fully independent, so process-per-level is the clean
+    # parallel unit. Single level -> run inline to avoid Pool overhead.
+    if len(tasks) == 1:
+        level_dicts = [_build_level(tasks[0])]
+    else:
+        n_proc = processes or min(len(tasks), os.cpu_count() or 1)
+        with Pool(processes=n_proc) as pool:
+            level_dicts = pool.map(_build_level, tasks)
+
+    levels = [LevelInfo.from_dict(d) for d in level_dicts]
+    levels.sort(key=lambda lvl: lvl.z)
+
+    manifest = Manifest(
+        source_file=input_path.name,
+        native_shape=[int(data.shape[0]), int(data.shape[1])],
+        fpack_tile_size=tile_size,
+        n_levels=N,
+        levels=levels,
+    )
+    write_manifest(output_dir / "manifest.json", manifest)
+    return manifest
