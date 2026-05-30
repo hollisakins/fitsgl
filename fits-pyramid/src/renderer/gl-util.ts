@@ -111,3 +111,30 @@ export function createTileTexture(
   gl.bindTexture(gl.TEXTURE_2D, null);
   return texture;
 }
+
+/**
+ * Upload a 1-D colormap LUT as a `size × 1` RGBA8 texture with LINEAR filtering
+ * and clamp-to-edge wrapping. Unlike the R32F tile textures, RGBA8 *is*
+ * filterable, so LINEAR gives a smooth gradient between the (typically 256) LUT
+ * entries — sampled in the fragment shader at `vec2(s, 0.5)`. `rgba` must be
+ * exactly `size * 4` bytes.
+ */
+export function createColormapTexture(
+  gl: WebGL2RenderingContext,
+  size: number,
+  rgba: Uint8Array,
+): WebGLTexture {
+  if (rgba.length !== size * 4) {
+    throw new Error(`gl-util: colormap LUT length ${rgba.length} != ${size}×4`);
+  }
+  const texture = gl.createTexture();
+  if (texture === null) throw new Error('gl-util: createTexture returned null');
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, size, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  return texture;
+}

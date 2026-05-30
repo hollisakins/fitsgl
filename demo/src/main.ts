@@ -71,6 +71,8 @@ async function main(): Promise<void> {
       minInput: el<HTMLInputElement>('stretch-min'),
       maxInput: el<HTMLInputElement>('stretch-max'),
       autoButton: el<HTMLButtonElement>('auto-btn'),
+      stretchSelect: el<HTMLSelectElement>('stretch-mode'),
+      colormapSelect: el<HTMLSelectElement>('colormap'),
       statZoom: el('stat-zoom'),
       statCenter: el('stat-center'),
       statLevel: el('stat-level'),

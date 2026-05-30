@@ -39,8 +39,7 @@
 
       .field { display: flex; align-items: center; gap: 6px; }
       .field label { color: var(--muted); }
-      .field input {
-        width: 92px;
+      .field input, .field select {
         padding: 4px 6px;
         background: var(--bg);
         color: var(--text);
@@ -48,7 +47,9 @@
         border-radius: 4px;
         font: inherit;
       }
-      .field input:focus { outline: none; border-color: var(--accent); }
+      .field input { width: 92px; }
+      .field select { cursor: pointer; }
+      .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
       button {
         padding: 4px 12px;
         background: var(--bg);
@@ -98,6 +99,14 @@
           <input id="stretch-max" type="number" step="any" inputmode="decimal" />
         </div>
         <button id="auto-btn" title="Stretch to the 1st–99th percentile of the data in view">Auto</button>
+        <div class="field">
+          <label for="stretch-mode">stretch</label>
+          <select id="stretch-mode" title="Display transfer curve"></select>
+        </div>
+        <div class="field">
+          <label for="colormap">cmap</label>
+          <select id="colormap" title="Single-band colormap"></select>
+        </div>
         <span class="spacer"></span>
         <span class="hint">drag&nbsp;=&nbsp;pan&nbsp;·&nbsp;scroll&nbsp;=&nbsp;zoom</span>
       </header>

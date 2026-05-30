@@ -36,3 +36,9 @@ export type { FitsViewerOptions, ViewerFrameInfo } from './renderer/index.js';
 export { targetLevel, visibleTiles, buildLevelGeoms, TILE_SIZE } from './renderer/index.js';
 export type { TileCoord, LevelGeom, WorldRect } from './renderer/index.js';
 export type { WorldBounds } from './renderer/index.js';
+
+// M1 — display modes: stretch curves + bundled colormaps (single-band).
+export { STRETCH_MODES, isStretchMode } from './renderer/index.js';
+export type { StretchMode } from './renderer/index.js';
+export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './renderer/index.js';
+export type { ColormapName, ColormapLUT } from './renderer/index.js';

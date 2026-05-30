@@ -16,9 +16,11 @@ import type { TilePyramid } from '../fpack/tile-source.js';
 import type { Manifest } from '../manifest.js';
 import { Camera } from './camera.js';
 import type { WorldBounds } from './camera.js';
-import { createProgram, createUnitQuadVAO } from './gl-util.js';
+import { createColormapTexture, createProgram, createUnitQuadVAO } from './gl-util.js';
 import { TILE_VERT } from './shaders/tile.vert.js';
 import { TILE_FRAG } from './shaders/tile.frag.js';
+import { STRETCH_MODE_IDS, type StretchMode } from './stretch.js';
+import { resolveColormap, type ColormapLUT, type ColormapName } from './colormaps.js';
 import {
   TileManager,
   buildLevelGeoms,
@@ -107,9 +109,16 @@ export class FitsViewer {
   private readonly uMin: WebGLUniformLocation | null;
   private readonly uMax: WebGLUniformLocation | null;
   private readonly uTile: WebGLUniformLocation | null;
+  private readonly uMode: WebGLUniformLocation | null;
+  private readonly uStretchMode: WebGLUniformLocation | null;
+  private readonly uUseColormap: WebGLUniformLocation | null;
+  private readonly uColormap: WebGLUniformLocation | null;
 
   private stretchMin = 0;
   private stretchMax = 1;
+  private stretchMode: StretchMode = 'linear';
+  /** Single-band colormap LUT (texture unit 1), or null for grayscale. */
+  private colormapTexture: WebGLTexture | null = null;
   private frameCounter = 0;
   private renderScheduled = false;
   private destroyed = false;
@@ -155,6 +164,10 @@ export class FitsViewer {
     this.uMin = gl.getUniformLocation(this.program, 'u_min');
     this.uMax = gl.getUniformLocation(this.program, 'u_max');
     this.uTile = gl.getUniformLocation(this.program, 'u_tile');
+    this.uMode = gl.getUniformLocation(this.program, 'u_mode');
+    this.uStretchMode = gl.getUniformLocation(this.program, 'u_stretchMode');
+    this.uUseColormap = gl.getUniformLocation(this.program, 'u_useColormap');
+    this.uColormap = gl.getUniformLocation(this.program, 'u_colormap');
 
     this.camera = new Camera(Math.max(1, canvas.width), Math.max(1, canvas.height));
     this.tiles = new TileManager(
@@ -214,6 +227,39 @@ export class FitsViewer {
     this.requestRender();
   }
 
+  /** Select the display transfer curve (`'linear'` | `'log'` | `'asinh'`). */
+  setStretchMode(mode: StretchMode): void {
+    this.stretchMode = mode;
+    this.requestRender();
+  }
+
+  /**
+   * Set the single-band colormap: a bundled palette name (e.g. `'viridis'`), a
+   * raw `Uint8Array` of N×3 RGB bytes, or `null`/`'gray'` for the built-in
+   * grayscale path (no LUT). The post-stretch [0,1] scalar is mapped through it;
+   * the underlying data is never refetched.
+   */
+  setColormap(spec: ColormapName | ColormapLUT | null): void {
+    // 'gray' is the grayscale fast path (no LUT texture), same as null/default.
+    if (spec === null || spec === 'gray') {
+      this.clearColormapTexture();
+      this.requestRender();
+      return;
+    }
+    const { rgba, size } = resolveColormap(spec);
+    const next = createColormapTexture(this.gl, size, rgba);
+    this.clearColormapTexture();
+    this.colormapTexture = next;
+    this.requestRender();
+  }
+
+  private clearColormapTexture(): void {
+    if (this.colormapTexture !== null) {
+      this.gl.deleteTexture(this.colormapTexture);
+      this.colormapTexture = null;
+    }
+  }
+
   setCenter(x: number, y: number): void {
     this.camera.centerX = x;
     this.camera.centerY = y;
@@ -238,6 +284,7 @@ export class FitsViewer {
     this.destroyed = true;
     this.detachHandlers();
     this.tiles.destroy();
+    this.clearColormapTexture();
     this.gl.deleteProgram(this.program);
     this.gl.deleteVertexArray(this.vao);
     this.gl.deleteBuffer(this.quadBuffer); // deleteVertexArray does not free it
@@ -330,8 +377,19 @@ export class FitsViewer {
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
+    gl.uniform1i(this.uMode, 0); // single-band (RGB composite is the M4 slot)
+    gl.uniform1i(this.uStretchMode, STRETCH_MODE_IDS[this.stretchMode]);
     gl.uniform1f(this.uMin, this.stretchMin);
     gl.uniform1f(this.uMax, this.stretchMax);
+    // Colormap LUT lives on texture unit 1; tiles bind to unit 0 in drawTile.
+    if (this.colormapTexture !== null) {
+      gl.uniform1i(this.uUseColormap, 1);
+      gl.uniform1i(this.uColormap, 1);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.colormapTexture);
+    } else {
+      gl.uniform1i(this.uUseColormap, 0);
+    }
     gl.uniform1i(this.uTile, 0);
     gl.activeTexture(gl.TEXTURE0);
 

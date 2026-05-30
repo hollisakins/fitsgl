@@ -12,6 +12,12 @@ export type { FitsViewerOptions, ViewerFrameInfo } from './viewer.js';
 export { Camera } from './camera.js';
 export type { Point, WorldBounds } from './camera.js';
 
+// Display modes (M1): stretch curves + bundled colormaps for single-band view.
+export { STRETCH_MODES, isStretchMode } from './stretch.js';
+export type { StretchMode } from './stretch.js';
+export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './colormaps.js';
+export type { ColormapName, ColormapLUT } from './colormaps.js';
+
 export {
   TileManager,
   targetLevel,

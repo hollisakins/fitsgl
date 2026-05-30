@@ -12,9 +12,13 @@
 import {
   buildLevelGeoms,
   visibleTiles,
+  COLORMAP_NAMES,
+  STRETCH_MODES,
+  type ColormapName,
   type FitsViewer,
   type LevelGeom,
   type Manifest,
+  type StretchMode,
   type TilePyramid,
   type ViewerFrameInfo,
 } from 'fits-pyramid';
@@ -23,6 +27,8 @@ export interface ControlsElements {
   minInput: HTMLInputElement;
   maxInput: HTMLInputElement;
   autoButton: HTMLButtonElement;
+  stretchSelect: HTMLSelectElement;
+  colormapSelect: HTMLSelectElement;
   statZoom: HTMLElement;
   statCenter: HTMLElement;
   statLevel: HTMLElement;
@@ -60,6 +66,18 @@ export class DemoControls {
     const applyStretch = (): void => this.applyManualStretch();
     this.el.minInput.addEventListener('input', applyStretch);
     this.el.maxInput.addEventListener('input', applyStretch);
+
+    // Populate the stretch + colormap pickers from the library's own lists so
+    // they stay in sync with what the core actually supports.
+    populateSelect(this.el.stretchSelect, STRETCH_MODES, 'linear');
+    populateSelect(this.el.colormapSelect, COLORMAP_NAMES, 'gray');
+    this.el.stretchSelect.addEventListener('change', () => {
+      this.viewer?.setStretchMode(this.el.stretchSelect.value as StretchMode);
+    });
+    this.el.colormapSelect.addEventListener('change', () => {
+      // 'gray' is the built-in grayscale path; any other name uploads a LUT.
+      this.viewer?.setColormap(this.el.colormapSelect.value as ColormapName);
+    });
 
     // Repaint the HUD a few times a second so FPS decays to "idle" and the
     // byte counter keeps ticking even between rendered frames.
@@ -201,6 +219,19 @@ export function percentileRange(
   const hi = at(pHi);
   if (!(hi > lo)) return null;
   return [lo, hi];
+}
+
+/** Fill a <select> with `options`, selecting `selected`. */
+function populateSelect(select: HTMLSelectElement, options: readonly string[], selected: string): void {
+  select.replaceChildren(
+    ...options.map((name) => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      if (name === selected) opt.selected = true;
+      return opt;
+    }),
+  );
 }
 
 function formatStretch(v: number): string {
