@@ -11,8 +11,38 @@
  * Phase 2b tests.
  */
 
-import { FitsViewer, TilePyramid, httpRangeFetch, type RangeFetcher } from 'fits-pyramid';
+import {
+  FitsViewer,
+  TilePyramid,
+  httpRangeFetch,
+  parseCatalogCSV,
+  formatRA,
+  formatDec,
+  type MarkerInput,
+  type RangeFetcher,
+  type ResolvedMarker,
+} from 'fits-pyramid';
 import { DemoControls } from './controls.js';
+
+/** Load the optional overlay catalog served beside the manifest (empty if absent). */
+async function loadCatalog(baseUrl: string): Promise<MarkerInput[]> {
+  try {
+    const res = await fetch(new URL('pyramid/catalog.csv', baseUrl).href);
+    if (!res.ok) return [];
+    return parseCatalogCSV(await res.text());
+  } catch {
+    return [];
+  }
+}
+
+/** Tooltip text for a hovered marker: id, sky position, and flux if present. */
+function markerTooltip(m: ResolvedMarker): string {
+  const lines = [m.id];
+  if (m.ra !== null && m.dec !== null) lines.push(`${formatRA(m.ra)} ${formatDec(m.dec)}`);
+  const flux = m.data.flux;
+  if (typeof flux === 'number') lines.push(`flux ${flux.toFixed(2)}`);
+  return lines.join('\n');
+}
 
 // Client-side cache sizes. Two layers protect against re-work when you pan back
 // onto a tile (see notes/phase4.md "Reducing fetched bytes"):
@@ -74,6 +104,7 @@ async function main(): Promise<void> {
       stretchSelect: el<HTMLSelectElement>('stretch-mode'),
       colormapSelect: el<HTMLSelectElement>('colormap'),
       northUpCheckbox: el<HTMLInputElement>('northup'),
+      markersCheckbox: el<HTMLInputElement>('markers'),
       statZoom: el('stat-zoom'),
       statRaDec: el('stat-radec'),
       statCenter: el('stat-center'),
@@ -93,10 +124,22 @@ async function main(): Promise<void> {
     textureBudget: GPU_TEXTURE_BUDGET,
     onFrame: (info) => controls.handleFrame(info),
     onCursor: (info) => controls.handleCursor(info),
+    markerTooltip,
+    onMarkerClick: (e) => {
+      const sky = e.marker.ra !== null && e.marker.dec !== null
+        ? ` @ ${formatRA(e.marker.ra)} ${formatDec(e.marker.dec)}`
+        : '';
+      // eslint-disable-next-line no-console
+      console.log(`clicked marker ${e.marker.id}${sky}`, e.marker.data);
+    },
   });
   controls.setViewer(viewer);
 
   status.classList.add('hidden');
+
+  // Load the optional overlay catalog and hand it to the controls (which toggle
+  // it via the "markers" checkbox). Non-fatal if absent.
+  controls.setCatalog(await loadCatalog(document.baseURI));
 
   // Tidy teardown so GL resources, the inline engine, and the HUD timer are
   // released on navigation (beforeunload) and on Vite hot-module replacement

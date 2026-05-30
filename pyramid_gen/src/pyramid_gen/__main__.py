@@ -21,14 +21,26 @@ from .build_pyramid import (
 )
 
 
-def _write_synthetic(path: Path) -> None:
-    """Write a synthetic test mosaic to ``path`` (helper for kicking the tires)."""
+def _write_synthetic(path: Path):
+    """Write a synthetic test mosaic to ``path``; return its source catalog.
+
+    The catalog is written into the pyramid's output directory by ``main`` after
+    the build (see below), so the overlay demo/SSG can serve a `catalog.csv`.
+    """
     from astropy.io import fits
 
     from .synthetic import generate_synthetic_mosaic
 
-    image, header, _catalog = generate_synthetic_mosaic()
+    image, header, catalog = generate_synthetic_mosaic()
     fits.PrimaryHDU(data=image, header=header).writeto(path, overwrite=True)
+    return catalog
+
+
+def _resolve_output_dir(input_path: Path, output_dir: Path | None) -> Path:
+    """The directory ``build_pyramid`` will write to (mirrors its default)."""
+    if output_dir is not None:
+        return output_dir
+    return input_path.parent / f"{input_path.stem}_pyramid"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,8 +95,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     inputs = list(args.inputs)
+    synthetic_catalog = None
     if args.synthetic is not None:
-        _write_synthetic(args.synthetic)
+        synthetic_catalog = _write_synthetic(args.synthetic)
         print(f"wrote synthetic mosaic -> {args.synthetic}")
         inputs.append(args.synthetic)
 
@@ -101,10 +114,11 @@ def main(argv: list[str] | None = None) -> int:
 
     rc = 0
     for inp in inputs:
+        out_dir = _resolve_output_dir(inp, args.output_dir)
         try:
             manifest = build_pyramid(
                 inp,
-                output_dir=args.output_dir,
+                output_dir=out_dir,
                 tile_size=args.tile_size,
                 quantize_level=args.quantize_level,
                 processes=args.processes,
@@ -131,6 +145,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"{lvl.pixel_scale_arcsec:.4f}\"/px  "
                 f"tiles={lvl.fpack_tile_count[0]}x{lvl.fpack_tile_count[1]}"
             )
+
+        # For the synthetic input, drop its source catalog next to the manifest so
+        # the overlay demo/SSG can serve it. No multiprocessing here (the build is
+        # done), so this is safe even under a `python -` stdin context.
+        if synthetic_catalog is not None and inp == args.synthetic:
+            from .catalog import write_catalog_csv
+
+            cat_path = write_catalog_csv(synthetic_catalog, out_dir / "catalog.csv")
+            print(f"  wrote catalog -> {cat_path}")
     return rc
 
 

@@ -53,8 +53,10 @@ else
   "$PY" - "$INPUT" "$SIZE" "${SOURCES:-}" <<'PY'
 import os
 import sys
+from pathlib import Path
 from astropy.io import fits
 from pyramid_gen.synthetic import generate_synthetic_mosaic
+from pyramid_gen.catalog import write_catalog_csv
 
 out = sys.argv[1]
 size = int(sys.argv[2])
@@ -65,14 +67,20 @@ default_sources = max(50, round(50 * (size / 512) ** 2))
 sources = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else default_sources
 # Roll the WCS so the client's North-up rendering visibly rotates the field.
 rotation = float(os.environ.get("ROTATE", "30"))
-image, header, _catalog = generate_synthetic_mosaic(
+image, header, catalog = generate_synthetic_mosaic(
     shape=(size, size), n_sources=sources, rotation_deg=rotation
 )
 fits.PrimaryHDU(data=image, header=header).writeto(out, overwrite=True)
+# Emit the overlay catalog here (no multiprocessing in this stdin context, so it
+# is safe) for the demo to show markers; the pyramid build runs separately below.
+write_catalog_csv(catalog, Path(out).with_name("catalog.csv"))
 print(f"  wrote {image.shape[1]}x{image.shape[0]} {image.dtype} mosaic, {sources} sources, roll {rotation}°")
 PY
   echo "==> building pyramid"
   "$PY" -m pyramid_gen "$INPUT" -o "$OUT_DIR"
+  # Serve the catalog next to the manifest so the demo overlay can fetch it.
+  cp "$(dirname "$INPUT")/catalog.csv" "$OUT_DIR/catalog.csv"
+  echo "==> copied catalog.csv into $OUT_DIR"
 fi
 
 echo "==> done:"

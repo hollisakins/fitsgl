@@ -27,12 +27,25 @@ import {
   northUpOrientation,
   orientedImageSpan,
   panCenter,
+  projectWorldToNdc,
   viewportWorldAABB,
-  worldToScreen,
   screenToWorld,
   type Mat2,
 } from './view-transform.js';
 import { parseWcs, pixToSky, type TanWcs } from '../wcs/tan.js';
+import {
+  MarkerStore,
+  type MarkerEvent,
+  type MarkerHandlers,
+  type MarkerInput,
+  type MarkerPatch,
+  type ResolvedMarker,
+} from '../overlay/markers.js';
+import { packInstances, packOne } from '../overlay/pack.js';
+import { GridIndex } from '../overlay/spatial-index.js';
+import { broadPhaseWorldRadius, pickMarker, wasClick } from '../overlay/hit-test.js';
+import { OverlayRenderer } from '../overlay/overlay-renderer.js';
+import { OverlayPopup } from '../overlay/popup.js';
 import {
   TileManager,
   buildLevelGeoms,
@@ -88,6 +101,9 @@ export interface CursorInfo {
   dec: number | null;
   /** Whether the cursor is within the image's pixel bounds. */
   insideImage: boolean;
+  /** The topmost marker under the cursor, or null. Correlates the sky readout
+   *  with the overlay hit-test in one event (decision D10). */
+  marker: ResolvedMarker | null;
 }
 
 export interface FitsViewerOptions {
@@ -119,11 +135,29 @@ export interface FitsViewerOptions {
   northUp?: boolean;
   /**
    * Called on cursor movement over the canvas with the world/sky position under
-   * the pointer, and with `null` when the cursor leaves. Drives a live RA/Dec
-   * readout. Independent of North-up: the world->sky mapping is the same whether
-   * or not the display is rotated.
+   * the pointer (and the topmost marker, if any), and with `null` when the cursor
+   * leaves. Drives a live RA/Dec readout. Independent of North-up: the world->sky
+   * mapping is the same whether or not the display is rotated. Coalesced to one
+   * call per animation frame.
    */
   onCursor?: (info: CursorInfo | null) => void;
+  /**
+   * Overlay marker click handler (decision D10). Fires on a non-drag left click
+   * over a marker. Settable after construction via `setMarkerHandlers`.
+   */
+  onMarkerClick?: (e: MarkerEvent) => void;
+  /**
+   * Overlay marker hover handler: fires when the topmost marker under the pointer
+   * *changes* (with the marker, or null on leave). Independent of `onCursor`, so a
+   * host wanting only marker events need not also take the RA/Dec readout.
+   */
+  onMarkerHover?: (e: MarkerEvent | null) => void;
+  /**
+   * Tooltip content for the built-in popup: called with the hovered marker;
+   * return a string (set as text), an `HTMLElement` (rich content), or null to
+   * show nothing. The viewer owns one reused popup element.
+   */
+  markerTooltip?: (m: ResolvedMarker) => string | HTMLElement | null;
 }
 
 export class FitsViewer {
@@ -172,6 +206,22 @@ export class FitsViewer {
 
   private readonly onCursor?: (info: CursorInfo | null) => void;
 
+  // ---- overlay (M3, decision D10) ----------------------------------------
+  private readonly overlay: OverlayRenderer;
+  private readonly markers = new MarkerStore();
+  private grid = new GridIndex([]);
+  private readonly popup: OverlayPopup;
+  private markerHandlers: MarkerHandlers;
+  /** Latest un-processed pointer sample; picking is coalesced to one rAF. */
+  private pendingPointer: { bufX: number; bufY: number; cssX: number; cssY: number; event: MouseEvent } | null = null;
+  private pointerScheduled = false;
+  private pointerRaf = 0;
+  /** Id of the marker currently hovered, so onMarkerHover fires only on change. */
+  private hoveredId: string | null = null;
+  /** Left-button press position (buffer px), for click-vs-drag discrimination. */
+  private pressX = 0;
+  private pressY = 0;
+
   private frameCounter = 0;
   private renderScheduled = false;
   private destroyed = false;
@@ -185,11 +235,12 @@ export class FitsViewer {
   // Bound handlers, retained so destroy() can detach exactly what it attached.
   private readonly onMouseDown: (e: MouseEvent) => void;
   private readonly onMouseMove: (e: MouseEvent) => void;
-  private readonly onMouseUp: () => void;
+  private readonly onMouseUp: (e: MouseEvent) => void;
   private readonly onWheel: (e: WheelEvent) => void;
   private readonly onCanvasMove: (e: MouseEvent) => void;
   private readonly onCanvasLeave: () => void;
   private readonly frame: () => void;
+  private readonly pointerFrame: () => void;
 
   constructor(canvas: HTMLCanvasElement, pyramid: TilePyramid, options: FitsViewerOptions = {}) {
     this.canvas = canvas;
@@ -212,7 +263,11 @@ export class FitsViewer {
       this.wcs !== null ? northUpOrientation(this.wcs, nativeW / 2, nativeH / 2) : IDENTITY_MAT2;
     this.northUpEnabled = (options.northUp ?? true) && this.wcs !== null;
 
-    const gl = canvas.getContext('webgl2');
+    // `alpha: false`: the viewer fully paints the canvas (opaque clear + tiles),
+    // so an opaque drawing buffer is correct and avoids the page-composite halo
+    // that a premultiplied-alpha context would show where the marker AA fringe
+    // drops the framebuffer alpha below 1.
+    const gl = canvas.getContext('webgl2', { alpha: false });
     if (gl === null) {
       throw new Error(
         'FitsViewer: WebGL2 is not available (canvas.getContext("webgl2") returned null).',
@@ -246,6 +301,16 @@ export class FitsViewer {
       () => this.requestRender(),
     );
 
+    // Overlay subsystem (M3): the instanced marker renderer + a reused DOM popup.
+    // The marker store/grid stay empty until the host adds markers.
+    this.overlay = new OverlayRenderer(gl);
+    this.popup = new OverlayPopup();
+    this.markerHandlers = {
+      onMarkerClick: options.onMarkerClick,
+      onMarkerHover: options.onMarkerHover,
+      markerTooltip: options.markerTooltip,
+    };
+
     gl.clearColor(0, 0, 0, 1);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -254,6 +319,10 @@ export class FitsViewer {
       this.renderScheduled = false;
       if (!this.destroyed) this.draw();
     };
+    this.pointerFrame = () => {
+      this.pointerScheduled = false;
+      if (!this.destroyed) this.processPointer();
+    };
 
     this.onMouseDown = (e) => {
       if (e.button !== 0) return;
@@ -261,6 +330,9 @@ export class FitsViewer {
       const p = this.toBufferCoords(e);
       this.lastDragX = p.x;
       this.lastDragY = p.y;
+      // Remember the press for click-vs-drag discrimination on mouseup.
+      this.pressX = p.x;
+      this.pressY = p.y;
     };
     this.onMouseMove = (e) => {
       if (!this.dragging) return;
@@ -274,8 +346,22 @@ export class FitsViewer {
       this.lastDragY = p.y;
       this.requestRender();
     };
-    this.onMouseUp = () => {
+    this.onMouseUp = (e) => {
+      // `dragging` is set only by a press that began on the canvas, so it gates
+      // out a window mouseup whose mousedown landed elsewhere (which would reuse
+      // a stale press position and could spuriously fire onMarkerClick).
+      const pressedOnCanvas = this.dragging;
       this.dragging = false;
+      if (e.button !== 0 || !pressedOnCanvas) return;
+      const onClick = this.markerHandlers.onMarkerClick;
+      if (onClick === undefined) return;
+      const p = this.toBufferCoords(e);
+      // Only a press+release that didn't travel (a click, not a pan) can hit a
+      // marker — using mousedown/up rather than the DOM `click`, which can't see
+      // the drag distance.
+      if (!wasClick(this.pressX, this.pressY, p.x, p.y, this.dpr)) return;
+      const marker = this.hitTest(p.x, p.y);
+      if (marker !== null) onClick(this.buildMarkerEvent(marker, e));
     };
     this.onWheel = (e) => {
       e.preventDefault();
@@ -291,12 +377,25 @@ export class FitsViewer {
       this.requestRender();
     };
     this.onCanvasMove = (e) => {
-      if (this.onCursor === undefined) return;
-      const p = this.toBufferCoords(e);
-      this.reportCursor(p.x, p.y);
+      // Run when the host wants the cursor readout OR marker hover/tooltip — not
+      // coupled to onCursor alone (so a markers-only host still gets hover).
+      if (!this.pointerInterest()) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const cssX = e.clientX - rect.left;
+      const cssY = e.clientY - rect.top;
+      this.pendingPointer = {
+        bufX: cssX * (this.canvas.width / (rect.width || 1)),
+        bufY: cssY * (this.canvas.height / (rect.height || 1)),
+        cssX,
+        cssY,
+        event: e,
+      };
+      this.schedulePointer();
     };
     this.onCanvasLeave = () => {
+      this.pendingPointer = null;
       this.onCursor?.(null);
+      this.clearHoverState();
     };
 
     this.syncCanvasSize();
@@ -364,6 +463,77 @@ export class FitsViewer {
     return this.northUpEnabled;
   }
 
+  // ---- overlay markers (M3, decision D10) --------------------------------
+
+  /**
+   * Add markers, returning the resolved id of each input in order (auto-filled
+   * where omitted). Sky (`ra`/`dec`) markers require a usable WCS at construction
+   * — a marker that cannot be placed is dropped (its id is still returned, but a
+   * later `updateMarker`/`removeMarker` on it is a no-op). Throws on a duplicate id.
+   */
+  addMarkers(markers: MarkerInput[]): string[] {
+    const ids = this.markers.add(markers, this.wcs);
+    this.rebuildGrid();
+    this.rebuildOverlayBuffer();
+    this.requestRender();
+    return ids;
+  }
+
+  /** Replace all markers (clear + add). Returns the new ids. */
+  setMarkers(markers: MarkerInput[]): string[] {
+    const ids = this.markers.replace(markers, this.wcs);
+    this.clearHoverState(); // the hovered marker may no longer exist
+    this.rebuildGrid();
+    this.rebuildOverlayBuffer();
+    this.requestRender();
+    return ids;
+  }
+
+  /**
+   * Patch one marker by id (style, position, or data). Returns whether the id
+   * existed. A style-only change is O(1) — a single instance slot re-uploaded; a
+   * position change additionally rebuilds the hit-test grid.
+   */
+  updateMarker(id: string, patch: MarkerPatch): boolean {
+    const res = this.markers.update(id, patch, this.wcs);
+    if (res === null) return false;
+    const marker = this.markers.at(res.index);
+    if (marker !== undefined) this.overlay.updateInstance(res.index, packOne(marker));
+    if (res.positionChanged) this.rebuildGrid();
+    this.requestRender();
+    return true;
+  }
+
+  /** Remove one marker by id. Returns whether it existed. */
+  removeMarker(id: string): boolean {
+    if (!this.markers.remove(id)) return false;
+    if (this.hoveredId === id) this.clearHoverState();
+    this.rebuildGrid();
+    this.rebuildOverlayBuffer();
+    this.requestRender();
+    return true;
+  }
+
+  /** Remove all markers. */
+  clearMarkers(): void {
+    if (this.markers.count === 0) return;
+    this.markers.clear();
+    this.clearHoverState();
+    this.rebuildGrid();
+    this.rebuildOverlayBuffer();
+    this.requestRender();
+  }
+
+  /**
+   * Set the overlay interaction handlers (click / hover / tooltip), replacing any
+   * previously set. A React wrapper can call this each render with fresh closures
+   * without rebuilding the viewer; omit a field to disable it.
+   */
+  setMarkerHandlers(handlers: MarkerHandlers): void {
+    this.markerHandlers = handlers;
+    if (handlers.markerTooltip === undefined) this.popup.hide();
+  }
+
   /** The orientation matrix to apply this frame (identity when North-up is off). */
   private currentOrientation(): Mat2 {
     return this.northUpEnabled && this.wcs !== null ? this.northUpMatrix : IDENTITY_MAT2;
@@ -391,9 +561,12 @@ export class FitsViewer {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.pointerScheduled) cancelAnimationFrame(this.pointerRaf);
     this.detachHandlers();
     this.tiles.destroy();
     this.clearColormapTexture();
+    this.overlay.destroy(); // marker program, VAO, instance + quad buffers
+    this.popup.destroy(); // remove the popup DOM node
     this.gl.deleteProgram(this.program);
     this.gl.deleteVertexArray(this.vao);
     this.gl.deleteBuffer(this.quadBuffer); // deleteVertexArray does not free it
@@ -563,6 +736,20 @@ export class FitsViewer {
 
     this.tiles.evict(MAX_IDLE_FRAMES);
 
+    // Markers draw on top of the tiles, sharing the oriented transform so they
+    // stay registered under pan/zoom and North-up (decision D10). The marker pass
+    // binds its own program/VAO; the next frame's tile pass rebinds the tile
+    // program/VAO at the top of draw().
+    this.overlay.draw({
+      centerX: this.camera.centerX,
+      centerY: this.camera.centerY,
+      zoom: this.camera.zoom,
+      viewportWidth: this.canvas.width,
+      viewportHeight: this.canvas.height,
+      orient,
+      pixelRatio: this.dpr,
+    });
+
     if (this.onFrame !== undefined) {
       try {
         this.onFrame({
@@ -611,19 +798,53 @@ export class FitsViewer {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  /** World pixel -> NDC, through the oriented view transform then the y-up flip. */
+  /**
+   * World pixel -> NDC. Delegates to the pure `projectWorldToNdc` (the single
+   * source of truth the marker vertex shader transcribes). `camera.viewportWidth/
+   * Height` equal `canvas.width/height` — `syncCanvasSize` keeps them in sync — so
+   * this is identical to dividing by the canvas backing-store size.
+   */
   private worldToNdc(orient: Mat2, worldX: number, worldY: number): { x: number; y: number } {
-    const s = worldToScreen(this.camera, orient, worldX, worldY);
-    return {
-      x: (s.x / this.canvas.width) * 2 - 1,
-      y: 1 - (s.y / this.canvas.height) * 2,
-    };
+    return projectWorldToNdc(this.camera, orient, worldX, worldY);
   }
 
-  /** Compute and emit the cursor's world/sky position from drawing-buffer coords. */
-  private reportCursor(bufX: number, bufY: number): void {
-    if (this.onCursor === undefined) return;
-    const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
+  /** Whether any pointer-driven callback is registered (cursor readout or hover). */
+  private pointerInterest(): boolean {
+    return (
+      this.onCursor !== undefined ||
+      this.markerHandlers.onMarkerHover !== undefined ||
+      this.markerHandlers.markerTooltip !== undefined
+    );
+  }
+
+  private schedulePointer(): void {
+    if (this.destroyed || this.pointerScheduled) return;
+    this.pointerScheduled = true;
+    this.pointerRaf = requestAnimationFrame(this.pointerFrame);
+  }
+
+  /**
+   * Topmost marker under a drawing-buffer point, or null. Broad phase: the
+   * world-space grid (radius from the largest glyph, dpr-corrected). Narrow phase:
+   * the exact screen-space per-glyph test in `pickMarker`. Picking cost scales
+   * with candidates near the cursor, which the grid keeps small for typical
+   * marker sizes.
+   */
+  private hitTest(bufX: number, bufY: number): ResolvedMarker | null {
+    if (this.markers.count === 0) return null;
+    const orient = this.currentOrientation();
+    const world = screenToWorld(this.camera, orient, bufX, bufY);
+    const radius = broadPhaseWorldRadius(this.markers.maxSize, this.dpr, this.camera.zoom);
+    const candidates = this.grid.query(world.x, world.y, radius);
+    return pickMarker(candidates, this.markers.list(), this.camera, orient, bufX, bufY, this.dpr);
+  }
+
+  /** Once-per-frame: emit the cursor readout and the marker hover/tooltip. */
+  private processPointer(): void {
+    const p = this.pendingPointer;
+    if (p === null) return;
+    const orient = this.currentOrientation();
+    const world = screenToWorld(this.camera, orient, p.bufX, p.bufY);
     const insideImage =
       world.x >= 0 && world.x < this.nativeW && world.y >= 0 && world.y < this.nativeH;
     let ra: number | null = null;
@@ -633,6 +854,56 @@ export class FitsViewer {
       ra = sky.ra;
       dec = sky.dec;
     }
-    this.onCursor({ worldX: world.x, worldY: world.y, ra, dec, insideImage });
+    const marker = this.hitTest(p.bufX, p.bufY);
+
+    this.onCursor?.({ worldX: world.x, worldY: world.y, ra, dec, insideImage, marker });
+
+    // Hover fires only when the topmost marker changes; the popup follows the
+    // cursor while a marker stays hovered.
+    const id = marker?.id ?? null;
+    if (id !== this.hoveredId) {
+      this.hoveredId = id;
+      this.markerHandlers.onMarkerHover?.(marker === null ? null : this.buildMarkerEvent(marker, p.event));
+    }
+    const tooltip = this.markerHandlers.markerTooltip;
+    if (marker !== null && tooltip !== undefined) {
+      const content = tooltip(marker);
+      if (content !== null) this.popup.show(content, p.event.clientX, p.event.clientY);
+      else this.popup.hide();
+    } else {
+      this.popup.hide();
+    }
+  }
+
+  private buildMarkerEvent(marker: ResolvedMarker, e: MouseEvent): MarkerEvent {
+    const rect = this.canvas.getBoundingClientRect();
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+    const bufX = cssX * (this.canvas.width / (rect.width || 1));
+    const bufY = cssY * (this.canvas.height / (rect.height || 1));
+    const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
+    return { marker, worldX: world.x, worldY: world.y, screenX: cssX, screenY: cssY, originalEvent: e };
+  }
+
+  /**
+   * Drop any active hover: emit the leave (so a host tracking the hovered marker
+   * clears its highlight) and hide the popup. Called on cursor-leave and whenever
+   * the hovered marker may have been removed (set/remove/clear) without a pointer
+   * move that would otherwise re-evaluate the hover in `processPointer`.
+   */
+  private clearHoverState(): void {
+    if (this.hoveredId !== null) {
+      this.hoveredId = null;
+      this.markerHandlers.onMarkerHover?.(null);
+    }
+    this.popup.hide();
+  }
+
+  private rebuildGrid(): void {
+    this.grid = new GridIndex(this.markers.list());
+  }
+
+  private rebuildOverlayBuffer(): void {
+    this.overlay.setInstances(packInstances(this.markers.list()), this.markers.count);
   }
 }

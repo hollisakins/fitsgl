@@ -21,6 +21,7 @@ import {
   type FitsViewer,
   type LevelGeom,
   type Manifest,
+  type MarkerInput,
   type StretchMode,
   type TilePyramid,
   type ViewerFrameInfo,
@@ -33,6 +34,7 @@ export interface ControlsElements {
   stretchSelect: HTMLSelectElement;
   colormapSelect: HTMLSelectElement;
   northUpCheckbox: HTMLInputElement;
+  markersCheckbox: HTMLInputElement;
   statZoom: HTMLElement;
   statRaDec: HTMLElement;
   statCenter: HTMLElement;
@@ -51,6 +53,7 @@ const PERCENTILE_SAMPLE_CAP = 1_000_000;
 
 export class DemoControls {
   private viewer: FitsViewer | null = null;
+  private catalog: MarkerInput[] = [];
   private readonly geoms: Map<number, LevelGeom>;
   private latest: ViewerFrameInfo | null = null;
   private didInitialAuto = false;
@@ -86,6 +89,8 @@ export class DemoControls {
     this.el.northUpCheckbox.addEventListener('change', () => {
       this.viewer?.setNorthUp(this.el.northUpCheckbox.checked);
     });
+    this.el.markersCheckbox.disabled = true; // enabled once a catalog loads
+    this.el.markersCheckbox.addEventListener('change', () => this.applyMarkers());
 
     // Repaint the HUD a few times a second so FPS decays to "idle" and the
     // byte counter keeps ticking even between rendered frames.
@@ -97,6 +102,24 @@ export class DemoControls {
     this.viewer = viewer;
     // Reflect the viewer's default (North-up on when the pyramid has a usable WCS).
     this.el.northUpCheckbox.checked = viewer.isNorthUp;
+  }
+
+  /** Provide the overlay catalog; markers default on when present. */
+  setCatalog(markers: MarkerInput[]): void {
+    this.catalog = markers;
+    const has = markers.length > 0;
+    this.el.markersCheckbox.disabled = !has;
+    this.el.markersCheckbox.checked = has;
+    this.applyMarkers();
+  }
+
+  private applyMarkers(): void {
+    if (this.viewer === null) return;
+    if (this.el.markersCheckbox.checked && this.catalog.length > 0) {
+      this.viewer.setMarkers(this.catalog);
+    } else {
+      this.viewer.clearMarkers();
+    }
   }
 
   /** Called by the viewer on cursor movement; updates the RA/Dec readout. */

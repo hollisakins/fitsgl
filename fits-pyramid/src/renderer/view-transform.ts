@@ -53,6 +53,26 @@ export function worldToScreen(
   return { x: d.x + view.viewportWidth / 2, y: d.y + view.viewportHeight / 2 };
 }
 
+/**
+ * World (native pixel) -> normalized device coordinates ([-1, 1], y-up). The
+ * world->screen affine (y-down, drawing-buffer px) followed by the clip-space
+ * y-flip the viewer applies. This is the single source of truth for that
+ * conversion: `FitsViewer.worldToNdc` delegates to it (so the tile draw uses it),
+ * and the marker vertex shader is a literal transcription of it (so instanced
+ * markers land exactly where tiles do, under any orientation). `view.viewport*`
+ * are drawing-buffer pixels — identical to the canvas backing-store size the
+ * viewer divides by, kept in sync by `syncCanvasSize`.
+ */
+export function projectWorldToNdc(
+  view: ViewParams,
+  orient: Mat2,
+  worldX: number,
+  worldY: number,
+): { x: number; y: number } {
+  const s = worldToScreen(view, orient, worldX, worldY);
+  return { x: (s.x / view.viewportWidth) * 2 - 1, y: 1 - (s.y / view.viewportHeight) * 2 };
+}
+
 /** Screen (drawing-buffer pixel, y-down) -> world. Inverse of `worldToScreen`. */
 export function screenToWorld(
   view: ViewParams,

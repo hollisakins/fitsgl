@@ -46,3 +46,23 @@ export type { ColormapName, ColormapLUT } from './renderer/index.js';
 // M2 — WCS: client-side TAN pixel<->sky (ICRS) + sexagesimal formatting.
 export { parseWcs, pixToSky, skyToPix, formatRA, formatDec } from './wcs/index.js';
 export type { TanWcs, SkyCoord, PixelCoord } from './wcs/index.js';
+
+// M3 — overlays: catalog/region markers (sky or pixel), instanced WebGL render +
+// CPU hit-testing + one reused DOM popup (decision D10).
+export {
+  MARKER_SHAPES,
+  isMarkerShape,
+  parseColor,
+  parseCatalogCSV,
+  CATALOG_VERSION,
+} from './overlay/index.js';
+export type {
+  MarkerInput,
+  MarkerPatch,
+  ResolvedMarker,
+  MarkerShape,
+  MarkerEvent,
+  MarkerHandlers,
+  ColorInput,
+  ColorTuple,
+} from './overlay/index.js';
