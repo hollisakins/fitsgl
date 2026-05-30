@@ -19,8 +19,15 @@ _COSMOS_DEC = 2.2
 _FWHM_TO_SIGMA = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
 
 
-def _tan_header(shape: tuple[int, int], pixel_scale_arcsec: float) -> fits.Header:
-    """Build a minimal valid TAN WCS header for the given image shape."""
+def _tan_header(
+    shape: tuple[int, int], pixel_scale_arcsec: float, rotation_deg: float = 0.0
+) -> fits.Header:
+    """Build a minimal valid TAN WCS header for the given image shape.
+
+    ``rotation_deg`` rolls the CD matrix so the synthetic field can carry a
+    deliberate orientation for the client's North-up rendering (0 = the original
+    axis-aligned CD, RA increasing to the left).
+    """
     h, w = shape
     scale_deg = pixel_scale_arcsec / 3600.0
     hdr = fits.Header()
@@ -34,11 +41,14 @@ def _tan_header(shape: tuple[int, int], pixel_scale_arcsec: float) -> fits.Heade
     hdr["CRPIX2"] = (h + 1) / 2.0
     hdr["CRVAL1"] = _COSMOS_RA
     hdr["CRVAL2"] = _COSMOS_DEC
-    # RA increases to the left (east), so CD1_1 is negative.
-    hdr["CD1_1"] = -scale_deg
-    hdr["CD1_2"] = 0.0
-    hdr["CD2_1"] = 0.0
-    hdr["CD2_2"] = scale_deg
+    # Standard sky CD [[-scale, 0], [0, scale]] (RA increases left) rotated by
+    # rotation_deg: R(th) @ CD0.
+    th = np.radians(rotation_deg)
+    cos_t, sin_t = np.cos(th), np.sin(th)
+    hdr["CD1_1"] = -scale_deg * cos_t
+    hdr["CD1_2"] = -scale_deg * sin_t
+    hdr["CD2_1"] = -scale_deg * sin_t
+    hdr["CD2_2"] = scale_deg * cos_t
     hdr["RADESYS"] = "ICRS"
     return hdr
 
@@ -90,8 +100,12 @@ def generate_synthetic_mosaic(
     n_sources: int = 50,
     seed: int = 42,
     nan_fraction: float = 0.01,
+    rotation_deg: float = 0.0,
 ) -> tuple[np.ndarray, fits.Header, pd.DataFrame]:
     """Generate a synthetic TAN-projected mosaic.
+
+    ``rotation_deg`` rolls the WCS (0 = axis-aligned), useful for exercising the
+    client's North-up rendering.
 
     Returns
     -------
@@ -118,7 +132,7 @@ def generate_synthetic_mosaic(
     for x, y, flux in zip(xs, ys, fluxes):
         _add_gaussian(image, x, y, flux, sigma)
 
-    hdr = _tan_header(shape, pixel_scale_arcsec)
+    hdr = _tan_header(shape, pixel_scale_arcsec, rotation_deg)
     wcs = WCS(hdr)
     ra, dec = wcs.all_pix2world(xs, ys, 0)
 

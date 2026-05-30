@@ -73,7 +73,9 @@ async function main(): Promise<void> {
       autoButton: el<HTMLButtonElement>('auto-btn'),
       stretchSelect: el<HTMLSelectElement>('stretch-mode'),
       colormapSelect: el<HTMLSelectElement>('colormap'),
+      northUpCheckbox: el<HTMLInputElement>('northup'),
       statZoom: el('stat-zoom'),
+      statRaDec: el('stat-radec'),
       statCenter: el('stat-center'),
       statLevel: el('stat-level'),
       statCompression: el('stat-compression'),
@@ -90,6 +92,7 @@ async function main(): Promise<void> {
   const viewer = new FitsViewer(canvas, pyramid, {
     textureBudget: GPU_TEXTURE_BUDGET,
     onFrame: (info) => controls.handleFrame(info),
+    onCursor: (info) => controls.handleCursor(info),
   });
   controls.setViewer(viewer);
 

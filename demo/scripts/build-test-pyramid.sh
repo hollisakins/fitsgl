@@ -17,6 +17,8 @@
 #   SIZE     square mosaic edge length in pixels (default 512)
 #   SOURCES  number of Gaussian sources (default: scales with area to keep the
 #            field as populated as the 512x512 reference, ~50 per 512x512)
+#   ROTATE   WCS roll in degrees (default 30) so the demo shows North-up doing
+#            something visible; set ROTATE=0 for an axis-aligned field
 #
 # Honours $PYTHON (default: python). pyramid_gen need not be pip-installed; we
 # add its src/ to PYTHONPATH.
@@ -47,8 +49,9 @@ else
   WORK="$(mktemp -d)"
   trap 'rm -rf "$WORK"' EXIT
   INPUT="$WORK/synthetic.fits"
-  echo "==> generating ${SIZE}x${SIZE} synthetic mosaic"
+  echo "==> generating ${SIZE}x${SIZE} synthetic mosaic (roll ${ROTATE:-30}°)"
   "$PY" - "$INPUT" "$SIZE" "${SOURCES:-}" <<'PY'
+import os
 import sys
 from astropy.io import fits
 from pyramid_gen.synthetic import generate_synthetic_mosaic
@@ -60,9 +63,13 @@ size = int(sys.argv[2])
 # larger field doesn't become 50 needles in a haystack; SOURCES overrides it.
 default_sources = max(50, round(50 * (size / 512) ** 2))
 sources = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else default_sources
-image, header, _catalog = generate_synthetic_mosaic(shape=(size, size), n_sources=sources)
+# Roll the WCS so the client's North-up rendering visibly rotates the field.
+rotation = float(os.environ.get("ROTATE", "30"))
+image, header, _catalog = generate_synthetic_mosaic(
+    shape=(size, size), n_sources=sources, rotation_deg=rotation
+)
 fits.PrimaryHDU(data=image, header=header).writeto(out, overwrite=True)
-print(f"  wrote {image.shape[1]}x{image.shape[0]} {image.dtype} mosaic, {sources} sources")
+print(f"  wrote {image.shape[1]}x{image.shape[0]} {image.dtype} mosaic, {sources} sources, roll {rotation}°")
 PY
   echo "==> building pyramid"
   "$PY" -m pyramid_gen "$INPUT" -o "$OUT_DIR"

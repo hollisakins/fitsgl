@@ -31,7 +31,7 @@ export type { WorkerLike, WorkerReply, WorkerRequest } from './fpack/worker-prot
 
 // Phase 3 — WebGL2 viewer
 export { FitsViewer, Camera } from './renderer/index.js';
-export type { FitsViewerOptions, ViewerFrameInfo } from './renderer/index.js';
+export type { FitsViewerOptions, ViewerFrameInfo, CursorInfo } from './renderer/index.js';
 // Phase 3 — tile-selection helpers (for tools/demos building on the viewer).
 export { targetLevel, visibleTiles, buildLevelGeoms, TILE_SIZE } from './renderer/index.js';
 export type { TileCoord, LevelGeom, WorldRect } from './renderer/index.js';
@@ -42,3 +42,7 @@ export { STRETCH_MODES, isStretchMode } from './renderer/index.js';
 export type { StretchMode } from './renderer/index.js';
 export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './renderer/index.js';
 export type { ColormapName, ColormapLUT } from './renderer/index.js';
+
+// M2 — WCS: client-side TAN pixel<->sky (ICRS) + sexagesimal formatting.
+export { parseWcs, pixToSky, skyToPix, formatRA, formatDec } from './wcs/index.js';
+export type { TanWcs, SkyCoord, PixelCoord } from './wcs/index.js';

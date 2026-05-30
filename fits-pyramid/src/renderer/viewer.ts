@@ -22,6 +22,18 @@ import { TILE_FRAG } from './shaders/tile.frag.js';
 import { STRETCH_MODE_IDS, type StretchMode } from './stretch.js';
 import { resolveColormap, type ColormapLUT, type ColormapName } from './colormaps.js';
 import {
+  IDENTITY_MAT2,
+  anchoredZoomCenter,
+  northUpOrientation,
+  orientedImageSpan,
+  panCenter,
+  viewportWorldAABB,
+  worldToScreen,
+  screenToWorld,
+  type Mat2,
+} from './view-transform.js';
+import { parseWcs, pixToSky, type TanWcs } from '../wcs/tan.js';
+import {
   TileManager,
   buildLevelGeoms,
   coarserFallback,
@@ -62,6 +74,20 @@ export interface ViewerFrameInfo {
   bounds: WorldBounds;
   /** Number of tiles at `level` intersecting the viewport. */
   visibleTileCount: number;
+  /** Whether North-up rotation is currently applied (a usable WCS + enabled). */
+  northUp: boolean;
+}
+
+/** Cursor position reported by `onCursor` (world pixel + sky, if a WCS is present). */
+export interface CursorInfo {
+  /** World (native-pixel) coordinates under the cursor. */
+  worldX: number;
+  worldY: number;
+  /** ICRS sky coordinate (degrees), or null when there is no usable WCS. */
+  ra: number | null;
+  dec: number | null;
+  /** Whether the cursor is within the image's pixel bounds. */
+  insideImage: boolean;
 }
 
 export interface FitsViewerOptions {
@@ -84,6 +110,20 @@ export interface FitsViewerOptions {
    * callback are caught and logged so a buggy HUD can't halt rendering.
    */
   onFrame?: (info: ViewerFrameInfo) => void;
+  /**
+   * Render the image North-up / East-left from the manifest WCS (decision D1).
+   * Defaults to `true` when the pyramid carries a usable ICRS TAN WCS, and is
+   * forced off (identity orientation) when it does not. Toggle later with
+   * `setNorthUp`.
+   */
+  northUp?: boolean;
+  /**
+   * Called on cursor movement over the canvas with the world/sky position under
+   * the pointer, and with `null` when the cursor leaves. Drives a live RA/Dec
+   * readout. Independent of North-up: the world->sky mapping is the same whether
+   * or not the display is rotated.
+   */
+  onCursor?: (info: CursorInfo | null) => void;
 }
 
 export class FitsViewer {
@@ -104,7 +144,10 @@ export class FitsViewer {
   /** devicePixelRatio of the backing store; kept in sync by syncCanvasSize. */
   private dpr = 1;
 
-  private readonly uRect: WebGLUniformLocation | null;
+  private readonly uP00: WebGLUniformLocation | null;
+  private readonly uP10: WebGLUniformLocation | null;
+  private readonly uP01: WebGLUniformLocation | null;
+  private readonly uP11: WebGLUniformLocation | null;
   private readonly uUV: WebGLUniformLocation | null;
   private readonly uMin: WebGLUniformLocation | null;
   private readonly uMax: WebGLUniformLocation | null;
@@ -119,6 +162,16 @@ export class FitsViewer {
   private stretchMode: StretchMode = 'linear';
   /** Single-band colormap LUT (texture unit 1), or null for grayscale. */
   private colormapTexture: WebGLTexture | null = null;
+
+  /** Parsed manifest WCS (z=0), or null if absent/unsupported. */
+  private readonly wcs: TanWcs | null;
+  /** North-up orientation for `wcs` at the image centre; identity if no WCS. */
+  private readonly northUpMatrix: Mat2;
+  /** Whether North-up is currently applied (also requires a usable WCS). */
+  private northUpEnabled: boolean;
+
+  private readonly onCursor?: (info: CursorInfo | null) => void;
+
   private frameCounter = 0;
   private renderScheduled = false;
   private destroyed = false;
@@ -134,6 +187,8 @@ export class FitsViewer {
   private readonly onMouseMove: (e: MouseEvent) => void;
   private readonly onMouseUp: () => void;
   private readonly onWheel: (e: WheelEvent) => void;
+  private readonly onCanvasMove: (e: MouseEvent) => void;
+  private readonly onCanvasLeave: () => void;
   private readonly frame: () => void;
 
   constructor(canvas: HTMLCanvasElement, pyramid: TilePyramid, options: FitsViewerOptions = {}) {
@@ -145,7 +200,17 @@ export class FitsViewer {
     this.maxLevel = this.manifest.n_levels;
     this.geoms = buildLevelGeoms(this.manifest);
     this.onFrame = options.onFrame;
+    this.onCursor = options.onCursor;
     this.hiDpiLevels = options.hiDpiLevels ?? false;
+
+    // North-up: parse the z=0 WCS (world pixels are native = z=0 pixels) and
+    // precompute the orientation at the image centre once — it is a fixed rigid
+    // rotation, so pan/zoom preserve it (decision D1/D2). Default on when usable.
+    const z0 = this.manifest.levels.find((l) => l.z === 0);
+    this.wcs = z0 !== undefined ? parseWcs(z0.wcs) : null;
+    this.northUpMatrix =
+      this.wcs !== null ? northUpOrientation(this.wcs, nativeW / 2, nativeH / 2) : IDENTITY_MAT2;
+    this.northUpEnabled = (options.northUp ?? true) && this.wcs !== null;
 
     const gl = canvas.getContext('webgl2');
     if (gl === null) {
@@ -159,7 +224,10 @@ export class FitsViewer {
     const quad = createUnitQuadVAO(gl);
     this.vao = quad.vao;
     this.quadBuffer = quad.buffer;
-    this.uRect = gl.getUniformLocation(this.program, 'u_rect');
+    this.uP00 = gl.getUniformLocation(this.program, 'u_p00');
+    this.uP10 = gl.getUniformLocation(this.program, 'u_p10');
+    this.uP01 = gl.getUniformLocation(this.program, 'u_p01');
+    this.uP11 = gl.getUniformLocation(this.program, 'u_p11');
     this.uUV = gl.getUniformLocation(this.program, 'u_uv');
     this.uMin = gl.getUniformLocation(this.program, 'u_min');
     this.uMax = gl.getUniformLocation(this.program, 'u_max');
@@ -197,7 +265,11 @@ export class FitsViewer {
     this.onMouseMove = (e) => {
       if (!this.dragging) return;
       const p = this.toBufferCoords(e);
-      this.camera.panByScreen(p.x - this.lastDragX, p.y - this.lastDragY);
+      // Pan through the current orientation so a drag moves the grabbed point
+      // with the cursor under North-up too (not just when the view is unrotated).
+      const c = panCenter(this.camera, this.currentOrientation(), p.x - this.lastDragX, p.y - this.lastDragY);
+      this.camera.centerX = c.centerX;
+      this.camera.centerY = c.centerY;
       this.lastDragX = p.x;
       this.lastDragY = p.y;
       this.requestRender();
@@ -208,9 +280,23 @@ export class FitsViewer {
     this.onWheel = (e) => {
       e.preventDefault();
       const p = this.toBufferCoords(e);
-      const factor = Math.pow(2, -e.deltaY * WHEEL_ZOOM_RATE);
-      this.camera.zoomAt(p.x, p.y, this.camera.zoom * factor);
+      const target = this.camera.zoom * Math.pow(2, -e.deltaY * WHEEL_ZOOM_RATE);
+      // Anchor the zoom on the world point under the cursor *through the current
+      // orientation* — otherwise North-up zooms toward a vertically-flipped point.
+      const newZoom = this.camera.clampZoom(target);
+      const c = anchoredZoomCenter(this.camera, this.currentOrientation(), p.x, p.y, newZoom);
+      this.camera.setZoom(newZoom);
+      this.camera.centerX = c.centerX;
+      this.camera.centerY = c.centerY;
       this.requestRender();
+    };
+    this.onCanvasMove = (e) => {
+      if (this.onCursor === undefined) return;
+      const p = this.toBufferCoords(e);
+      this.reportCursor(p.x, p.y);
+    };
+    this.onCanvasLeave = () => {
+      this.onCursor?.(null);
     };
 
     this.syncCanvasSize();
@@ -260,6 +346,29 @@ export class FitsViewer {
     }
   }
 
+  /**
+   * Turn North-up rendering on or off. A no-op (stays off) when the pyramid has
+   * no usable WCS. Re-fits the zoom limits to the new orientation's extent and
+   * keeps the current centre.
+   */
+  setNorthUp(enabled: boolean): void {
+    const next = enabled && this.wcs !== null;
+    if (next === this.northUpEnabled) return;
+    this.northUpEnabled = next;
+    this.updateZoomLimits();
+    this.requestRender();
+  }
+
+  /** Whether North-up is currently applied. */
+  get isNorthUp(): boolean {
+    return this.northUpEnabled;
+  }
+
+  /** The orientation matrix to apply this frame (identity when North-up is off). */
+  private currentOrientation(): Mat2 {
+    return this.northUpEnabled && this.wcs !== null ? this.northUpMatrix : IDENTITY_MAT2;
+  }
+
   setCenter(x: number, y: number): void {
     this.camera.centerX = x;
     this.camera.centerY = y;
@@ -293,12 +402,28 @@ export class FitsViewer {
 
   // ---- sizing / zoom limits ----------------------------------------------
 
-  /** Smallest zoom that still fits the whole image in the viewport. */
+  /**
+   * Smallest zoom that still fits the whole image in the viewport, accounting
+   * for the current orientation (a rotated image has a larger screen footprint).
+   */
   private fitZoom(): number {
-    return Math.min(
-      this.camera.viewportWidth / this.nativeW,
-      this.camera.viewportHeight / this.nativeH,
+    const { spanX, spanY } = orientedImageSpan(
+      this.currentOrientation(),
+      this.nativeW,
+      this.nativeH,
     );
+    return Math.min(this.camera.viewportWidth / spanX, this.camera.viewportHeight / spanY);
+  }
+
+  /**
+   * Recompute the camera zoom limits from the current fit zoom. Zoom-out is
+   * bounded at "whole (oriented) mosaic visible"; zoom-in at MAX_NATIVE_ZOOM
+   * native pixels — but never below the fit zoom, so a mosaic smaller than the
+   * viewport (fit zoom > 16×) still fits instead of pinning at the ceiling.
+   */
+  private updateZoomLimits(): void {
+    const fit = this.fitZoom();
+    this.camera.setZoomLimits(fit, Math.max(fit, MAX_NATIVE_ZOOM * this.dpr));
   }
 
   /**
@@ -318,10 +443,7 @@ export class FitsViewer {
     if (this.canvas.width !== bw) this.canvas.width = bw;
     if (this.canvas.height !== bh) this.canvas.height = bh;
     this.camera.setViewport(bw, bh);
-    // Out to "whole mosaic visible", in to MAX_NATIVE_ZOOM native pixels — but
-    // never cap below the fit zoom, so a mosaic smaller than the viewport (where
-    // the fit zoom exceeds 16×) still fits instead of pinning at the 16× ceiling.
-    this.camera.setZoomLimits(this.fitZoom(), Math.max(this.fitZoom(), MAX_NATIVE_ZOOM * dpr));
+    this.updateZoomLimits();
   }
 
   // ---- event wiring -------------------------------------------------------
@@ -331,6 +453,8 @@ export class FitsViewer {
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mouseup', this.onMouseUp);
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
+    this.canvas.addEventListener('mousemove', this.onCanvasMove);
+    this.canvas.addEventListener('mouseleave', this.onCanvasLeave);
     if (typeof ResizeObserver !== 'undefined') {
       this.resizeObserver = new ResizeObserver(() => {
         this.syncCanvasSize();
@@ -345,6 +469,8 @@ export class FitsViewer {
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('mouseup', this.onMouseUp);
     this.canvas.removeEventListener('wheel', this.onWheel);
+    this.canvas.removeEventListener('mousemove', this.onCanvasMove);
+    this.canvas.removeEventListener('mouseleave', this.onCanvasLeave);
     if (this.resizeObserver !== null) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;
@@ -393,7 +519,11 @@ export class FitsViewer {
     gl.uniform1i(this.uTile, 0);
     gl.activeTexture(gl.TEXTURE0);
 
-    const bounds = this.camera.worldBounds();
+    const orient = this.currentOrientation();
+    // Under rotation the viewport maps to a rotated world rectangle; intersect
+    // its axis-aligned bounding box (from all four corners). This slightly
+    // over-selects tiles at the corners — expected, not a correctness issue.
+    const bounds = viewportWorldAABB(this.camera, orient);
     // Select levels by perceived (CSS) zoom by default: `camera.zoom` is
     // drawing-buffer px per world px, so on a HiDPI display it runs `dpr`× ahead
     // of what the user sees and would keep z=0 resident far past native. Dividing
@@ -411,7 +541,7 @@ export class FitsViewer {
         const rect = tileWorldRect(geom, t.tileX, t.tileY);
         const entry = this.tiles.acquire(level, t.tileX, t.tileY);
         if (entry !== undefined) {
-          this.drawTile(rect, entry.texture, 0, 0, 1, 1);
+          this.drawTile(orient, rect, entry.texture, 0, 0, 1, 1);
           continue;
         }
         // Not resident yet: request it, and fill from the best coarser ancestor.
@@ -425,7 +555,7 @@ export class FitsViewer {
           if (fbEntry !== undefined && fbGeom !== undefined) {
             const ancestor = tileWorldRect(fbGeom, fb.tileX, fb.tileY);
             const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
-            this.drawTile(rect, fbEntry.texture, u0, v0, u1, v1);
+            this.drawTile(orient, rect, fbEntry.texture, u0, v0, u1, v1);
           }
         }
       }
@@ -443,6 +573,7 @@ export class FitsViewer {
           level,
           bounds,
           visibleTileCount,
+          northUp: this.northUpEnabled,
         });
       } catch (err) {
         // A telemetry callback must never be able to stop the render loop.
@@ -451,8 +582,14 @@ export class FitsViewer {
     }
   }
 
-  /** Draw a world rectangle textured by `texture` over the [u0,v0]-[u1,v1] sub-rect. */
+  /**
+   * Draw a world rectangle textured by `texture` over the [u0,v0]-[u1,v1]
+   * sub-rect, under orientation `orient`. The four destination corners are
+   * transformed individually so a rotated/flipped orientation draws a rotated
+   * quad (not just an axis-aligned rect).
+   */
   private drawTile(
+    orient: Mat2,
     rect: WorldRect,
     texture: WebGLTexture,
     u0: number,
@@ -461,18 +598,41 @@ export class FitsViewer {
     v1: number,
   ): void {
     const gl = this.gl;
-    const tl = this.camera.worldToScreen(rect.x0, rect.y0);
-    const br = this.camera.worldToScreen(rect.x1, rect.y1);
-    const w = this.canvas.width;
-    const h = this.canvas.height;
-    // Screen (y-down) -> NDC (y-up).
-    const nx0 = (tl.x / w) * 2 - 1;
-    const nx1 = (br.x / w) * 2 - 1;
-    const ny0 = 1 - (tl.y / h) * 2;
-    const ny1 = 1 - (br.y / h) * 2;
-    gl.uniform4f(this.uRect, nx0, ny0, nx1, ny1);
+    const p00 = this.worldToNdc(orient, rect.x0, rect.y0);
+    const p10 = this.worldToNdc(orient, rect.x1, rect.y0);
+    const p01 = this.worldToNdc(orient, rect.x0, rect.y1);
+    const p11 = this.worldToNdc(orient, rect.x1, rect.y1);
+    gl.uniform2f(this.uP00, p00.x, p00.y);
+    gl.uniform2f(this.uP10, p10.x, p10.y);
+    gl.uniform2f(this.uP01, p01.x, p01.y);
+    gl.uniform2f(this.uP11, p11.x, p11.y);
     gl.uniform4f(this.uUV, u0, v0, u1, v1);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  /** World pixel -> NDC, through the oriented view transform then the y-up flip. */
+  private worldToNdc(orient: Mat2, worldX: number, worldY: number): { x: number; y: number } {
+    const s = worldToScreen(this.camera, orient, worldX, worldY);
+    return {
+      x: (s.x / this.canvas.width) * 2 - 1,
+      y: 1 - (s.y / this.canvas.height) * 2,
+    };
+  }
+
+  /** Compute and emit the cursor's world/sky position from drawing-buffer coords. */
+  private reportCursor(bufX: number, bufY: number): void {
+    if (this.onCursor === undefined) return;
+    const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
+    const insideImage =
+      world.x >= 0 && world.x < this.nativeW && world.y >= 0 && world.y < this.nativeH;
+    let ra: number | null = null;
+    let dec: number | null = null;
+    if (this.wcs !== null) {
+      const sky = pixToSky(this.wcs, world.x, world.y);
+      ra = sky.ra;
+      dec = sky.dec;
+    }
+    this.onCursor({ worldX: world.x, worldY: world.y, ra, dec, insideImage });
   }
 }

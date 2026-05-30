@@ -50,6 +50,8 @@
       .field input { width: 92px; }
       .field select { cursor: pointer; }
       .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+      .field input[type="checkbox"] { width: auto; padding: 0; background: none; border: none; cursor: pointer; }
+      label.check { cursor: pointer; }
       button {
         padding: 4px 12px;
         background: var(--bg);
@@ -107,6 +109,10 @@
           <label for="colormap">cmap</label>
           <select id="colormap" title="Single-band colormap"></select>
         </div>
+        <label class="field check" for="northup" title="Render North-up / East-left from the WCS">
+          <input id="northup" type="checkbox" />
+          North-up
+        </label>
         <span class="spacer"></span>
         <span class="hint">drag&nbsp;=&nbsp;pan&nbsp;·&nbsp;scroll&nbsp;=&nbsp;zoom</span>
       </header>
@@ -119,6 +125,7 @@
       <footer id="bottombar">
         <span class="stat">zoom <b id="stat-zoom">—</b></span>
         <span class="stat">center <b id="stat-center">—</b></span>
+        <span class="stat">RA/Dec <b id="stat-radec">—</b></span>
         <span class="stat">level <b id="stat-level">—</b></span>
         <span class="stat">compression <b id="stat-compression">—</b></span>
         <span class="stat">tiles <b id="stat-tiles">—</b></span>

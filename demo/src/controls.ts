@@ -12,9 +12,12 @@
 import {
   buildLevelGeoms,
   visibleTiles,
+  formatRA,
+  formatDec,
   COLORMAP_NAMES,
   STRETCH_MODES,
   type ColormapName,
+  type CursorInfo,
   type FitsViewer,
   type LevelGeom,
   type Manifest,
@@ -29,7 +32,9 @@ export interface ControlsElements {
   autoButton: HTMLButtonElement;
   stretchSelect: HTMLSelectElement;
   colormapSelect: HTMLSelectElement;
+  northUpCheckbox: HTMLInputElement;
   statZoom: HTMLElement;
+  statRaDec: HTMLElement;
   statCenter: HTMLElement;
   statLevel: HTMLElement;
   statCompression: HTMLElement;
@@ -78,6 +83,9 @@ export class DemoControls {
       // 'gray' is the built-in grayscale path; any other name uploads a LUT.
       this.viewer?.setColormap(this.el.colormapSelect.value as ColormapName);
     });
+    this.el.northUpCheckbox.addEventListener('change', () => {
+      this.viewer?.setNorthUp(this.el.northUpCheckbox.checked);
+    });
 
     // Repaint the HUD a few times a second so FPS decays to "idle" and the
     // byte counter keeps ticking even between rendered frames.
@@ -87,6 +95,17 @@ export class DemoControls {
   /** Wire the viewer in after construction (it needs `onFrame` -> this). */
   setViewer(viewer: FitsViewer): void {
     this.viewer = viewer;
+    // Reflect the viewer's default (North-up on when the pyramid has a usable WCS).
+    this.el.northUpCheckbox.checked = viewer.isNorthUp;
+  }
+
+  /** Called by the viewer on cursor movement; updates the RA/Dec readout. */
+  handleCursor(info: CursorInfo | null): void {
+    if (info === null || info.ra === null || info.dec === null) {
+      this.el.statRaDec.textContent = '—';
+      return;
+    }
+    this.el.statRaDec.textContent = `${formatRA(info.ra)} ${formatDec(info.dec)}`;
   }
 
   /** Stop the HUD timer. Call on teardown (page unload / Vite HMR dispose). */
