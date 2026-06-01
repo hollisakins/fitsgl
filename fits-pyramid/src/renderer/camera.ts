@@ -29,9 +29,9 @@ export interface WorldBounds {
 }
 
 export class Camera {
-  centerX: number;
-  centerY: number;
-  zoom: number;
+  private _centerX: number;
+  private _centerY: number;
+  private _zoom: number;
   viewportWidth: number;
   viewportHeight: number;
   /** Clamp bounds for zoom; set by the viewer from canvas + image size. */
@@ -47,9 +47,33 @@ export class Camera {
   ) {
     this.viewportWidth = viewportWidth;
     this.viewportHeight = viewportHeight;
-    this.centerX = centerX;
-    this.centerY = centerY;
-    this.zoom = zoom;
+    this._centerX = centerX;
+    this._centerY = centerY;
+    this._zoom = zoom;
+  }
+
+  /**
+   * Camera state is read-only from outside (frozen for the v1.0 public API, D11):
+   * the world point at the viewport centre, and the zoom (drawing-buffer px per
+   * world px, 1.0 = native). Mutate only through the methods below — `setCenter`,
+   * `setZoom`, `zoomAt`, `panByScreen`, `setZoomLimits`.
+   */
+  get centerX(): number {
+    return this._centerX;
+  }
+
+  get centerY(): number {
+    return this._centerY;
+  }
+
+  get zoom(): number {
+    return this._zoom;
+  }
+
+  /** Move the world centre to (centerX, centerY); the zoom is unchanged. */
+  setCenter(centerX: number, centerY: number): void {
+    this._centerX = centerX;
+    this._centerY = centerY;
   }
 
   setViewport(width: number, height: number): void {
@@ -64,7 +88,7 @@ export class Camera {
     // bounds — an inverted range would pin clampZoom to the wrong limit and make
     // fitToImage unreachable. Raise the ceiling to the floor instead.
     this.maxZoom = Math.max(minZoom, maxZoom);
-    this.zoom = this.clampZoom(this.zoom);
+    this._zoom = this.clampZoom(this._zoom);
   }
 
   clampZoom(zoom: number): number {
@@ -74,28 +98,28 @@ export class Camera {
   /** World pixel -> screen (drawing-buffer) pixel. */
   worldToScreen(worldX: number, worldY: number): Point {
     return {
-      x: (worldX - this.centerX) * this.zoom + this.viewportWidth / 2,
-      y: (worldY - this.centerY) * this.zoom + this.viewportHeight / 2,
+      x: (worldX - this._centerX) * this._zoom + this.viewportWidth / 2,
+      y: (worldY - this._centerY) * this._zoom + this.viewportHeight / 2,
     };
   }
 
   /** Screen (drawing-buffer) pixel -> world pixel. Inverse of worldToScreen. */
   screenToWorld(screenX: number, screenY: number): Point {
     return {
-      x: (screenX - this.viewportWidth / 2) / this.zoom + this.centerX,
-      y: (screenY - this.viewportHeight / 2) / this.zoom + this.centerY,
+      x: (screenX - this.viewportWidth / 2) / this._zoom + this._centerX,
+      y: (screenY - this.viewportHeight / 2) / this._zoom + this._centerY,
     };
   }
 
   /** Pan by a screen-pixel delta (e.g. a mouse drag), keeping content under the cursor. */
   panByScreen(dxScreen: number, dyScreen: number): void {
-    this.centerX -= dxScreen / this.zoom;
-    this.centerY -= dyScreen / this.zoom;
+    this._centerX -= dxScreen / this._zoom;
+    this._centerY -= dyScreen / this._zoom;
   }
 
   /** Set zoom (clamped), centre unchanged. */
   setZoom(zoom: number): void {
-    this.zoom = this.clampZoom(zoom);
+    this._zoom = this.clampZoom(zoom);
   }
 
   /**
@@ -104,9 +128,9 @@ export class Camera {
    */
   zoomAt(screenX: number, screenY: number, newZoom: number): void {
     const anchor = this.screenToWorld(screenX, screenY);
-    this.zoom = this.clampZoom(newZoom);
-    this.centerX = anchor.x - (screenX - this.viewportWidth / 2) / this.zoom;
-    this.centerY = anchor.y - (screenY - this.viewportHeight / 2) / this.zoom;
+    this._zoom = this.clampZoom(newZoom);
+    this._centerX = anchor.x - (screenX - this.viewportWidth / 2) / this._zoom;
+    this._centerY = anchor.y - (screenY - this.viewportHeight / 2) / this._zoom;
   }
 
   /** World-space rectangle currently visible in the viewport. */

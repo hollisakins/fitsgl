@@ -417,8 +417,7 @@ export class FitsViewer {
       // Pan through the current orientation so a drag moves the grabbed point
       // with the cursor under North-up too (not just when the view is unrotated).
       const c = panCenter(this.camera, this.currentOrientation(), p.x - this.lastDragX, p.y - this.lastDragY);
-      this.camera.centerX = c.centerX;
-      this.camera.centerY = c.centerY;
+      this.camera.setCenter(c.centerX, c.centerY);
       this.lastDragX = p.x;
       this.lastDragY = p.y;
       this.requestRender();
@@ -449,8 +448,7 @@ export class FitsViewer {
       const newZoom = this.camera.clampZoom(target);
       const c = anchoredZoomCenter(this.camera, this.currentOrientation(), p.x, p.y, newZoom);
       this.camera.setZoom(newZoom);
-      this.camera.centerX = c.centerX;
-      this.camera.centerY = c.centerY;
+      this.camera.setCenter(c.centerX, c.centerY);
       this.requestRender();
     };
     this.onCanvasMove = (e) => {
@@ -739,8 +737,7 @@ export class FitsViewer {
   }
 
   setCenter(x: number, y: number): void {
-    this.camera.centerX = x;
-    this.camera.centerY = y;
+    this.camera.setCenter(x, y);
     this.requestRender();
   }
 
@@ -751,8 +748,7 @@ export class FitsViewer {
 
   /** Centre the image and zoom so the whole mosaic is visible. */
   fitToImage(): void {
-    this.camera.centerX = this.nativeW / 2;
-    this.camera.centerY = this.nativeH / 2;
+    this.camera.setCenter(this.nativeW / 2, this.nativeH / 2);
     this.camera.setZoom(this.fitZoom());
     this.requestRender();
   }
