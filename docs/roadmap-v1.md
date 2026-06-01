@@ -28,7 +28,7 @@ that log.
 | D9 | Dataset manifest | New additive manifest listing available bands (short name, filepath, WCS info) + a **hash of canonical WCS-grid params** for trivial match-grouping. No change to the per-pyramid manifest; **no version bump**, but start *checking* version at v1.0. | Lets the channel-picker offer only WCS-matched bands; additive keeps every existing pyramid valid. | 2.4, 4.2 |
 | D10 | Overlays | **WebGL marker geometry** (instanced, per-instance style) + **CPU spatial-index hit-testing** (click/hover callbacks) + **one reused DOM popup**. Simple shapes only (points, circles, boxes). | WebGL handles large catalogs without DOM-node slowdown; CPU picking + a single DOM popup give CAMPFIRE per-marker callbacks and rich tooltips without thousands of nodes. | 2.6 |
 | D11 | Public API | **Narrow** the public surface + an `/internal` subpath; route `Camera` mutation through methods; tile-selection helpers become internal. | The current `index.ts` over-exports internals that shouldn't carry a v1.0 stability promise. | 4.4 |
-| D12 | React wrapper | Stays in **M5**; controlled stretch/colormap props + an imperative handle for the overlay API. | Wrapping a settled surface avoids mirroring a churning API into three tiers. | 3.2, 5 |
+| D12 | React wrapper | **Settled + shipped (M5).** `<FitsViewer>` is **controlled by a single `config: ViewerConfig` prop** (diffed by a pure `planConfigUpdate`, routed to the cheapest viewer call) + an **imperative `ref` handle** for the live marker push (`setMarkers`/`add`/`update`/`remove`/`clear`) and one-shot actions (`autoStretch`/`fitToImage`/`getViewer`). Markers are **not** a controlled prop (a 10–20k array would diff every render). The tier is a **pure consumer of the D11 public API**. | Wrapping a settled surface avoids mirroring a churning API into three tiers; one `config` contract matches the host's mental model; pushing markers via the handle fits CAMPFIRE's live, filtered set. | 3.2, 5 |
 | D13 | Tiled mosaics | Render a field too large to drizzle whole as **N co-gridded tile-pyramids placed by integer pixel offset** (tiles share tangent point + CD + scale; CRPIX/footprint differ). No reprojection, no sub-pixel sampling; a per-tile **interior clip** resolves the ~1000-px overlap; a **synthesized virtual WCS** drives readout/North-up/markers. | The data already exists as independently-drizzled aligned tiles, so *placement* (not resampling) composites them — reusing the world-space tile-culling and multi-manager machinery. **M6, post-v1.0; architecture still being finalized.** | 2.7, 5 |
 | D14 | ViewerConfig band shape | A band is a **list of tile-pyramid manifest URLs** (`tiles[]`, length 1 in the common case), not a single URL — baked into the M5 `ViewerConfig` even though the multi-tile renderer is M6. | Freezes the config shape once: a large field lights up when the M6 renderer lands with **no `ViewerConfig` change**. | 3.1, 5 |
 
@@ -419,14 +419,33 @@ in the public surface.
 
 ### 3.2 React wrapper
 
-A thin component (new subpath/package, e.g. `fits-pyramid/react`) that constructs
-a `FitsViewer` against a ref'd `<canvas>` in an effect, calls `destroy()` on
-unmount, and **translates declarative props → imperative methods** (`stretch`
-prop → `setStretch`, `colormap` → `setColormap`, `center`/`zoom` →
-`setCenter`/`setZoom`), surfacing `onFrame`/`onCursor`/overlay clicks as React
-callbacks. Per D12 the recommended split is **controlled** stretch/colormap/view
-props plus an **imperative handle** (ref) for the programmatic overlay API that
-CAMPFIRE drives; the exact boundary is settled during M5.
+**Shipped** as the `fits-pyramid/react` subpath: a `<FitsViewer>` component that
+owns a `<canvas>`, loads the config + constructs a core `FitsViewer` in an effect,
+and `destroy()`s the viewer **and every band pyramid** (which the core does not
+own) on unmount. It imports **only the frozen public API** — building the tier on
+that surface is itself a check that D11 is sufficient.
+
+The controlled/imperative boundary (D12, settled):
+
+- **Controlled** by one `config: ViewerConfig` prop — the single high-level
+  contract every tier shares. A pure `planConfigUpdate(prev, next)` (unit-tested,
+  no GL/DOM) diffs the incoming config and routes each change to the cheapest
+  viewer call: a **band-URL/name change reloads + rebuilds**; `view` →
+  `setSource`; `colormap`/`stretch`/`northUp` → the matching live setter. An
+  omitted `stretch` auto-stretches, driven off the first drawn frame (the core's
+  `autoStretch` is a no-op until then). `northUp` omitted = uncontrolled (the
+  viewer keeps its WCS-derived default).
+- **Imperative** via a `ref` handle (`FitsViewerHandle`) for the high-frequency
+  live path CAMPFIRE drives — `setMarkers`/`addMarkers`/`updateMarker`/
+  `removeMarker`/`clearMarkers` — plus one-shot actions (`autoStretch`,
+  `fitToImage`, `setCenter`/`setZoom`) and `getViewer()`/`getPyramids()` escape
+  hatches. Markers are **not** a controlled prop (a 10–20k-element array would
+  diff on every render; pushing through the handle does not).
+- **Callbacks** mirror the core's mutability: `onFrame`/`onCursor` are fixed at
+  construction (stable trampolines read the latest closure from a ref); the three
+  marker handlers hot-swap via `setMarkerHandlers` whenever their presence
+  changes. `onReady(handle)` fires once the viewer exists (and after each reload);
+  `onError` surfaces load/WebGL failures.
 
 ### 3.3 Vanilla embed
 
@@ -567,6 +586,12 @@ API narrowing; §4.5 docs. *Why last:* the three tiers wrap a **settled** featur
 surface so the shared `ViewerConfig` doesn't churn after it is mirrored into three
 places. *Deployable:* all three tiers, the v1.0 stability commitment. *Depends
 on:* M1–M4.
+
+*Progress:* the **`ViewerConfig` contract** (D14), the **`autoStretch` promotion**
+and **D11 API narrowing** (+ `/internal` subpath), and the **React tier**
+(`fits-pyramid/react`, D12) have landed. Remaining: the **vanilla embed** and
+**SSG** tiers (both need bundler infra not yet present — `tsc`-only today), and the
+§4.5 architecture/usage docs.
 
 **Schema-freeze checkpoint.** The two net-new schemas — the RGB **dataset
 manifest** (M4) and the **overlay/catalog format** (M3) — must be finalized by the

@@ -7,6 +7,9 @@
     // Empty so Node globals are NOT auto-injected (src stays browser-clean);
     // `node:` module imports still resolve for the test files.
     "types": [],
+    // The React tier (src/react/*.tsx) compiles with the automatic JSX runtime
+    // (no per-file React import); only .tsx files are affected.
+    "jsx": "react-jsx",
 
     "strict": true,
     "noImplicitAny": true,

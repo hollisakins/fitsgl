@@ -7,11 +7,13 @@ import { defineConfig } from 'vitest/config';
 //
 // Tests run under Node; Phase 2b modules that need browser globals
 // (DecompressionStream, fetch, Response) rely on those being present in modern
-// Node (>=18), which they are.
+// Node (>=18), which they are. The default environment is `node`; the React-tier
+// component test (test/react/*.test.tsx) opts into jsdom with a per-file
+// `// @vitest-environment jsdom` docblock, leaving every other test on Node.
 export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    include: ['test/**/*.test.ts'],
+    include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
   },
 });
