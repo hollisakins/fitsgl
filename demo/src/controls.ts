@@ -3,25 +3,23 @@
  * telemetry HUD. Vanilla TypeScript, native inputs — no framework.
  *
  * The viewer renders on demand and reports its state through `onFrame`; this
- * module turns each report into HUD text and uses the reported visible bounds to
- * implement "Auto" (stretch to the 1st–99th percentile of the data currently in
- * view). FPS is derived from the spacing of recent frames and decays to "idle"
- * when nothing is drawing.
+ * module turns each report into HUD text. "Auto" is delegated to
+ * `FitsViewer.autoStretch` (which samples the data currently in view); this module
+ * just reflects the result in the min/max inputs. FPS is derived from the spacing
+ * of recent frames and decays to "idle" when nothing is drawing.
  */
 
 import {
-  buildLevelGeoms,
-  visibleTiles,
   formatRA,
   formatDec,
   COLORMAP_NAMES,
   STRETCH_MODES,
   compatibleBands,
+  type AutoStretchResult,
   type ColormapName,
   type CursorInfo,
   type DatasetManifest,
   type FitsViewer,
-  type LevelGeom,
   type Manifest,
   type MarkerInput,
   type RenderSource,
@@ -59,13 +57,10 @@ export interface ControlsElements {
 
 /** Show FPS as "idle" once no frame has drawn for this long. */
 const IDLE_MS = 400;
-/** Cap the sample count for the percentile sort so "Auto" stays snappy. */
-const PERCENTILE_SAMPLE_CAP = 1_000_000;
 
 export class DemoControls {
   private viewer: FitsViewer | null = null;
   private catalog: MarkerInput[] = [];
-  private readonly geoms: Map<number, LevelGeom>;
   private latest: ViewerFrameInfo | null = null;
   private didInitialAuto = false;
   private readonly frameTimes: number[] = [];
@@ -86,8 +81,6 @@ export class DemoControls {
     private readonly manifest: Manifest,
     private readonly getBytesFetched: () => number,
   ) {
-    this.geoms = buildLevelGeoms(manifest);
-
     this.el.autoButton.addEventListener('click', () => {
       void this.autoStretch();
     });
@@ -183,9 +176,9 @@ export class DemoControls {
       void this.enterRgb();
     } else {
       // Back to single-band on the representative pyramid (the viewer was built
-      // single-band on it; setSource preserves the grid).
+      // single-band on it; setSource preserves the grid). The min/max inputs keep
+      // the single-band stretch they already showed; "Auto" re-derives on demand.
       this.viewer.setSource({ kind: 'single', pyramid: this.pyramid });
-      this.loadSingleStretchIntoInputs();
     }
   }
 
@@ -199,14 +192,13 @@ export class DemoControls {
     if (this.el.rgbCheckbox.checked) void this.enterRgb();
   }
 
-  /** Build the RGB source from the current roles, then auto + sync the inputs. */
+  /** Build the RGB source from the current roles, then auto-stretch + sync inputs. */
   private async enterRgb(): Promise<void> {
     if (this.viewer === null || this.roles === null) return;
     const source = this.rgbSource(this.roles);
     if (source === null) return;
     this.viewer.setSource(source);
-    await this.autoStretchRgb();
-    this.loadChannelStretchIntoInputs();
+    await this.autoStretch(); // viewer.autoStretch handles RGB; we cache + fill inputs
   }
 
   private rgbSource(roles: { r: string; g: string; b: string }): RenderSource | null {
@@ -217,20 +209,6 @@ export class DemoControls {
     return { kind: 'rgb', r, g, b };
   }
 
-  /** Per-channel auto-stretch: percentile of each role's band, in view. */
-  private async autoStretchRgb(): Promise<void> {
-    if (this.viewer === null || this.roles === null) return;
-    for (const ch of ['r', 'g', 'b'] as const) {
-      const name = this.roles[ch];
-      const pyr = this.bandPyramids.get(name);
-      if (pyr === undefined) continue;
-      const range = (await this.percentileForPyramid(pyr)) ?? this.bandStretch.get(name);
-      if (range === undefined) continue;
-      this.bandStretch.set(name, range);
-      this.viewer.setChannelStretch(ch, range[0], range[1]);
-    }
-  }
-
   /** Reflect the selected channel's band stretch in the min/max inputs. */
   private loadChannelStretchIntoInputs(): void {
     if (this.roles === null) return;
@@ -238,11 +216,6 @@ export class DemoControls {
     if (range === undefined) return;
     this.el.minInput.value = formatStretch(range[0]);
     this.el.maxInput.value = formatStretch(range[1]);
-  }
-
-  private loadSingleStretchIntoInputs(): void {
-    // The single-band path keeps its own stretch in the inputs already; a fresh
-    // Auto re-derives it if the user wants. Nothing to restore here.
   }
 
   /** Called by the viewer on cursor movement; updates the RA/Dec readout. */
@@ -287,40 +260,27 @@ export class DemoControls {
     }
   }
 
-  /** "Auto": per-channel percentile in RGB mode, else the single-band stretch. */
+  /** "Auto": stretch to the data in view (per-channel in RGB), via the viewer. */
   async autoStretch(): Promise<void> {
-    if (this.el.rgbCheckbox.checked) {
-      await this.autoStretchRgb();
-      this.loadChannelStretchIntoInputs();
-      return;
-    }
     if (this.viewer === null) return;
-    const range = await this.percentileForPyramid(this.pyramid);
-    if (range === null) return;
-    const [lo, hi] = range;
-    this.viewer.setStretch(lo, hi);
-    this.el.minInput.value = formatStretch(lo);
-    this.el.maxInput.value = formatStretch(hi);
+    const result = await this.viewer.autoStretch();
+    if (result !== null) this.applyAutoResultToInputs(result);
   }
 
-  /** 1st–99th percentile of the tiles a pyramid has in the current viewport. */
-  private async percentileForPyramid(pyramid: TilePyramid): Promise<[number, number] | null> {
-    const info = this.latest;
-    if (info === null) return null;
-    const geom = this.geoms.get(info.level);
-    if (geom === undefined) return null;
-    const tiles = visibleTiles(geom, info.bounds);
-    if (tiles.length === 0) return null;
-    try {
-      // These are the same tiles the viewer drew, so they are cache hits.
-      const arrays = await Promise.all(
-        tiles.map((t) => pyramid.getTile(info.level, t.tileX, t.tileY)),
-      );
-      return percentileRange(arrays, 0.01, 0.99, PERCENTILE_SAMPLE_CAP);
-    } catch (err) {
-      this.setStatus(`Auto-stretch failed: ${(err as Error).message}`, true);
-      return null;
+  /** Reflect an auto-stretch result in the inputs; cache RGB ranges per band name. */
+  private applyAutoResultToInputs(result: AutoStretchResult): void {
+    if (result.mode === 'single') {
+      this.el.minInput.value = formatStretch(result.min);
+      this.el.maxInput.value = formatStretch(result.max);
+      return;
     }
+    if (this.roles !== null) {
+      for (const ch of ['r', 'g', 'b'] as const) {
+        const range = result[ch];
+        if (range !== null) this.bandStretch.set(this.roles[ch], range);
+      }
+    }
+    this.loadChannelStretchIntoInputs();
   }
 
   private fps(): number {
@@ -356,47 +316,6 @@ export class DemoControls {
     this.el.statBytes.textContent = formatBytes(this.getBytesFetched());
   }
 
-  private setStatus(message: string, isError: boolean): void {
-    this.el.status.textContent = message;
-    this.el.status.classList.toggle('error', isError);
-    this.el.status.classList.toggle('hidden', message === '');
-  }
-}
-
-/**
- * 1st/99th-percentile pair over the finite values across `arrays`. Subsamples
- * with a fixed stride when the total exceeds `cap` so a wide viewport's sort
- * stays cheap. Returns null when there is no finite data or the range collapses.
- */
-export function percentileRange(
-  arrays: Float32Array[],
-  pLo: number,
-  pHi: number,
-  cap: number,
-): [number, number] | null {
-  let total = 0;
-  for (const a of arrays) total += a.length;
-  if (total === 0) return null;
-  const stride = total > cap ? Math.ceil(total / cap) : 1;
-
-  const vals: number[] = [];
-  let idx = 0;
-  for (const a of arrays) {
-    for (let i = 0; i < a.length; i++, idx++) {
-      if (stride > 1 && idx % stride !== 0) continue;
-      const v = a[i];
-      if (Number.isFinite(v)) vals.push(v);
-    }
-  }
-  if (vals.length === 0) return null;
-  vals.sort((x, y) => x - y);
-
-  const at = (p: number): number =>
-    vals[Math.min(vals.length - 1, Math.max(0, Math.round(p * (vals.length - 1))))];
-  const lo = at(pLo);
-  const hi = at(pHi);
-  if (!(hi > lo)) return null;
-  return [lo, hi];
 }
 
 /** Fill a <select> with `options`, selecting `selected`. */

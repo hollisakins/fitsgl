@@ -63,8 +63,10 @@ import {
   tileWorldRect,
   visibleTiles,
   type LevelGeom,
+  type TileCoord,
   type WorldRect,
 } from './tile-manager.js';
+import { percentileRange, PERCENTILE_SAMPLE_CAP } from './auto-stretch.js';
 
 /** Maximum zoom-in: this many drawing-buffer pixels per native pixel. */
 const MAX_NATIVE_ZOOM = 16;
@@ -113,6 +115,20 @@ export interface CursorInfo {
    *  with the overlay hit-test in one event (decision D10). */
   marker: ResolvedMarker | null;
 }
+
+/**
+ * What `autoStretch` applied, returned so a host can reflect it in its inputs.
+ * RGB entries are `null` for a channel whose visible tiles held no finite data
+ * (that channel's stretch is left unchanged).
+ */
+export type AutoStretchResult =
+  | { mode: 'single'; min: number; max: number }
+  | {
+      mode: 'rgb';
+      r: [number, number] | null;
+      g: [number, number] | null;
+      b: [number, number] | null;
+    };
 
 export interface FitsViewerOptions {
   /** GPU texture budget in tiles (LRU by last visible frame). Default 200. */
@@ -182,6 +198,12 @@ export class FitsViewer {
    * so it is not `readonly`; everything grid-derived below stays `readonly`.
    */
   private bandManagers: TileManager[];
+  /**
+   * The pyramids behind `bandManagers`, in the same order. Kept so `autoStretch`
+   * can read decoded tile values (the managers hold only GPU textures). Length 1
+   * for single-band, 3 (R, G, B) for RGB; reassigned by `setSource`.
+   */
+  private bandPyramids: TilePyramid[];
   /** 'single' or 'rgb' — which draw path and shader mode this frame uses. */
   private mode: 'single' | 'rgb';
   /** Per-band GPU texture budget; each manager gets this (so RGB ≈ 3× resident). */
@@ -252,6 +274,10 @@ export class FitsViewer {
   private frameCounter = 0;
   private renderScheduled = false;
   private destroyed = false;
+  /** Level + world bounds of the last drawn frame; `autoStretch` reuses them so
+   *  it samples exactly the tiles already on screen (cache hits). */
+  private lastLevel = 0;
+  private lastBounds: WorldBounds | null = null;
 
   private dragging = false;
   private lastDragX = 0;
@@ -344,6 +370,7 @@ export class FitsViewer {
     this.bandManagers = norm.pyramids.map(
       (p) => new TileManager(gl, p, this.geoms, this.textureBudget, () => this.requestRender()),
     );
+    this.bandPyramids = norm.pyramids;
     // Prime the coarsest level (one tile per band) so an RGB composite shows a
     // whole-image low-res preview almost immediately rather than staying blank
     // until the finest common level loads (the common-level-hold policy).
@@ -495,6 +522,66 @@ export class FitsViewer {
     }
   }
 
+  /**
+   * Stretch to the `[pLo, pHi]` percentile of the data currently in view — the
+   * same tiles this frame drew, so they are cache hits. Single-band mode sets the
+   * shared stretch; RGB mode sets each channel from its own band, independently
+   * (the transfer curve stays shared, D5, so `stretchMode` is untouched).
+   *
+   * Resolves `null` before the first frame or when no tile is in view; otherwise
+   * the applied range(s), so a host can reflect them in its inputs. Promoted from
+   * the demo so a host need not import the internal tile-selection helpers (D11).
+   */
+  async autoStretch(pLo = 0.01, pHi = 0.99): Promise<AutoStretchResult | null> {
+    const bounds = this.lastBounds;
+    if (bounds === null) return null;
+    const level = this.lastLevel;
+    const geom = this.geoms.get(level);
+    if (geom === undefined) return null;
+    const tiles = visibleTiles(geom, bounds);
+    if (tiles.length === 0) return null;
+
+    // lastLevel/lastBounds may predate a just-applied `setSource` (e.g. the RGB
+    // toggle calls this right after switching bands), but every band shares the
+    // grid (D7) and the viewport is unchanged — so the tile coords stay valid and
+    // we simply sample the same tiles from the new bands' pyramids.
+    if (this.mode === 'rgb') {
+      // mode==='rgb' ⇒ bandPyramids has exactly 3 entries (normalizeSource invariant).
+      const roles = ['r', 'g', 'b'] as const;
+      const out: AutoStretchResult = { mode: 'rgb', r: null, g: null, b: null };
+      for (let i = 0; i < 3; i++) {
+        const range = await this.sampleVisiblePercentile(this.bandPyramids[i], level, tiles, pLo, pHi);
+        out[roles[i]] = range;
+        if (range !== null) this.setChannelStretch(roles[i], range[0], range[1]);
+      }
+      return out;
+    }
+
+    const range = await this.sampleVisiblePercentile(this.bandPyramids[0], level, tiles, pLo, pHi);
+    if (range === null) return null;
+    this.setStretch(range[0], range[1]);
+    return { mode: 'single', min: range[0], max: range[1] };
+  }
+
+  /** Fetch the given tiles from `pyramid` (cache hits) and percentile them. */
+  private async sampleVisiblePercentile(
+    pyramid: TilePyramid,
+    level: number,
+    tiles: readonly TileCoord[],
+    pLo: number,
+    pHi: number,
+  ): Promise<[number, number] | null> {
+    try {
+      const arrays = await Promise.all(tiles.map((t) => pyramid.getTile(level, t.tileX, t.tileY)));
+      return percentileRange(arrays, pLo, pHi, PERCENTILE_SAMPLE_CAP);
+    } catch (err) {
+      // A tile fetch can fail (network/decoder); auto-stretch is best-effort, so
+      // skip this band rather than reject the caller — but keep it visible.
+      console.warn('FitsViewer.autoStretch: tile fetch failed; leaving this band unchanged:', err);
+      return null;
+    }
+  }
+
   // ---- RGB compositing (M4, decisions D7/D8) -----------------------------
 
   /**
@@ -518,6 +605,7 @@ export class FitsViewer {
     }
     const old = this.bandManagers;
     this.bandManagers = next;
+    this.bandPyramids = norm.pyramids;
     this.mode = norm.mode;
     for (const m of old) m.destroy();
     this.requestRender();
@@ -806,6 +894,9 @@ export class FitsViewer {
     // for every band and computed once.
     const selectionZoom = this.hiDpiLevels ? this.camera.zoom : this.camera.zoom / this.dpr;
     const level = targetLevel(selectionZoom, this.maxLevel);
+    // Remember this frame's selection so `autoStretch` samples exactly what drew.
+    this.lastLevel = level;
+    this.lastBounds = bounds;
     const geom = this.geoms.get(level);
     let visibleTileCount = 0;
     if (geom !== undefined) {

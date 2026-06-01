@@ -407,10 +407,10 @@ must add no behavior of their own, only adapt the interface.
 This argues for a single high-level `ViewerConfig` type that the core accepts and
 **all three tiers consume**, so a new feature is added in exactly one type and is
 automatically reachable from every tier. Its shape (settled in M5): a **list of
-bands** — each band a short name, an optional RGB role, and a `tiles` list of
-pyramid-manifest URLs (length 1 for an ordinary image, N for an M6 mosaic, D14) —
-plus the view state: stretch mode + min/max, colormap, North-up on/off, and an
-overlay source. Markers are **not** a static config field for the React path: the
+bands** — each band a short name and a `tiles` list of pyramid-manifest URLs
+(length 1 for an ordinary image, N for an M6 mosaic, D14) — plus the view state:
+which band(s) to show (single, or three as R/G/B), stretch mode + min/max,
+colormap, North-up on/off, and an overlay source. Markers are **not** a static config field for the React path: the
 M3 push API (`setMarkers`/`setMarkerHandlers`, sky-coordinate input, an opaque
 per-marker `data` payload, click/hover callbacks) lets a host like CAMPFIRE own
 the catalog DB and push the filtered set live; the SSG's CSV + built-in popup is

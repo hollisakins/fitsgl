@@ -13,40 +13,42 @@
 
 import {
   FitsViewer,
-  TilePyramid,
   httpRangeFetch,
   loadDataset,
+  loadViewerSource,
   resolveDatasetBandUrl,
   parseCatalogCSV,
   formatRA,
   formatDec,
+  type BandConfig,
   type DatasetManifest,
   type MarkerInput,
   type RangeFetcher,
+  type RenderSource,
   type ResolvedMarker,
+  type TilePyramid,
   type TilePyramidOptions,
+  type ViewerConfig,
 } from 'fits-pyramid';
 import { DemoControls } from './controls.js';
 
 /**
- * The viewer's data source. A `dataset.json` beside the manifest (M4) yields a
- * multi-band RGB-capable source; otherwise we fall back to a single
- * `manifest.json` (a real-mosaic build, or a pre-M4 pyramid).
+ * The viewer's data source, assembled by the library from a `ViewerConfig` (M5).
+ * A `dataset.json` beside the manifest (M4) yields a multi-band, RGB-capable
+ * config; otherwise we fall back to a single `manifest.json` (a real-mosaic build,
+ * or a pre-M4 pyramid).
  */
-interface DatasetSource {
-  kind: 'dataset';
-  dataset: DatasetManifest;
+interface DemoSource {
   pyramids: Map<string, TilePyramid>;
-  representative: TilePyramid;
+  source: RenderSource;
+  /** Present in multi-band mode; drives the RGB toggle + band pickers. */
+  dataset: DatasetManifest | null;
+  /** Name of the band shown initially (the default red channel, or the only band). */
+  representative: string;
 }
-interface SingleSource {
-  kind: 'single';
-  pyramid: TilePyramid;
-}
-type SourceData = DatasetSource | SingleSource;
 
-/** Load the dataset (3 bands) if present, else a single-band pyramid. */
-async function loadSourceData(baseUrl: string, opts: TilePyramidOptions): Promise<SourceData> {
+/** Build a `ViewerConfig` from what's on disk and let the library load it. */
+async function loadDemoSource(baseUrl: string, opts: TilePyramidOptions): Promise<DemoSource> {
   const datasetUrl = new URL('pyramid/dataset.json', baseUrl).href;
   let dataset: DatasetManifest | null = null;
   try {
@@ -55,19 +57,26 @@ async function loadSourceData(baseUrl: string, opts: TilePyramidOptions): Promis
     dataset = null; // no/invalid dataset -> single-band fallback below
   }
 
+  let config: ViewerConfig;
+  let representative: string;
   if (dataset !== null) {
-    const pyramids = new Map<string, TilePyramid>();
-    for (const band of dataset.bands) {
-      pyramids.set(band.name, await TilePyramid.load(resolveDatasetBandUrl(datasetUrl, band.path), opts));
-    }
-    const repName = dataset.default_rgb?.r ?? dataset.bands[0].name;
-    const representative = pyramids.get(repName) ?? pyramids.get(dataset.bands[0].name);
-    if (representative === undefined) throw new Error('dataset has no usable band');
-    return { kind: 'dataset', dataset, pyramids, representative };
+    const bands: BandConfig[] = dataset.bands.map((b) => ({
+      name: b.name,
+      tiles: [resolveDatasetBandUrl(datasetUrl, b.path)],
+    }));
+    representative = dataset.default_rgb?.r ?? dataset.bands[0].name;
+    config = { bands, view: { mode: 'single', band: representative } };
+  } else {
+    representative = 'image';
+    const manifestUrl = new URL('pyramid/manifest.json', baseUrl).href;
+    config = {
+      bands: [{ name: representative, tiles: [manifestUrl] }],
+      view: { mode: 'single', band: representative },
+    };
   }
 
-  const manifestUrl = new URL('pyramid/manifest.json', baseUrl).href;
-  return { kind: 'single', pyramid: await TilePyramid.load(manifestUrl, opts) };
+  const { pyramids, source } = await loadViewerSource(config, opts);
+  return { pyramids, source, dataset, representative };
 }
 
 /** Load the optional overlay catalog served beside the manifest (empty if absent). */
@@ -120,9 +129,9 @@ async function main(): Promise<void> {
     return data;
   };
 
-  let source: SourceData;
+  let loaded: DemoSource;
   try {
-    source = await loadSourceData(document.baseURI, {
+    loaded = await loadDemoSource(document.baseURI, {
       useWorker: false,
       rangeFetch: countingRangeFetch,
       cacheSize: DECODED_TILE_CACHE,
@@ -136,9 +145,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  const { pyramids, source, dataset, representative } = loaded;
   // Single-band by default; in dataset mode the representative band is the
   // default red channel (the RGB toggle composites all three).
-  const pyramid = source.kind === 'dataset' ? source.representative : source.pyramid;
+  const pyramid = pyramids.get(representative);
+  if (pyramid === undefined) throw new Error('demo: representative band missing after load');
   const manifest = pyramid.getManifest();
 
   const controls = new DemoControls(
@@ -170,7 +181,7 @@ async function main(): Promise<void> {
     () => bytesFetched,
   );
 
-  const viewer = new FitsViewer(canvas, pyramid, {
+  const viewer = new FitsViewer(canvas, source, {
     textureBudget: GPU_TEXTURE_BUDGET,
     onFrame: (info) => controls.handleFrame(info),
     onCursor: (info) => controls.handleCursor(info),
@@ -186,8 +197,8 @@ async function main(): Promise<void> {
   controls.setViewer(viewer);
 
   // In dataset mode, hand the controls the bands so the RGB toggle + pickers work.
-  if (source.kind === 'dataset') {
-    controls.setDataset(source.dataset, source.pyramids);
+  if (dataset !== null) {
+    controls.setDataset(dataset, pyramids);
   }
 
   status.classList.add('hidden');
@@ -202,11 +213,7 @@ async function main(): Promise<void> {
   const teardown = (): void => {
     controls.destroy();
     viewer.destroy();
-    if (source.kind === 'dataset') {
-      for (const p of source.pyramids.values()) p.destroy();
-    } else {
-      source.pyramid.destroy();
-    }
+    for (const p of pyramids.values()) p.destroy();
   };
   window.addEventListener('beforeunload', teardown);
   import.meta.hot?.dispose(teardown);

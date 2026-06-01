@@ -32,6 +32,11 @@ export type { WorkerLike, WorkerReply, WorkerRequest } from './fpack/worker-prot
 // Phase 3 — WebGL2 viewer
 export { FitsViewer, Camera } from './renderer/index.js';
 export type { FitsViewerOptions, ViewerFrameInfo, CursorInfo } from './renderer/index.js';
+// M5 — percentile auto-stretch (promoted from the demo so hosts don't import the
+// internal tile-selection helpers, decision D11). `FitsViewer.autoStretch` applies
+// it to the data in view; `percentileRange` is the pure underlying math.
+export { percentileRange, PERCENTILE_SAMPLE_CAP } from './renderer/index.js';
+export type { AutoStretchResult } from './renderer/index.js';
 // M4 — RGB composite render source (single band, or three same-grid bands).
 export type { RenderSource, SingleBandSource, RgbSource } from './renderer/index.js';
 // Phase 3 — tile-selection helpers (for tools/demos building on the viewer).
@@ -83,3 +88,23 @@ export type {
   ColorInput,
   ColorTuple,
 } from './overlay/index.js';
+
+// M5 — ViewerConfig: the single high-level config every delivery tier (React,
+// vanilla embed, SSG) consumes. `loadViewerSource` does the URL->RenderSource
+// orchestration that used to live in the demo. The view/stretch fields reference
+// `StretchMode`/`ColormapName` (exported above). A band's `tiles` list is length 1
+// today; length N is the M6 tiled-mosaic case (decisions D13/D14).
+export {
+  validateViewerConfig,
+  renderSourceForView,
+  loadViewerSource,
+} from './viewer-config.js';
+export type {
+  ViewerConfig,
+  BandConfig,
+  StretchRange,
+  ViewerStretchConfig,
+  ViewerView,
+  OverlaySource,
+  LoadedViewerSource,
+} from './viewer-config.js';
