@@ -9,3 +9,7 @@
 export { parseWcs, pixToSky, skyToPix } from './tan.js';
 export type { TanWcs, SkyCoord, PixelCoord } from './tan.js';
 export { formatRA, formatDec } from './format.js';
+
+// M4 — grid compatibility for RGB compositing (the authoritative same-grid gate).
+export { gridsMatch, GRID_MATCH_SUBPIXEL_FRACTION } from './grid-match.js';
+export type { GridSpec } from './grid-match.js';

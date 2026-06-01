@@ -15,14 +15,60 @@ import {
   FitsViewer,
   TilePyramid,
   httpRangeFetch,
+  loadDataset,
+  resolveDatasetBandUrl,
   parseCatalogCSV,
   formatRA,
   formatDec,
+  type DatasetManifest,
   type MarkerInput,
   type RangeFetcher,
   type ResolvedMarker,
+  type TilePyramidOptions,
 } from 'fits-pyramid';
 import { DemoControls } from './controls.js';
+
+/**
+ * The viewer's data source. A `dataset.json` beside the manifest (M4) yields a
+ * multi-band RGB-capable source; otherwise we fall back to a single
+ * `manifest.json` (a real-mosaic build, or a pre-M4 pyramid).
+ */
+interface DatasetSource {
+  kind: 'dataset';
+  dataset: DatasetManifest;
+  pyramids: Map<string, TilePyramid>;
+  representative: TilePyramid;
+}
+interface SingleSource {
+  kind: 'single';
+  pyramid: TilePyramid;
+}
+type SourceData = DatasetSource | SingleSource;
+
+/** Load the dataset (3 bands) if present, else a single-band pyramid. */
+async function loadSourceData(baseUrl: string, opts: TilePyramidOptions): Promise<SourceData> {
+  const datasetUrl = new URL('pyramid/dataset.json', baseUrl).href;
+  let dataset: DatasetManifest | null = null;
+  try {
+    dataset = await loadDataset(datasetUrl);
+  } catch {
+    dataset = null; // no/invalid dataset -> single-band fallback below
+  }
+
+  if (dataset !== null) {
+    const pyramids = new Map<string, TilePyramid>();
+    for (const band of dataset.bands) {
+      pyramids.set(band.name, await TilePyramid.load(resolveDatasetBandUrl(datasetUrl, band.path), opts));
+    }
+    const repName = dataset.default_rgb?.r ?? dataset.bands[0].name;
+    const representative = pyramids.get(repName) ?? pyramids.get(dataset.bands[0].name);
+    if (representative === undefined) throw new Error('dataset has no usable band');
+    return { kind: 'dataset', dataset, pyramids, representative };
+  }
+
+  const manifestUrl = new URL('pyramid/manifest.json', baseUrl).href;
+  return { kind: 'single', pyramid: await TilePyramid.load(manifestUrl, opts) };
+}
 
 /** Load the optional overlay catalog served beside the manifest (empty if absent). */
 async function loadCatalog(baseUrl: string): Promise<MarkerInput[]> {
@@ -67,10 +113,6 @@ async function main(): Promise<void> {
   const canvas = el<HTMLCanvasElement>('view');
   const status = el('status');
 
-  // Absolute URL so the library can resolve per-level filenames against it
-  // (`new URL(filename, manifestUrl)` requires an absolute base).
-  const manifestUrl = new URL('pyramid/manifest.json', document.baseURI).href;
-
   let bytesFetched = 0;
   const countingRangeFetch: RangeFetcher = async (url, start, endInclusive) => {
     const data = await httpRangeFetch(url, start, endInclusive);
@@ -78,9 +120,9 @@ async function main(): Promise<void> {
     return data;
   };
 
-  let pyramid: TilePyramid;
+  let source: SourceData;
   try {
-    pyramid = await TilePyramid.load(manifestUrl, {
+    source = await loadSourceData(document.baseURI, {
       useWorker: false,
       rangeFetch: countingRangeFetch,
       cacheSize: DECODED_TILE_CACHE,
@@ -94,6 +136,9 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Single-band by default; in dataset mode the representative band is the
+  // default red channel (the RGB toggle composites all three).
+  const pyramid = source.kind === 'dataset' ? source.representative : source.pyramid;
   const manifest = pyramid.getManifest();
 
   const controls = new DemoControls(
@@ -105,6 +150,11 @@ async function main(): Promise<void> {
       colormapSelect: el<HTMLSelectElement>('colormap'),
       northUpCheckbox: el<HTMLInputElement>('northup'),
       markersCheckbox: el<HTMLInputElement>('markers'),
+      rgbCheckbox: el<HTMLInputElement>('rgb'),
+      bandRSelect: el<HTMLSelectElement>('band-r'),
+      bandGSelect: el<HTMLSelectElement>('band-g'),
+      bandBSelect: el<HTMLSelectElement>('band-b'),
+      channelSelect: el<HTMLSelectElement>('channel'),
       statZoom: el('stat-zoom'),
       statRaDec: el('stat-radec'),
       statCenter: el('stat-center'),
@@ -135,6 +185,11 @@ async function main(): Promise<void> {
   });
   controls.setViewer(viewer);
 
+  // In dataset mode, hand the controls the bands so the RGB toggle + pickers work.
+  if (source.kind === 'dataset') {
+    controls.setDataset(source.dataset, source.pyramids);
+  }
+
   status.classList.add('hidden');
 
   // Load the optional overlay catalog and hand it to the controls (which toggle
@@ -147,7 +202,11 @@ async function main(): Promise<void> {
   const teardown = (): void => {
     controls.destroy();
     viewer.destroy();
-    pyramid.destroy();
+    if (source.kind === 'dataset') {
+      for (const p of source.pyramids.values()) p.destroy();
+    } else {
+      source.pyramid.destroy();
+    }
   };
   window.addEventListener('beforeunload', teardown);
   import.meta.hot?.dispose(teardown);

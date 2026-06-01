@@ -9,6 +9,22 @@
 export { FitsViewer } from './viewer.js';
 export type { FitsViewerOptions, ViewerFrameInfo, CursorInfo } from './viewer.js';
 
+// M4 — render-source model (single band, or three same-grid bands) + the pure
+// grid-compatibility guard (GL-free, so it unit-tests under Node).
+export {
+  isRenderSource,
+  normalizeSource,
+  manifestGridSpec,
+  geomsEqual,
+  isCompatibleGrid,
+} from './render-source.js';
+export type {
+  RenderSource,
+  SingleBandSource,
+  RgbSource,
+  NormalizedSource,
+} from './render-source.js';
+
 export { Camera } from './camera.js';
 export type { Point, WorldBounds } from './camera.js';
 
@@ -23,6 +39,7 @@ export {
   targetLevel,
   visibleTiles,
   coarserFallback,
+  commonResidentLevel,
   selectEvictions,
   buildLevelGeoms,
   tileWorldRect,

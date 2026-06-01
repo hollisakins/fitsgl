@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "bands": [
+    {
+      "name": "red",
+      "path": "red/manifest.json",
+      "ctype1": "RA---TAN",
+      "ctype2": "DEC--TAN",
+      "shape": [
+        512,
+        512
+      ],
+      "crpix": [
+        256.5,
+        256.5
+      ],
+      "crval": [
+        150.0,
+        2.2
+      ],
+      "cd": [
+        -8.333e-06,
+        0.0,
+        0.0,
+        8.333e-06
+      ],
+      "pixel_scale_arcsec": 0.03,
+      "grid_hash": "cd26eeba"
+    },
+    {
+      "name": "green",
+      "path": "green/manifest.json",
+      "ctype1": "RA---TAN",
+      "ctype2": "DEC--TAN",
+      "shape": [
+        512,
+        512
+      ],
+      "crpix": [
+        256.5,
+        256.5
+      ],
+      "crval": [
+        150.0,
+        2.2
+      ],
+      "cd": [
+        -8.333e-06,
+        0.0,
+        0.0,
+        8.333e-06
+      ],
+      "pixel_scale_arcsec": 0.03,
+      "grid_hash": "cd26eeba"
+    },
+    {
+      "name": "blue",
+      "path": "blue/manifest.json",
+      "ctype1": "RA---TAN",
+      "ctype2": "DEC--TAN",
+      "shape": [
+        512,
+        512
+      ],
+      "crpix": [
+        256.5,
+        256.5
+      ],
+      "crval": [
+        150.0,
+        2.2
+      ],
+      "cd": [
+        -8.333e-06,
+        0.0,
+        0.0,
+        8.333e-06
+      ],
+      "pixel_scale_arcsec": 0.03,
+      "grid_hash": "cd26eeba"
+    }
+  ],
+  "default_rgb": {
+    "r": "red",
+    "g": "green",
+    "b": "blue"
+  }
+}

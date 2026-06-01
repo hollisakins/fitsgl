@@ -163,6 +163,36 @@ export function coarserFallback(
 }
 
 /**
+ * Finest pyramid level `cl >= level` at which the tile (or its shared ancestor)
+ * is resident in EVERY composite band — for RGB compositing (decision D7).
+ *
+ * The tile vertex shader exposes a single `u_uv`/`v_uv`, so all three channels
+ * must be sampled from the same source level + sub-rectangle in one draw call;
+ * registration is guaranteed only when the three bands draw from a COMMON level.
+ * Unlike `coarserFallback` (which starts at `level + 1` because the single-band
+ * path checks the target level itself separately), this INCLUDES `cl = level` —
+ * the common, fully-loaded steady state — then walks up one level at a time
+ * (each step halves the tile index). `hasAll(level, tileX, tileY)` must report
+ * whether *every* band has that tile resident. Returns the common level and its
+ * ancestor tile index, or null if no level up to `maxLevel` is common to all.
+ */
+export function commonResidentLevel(
+  level: number,
+  tileX: number,
+  tileY: number,
+  maxLevel: number,
+  hasAll: (level: number, tileX: number, tileY: number) => boolean,
+): TileCoord | null {
+  for (let cl = level; cl <= maxLevel; cl++) {
+    const k = cl - level;
+    const ctx = Math.floor(tileX / 2 ** k);
+    const cty = Math.floor(tileY / 2 ** k);
+    if (hasAll(cl, ctx, cty)) return { level: cl, tileX: ctx, tileY: cty };
+  }
+  return null;
+}
+
+/**
  * UV sub-rectangle of an ancestor tile's texture that corresponds to a
  * (smaller) descendant tile's world rectangle. Used to draw a coarse tile into
  * a fine tile's screen area. (0,0) = top-left of the texture, matching the

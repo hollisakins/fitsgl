@@ -86,6 +86,13 @@
       #bottombar { color: var(--muted); flex-wrap: wrap; gap: 6px 20px; }
       .stat { white-space: nowrap; }
       .stat b { color: var(--text); font-weight: 600; }
+
+      /* RGB-mode visibility: single-band-only controls hide in RGB mode and the
+         R/G/B band pickers + channel selector hide outside it. */
+      .rgb-only { display: none; }
+      body.rgb-mode .rgb-only { display: flex; }
+      body.rgb-mode .single-only { display: none; }
+      .field select.band { width: 78px; }
     </style>
   </head>
   <body>
@@ -105,9 +112,33 @@
           <label for="stretch-mode">stretch</label>
           <select id="stretch-mode" title="Display transfer curve"></select>
         </div>
-        <div class="field">
+        <div class="field single-only">
           <label for="colormap">cmap</label>
           <select id="colormap" title="Single-band colormap"></select>
+        </div>
+        <div class="field rgb-only">
+          <label for="channel" title="Which channel the min/max apply to">chan</label>
+          <select id="channel" title="Channel the min/max edit (each channel is independent)">
+            <option value="r">R</option>
+            <option value="g">G</option>
+            <option value="b">B</option>
+          </select>
+        </div>
+        <label class="field check" for="rgb" title="Composite three same-grid bands as one RGB image">
+          <input id="rgb" type="checkbox" disabled />
+          RGB
+        </label>
+        <div class="field rgb-only">
+          <label for="band-r">R</label>
+          <select id="band-r" class="band" title="Band for the red channel"></select>
+        </div>
+        <div class="field rgb-only">
+          <label for="band-g">G</label>
+          <select id="band-g" class="band" title="Band for the green channel"></select>
+        </div>
+        <div class="field rgb-only">
+          <label for="band-b">B</label>
+          <select id="band-b" class="band" title="Band for the blue channel"></select>
         </div>
         <label class="field check" for="northup" title="Render North-up / East-left from the WCS">
           <input id="northup" type="checkbox" />

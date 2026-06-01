@@ -4,6 +4,7 @@ import {
   targetLevel,
   visibleTiles,
   coarserFallback,
+  commonResidentLevel,
   selectEvictions,
   buildLevelGeoms,
   tileWorldRect,
@@ -170,6 +171,67 @@ describe('coarserFallback', () => {
   it('returns null at the coarsest level (no ancestors exist)', () => {
     const fb = coarserFallback(maxLevel, 0, 0, maxLevel, () => true);
     expect(fb).toBeNull();
+  });
+});
+
+describe('commonResidentLevel (RGB composite, M4)', () => {
+  const maxLevel = 4;
+
+  it('returns the TARGET level when all bands have the tile there (the inclusive-L case coarserFallback misses)', () => {
+    const found = commonResidentLevel(0, 5, 3, maxLevel, (l, x, y) =>
+      l === 0 && x === 5 && y === 3,
+    );
+    expect(found).toEqual({ level: 0, tileX: 5, tileY: 3 });
+  });
+
+  it('walks up to the finest level common to all bands when the target is not all-resident', () => {
+    // Common only at level 1: ancestor of (0,5,3) at z=1 is (1,2,1).
+    const found = commonResidentLevel(0, 5, 3, maxLevel, (l, x, y) =>
+      l === 1 && x === 2 && y === 1,
+    );
+    expect(found).toEqual({ level: 1, tileX: 2, tileY: 1 });
+  });
+
+  it('finds the common level even when bands diverge at finer levels', () => {
+    // R has (0,5,3)+(2,1,0); G has (1,2,1)+(2,1,0); B has (2,1,0). The only level
+    // where ALL THREE share the ancestor is z=2 -> (2,1,0).
+    const r = new Set([tileKey(0, 5, 3), tileKey(2, 1, 0)]);
+    const g = new Set([tileKey(1, 2, 1), tileKey(2, 1, 0)]);
+    const b = new Set([tileKey(2, 1, 0)]);
+    const found = commonResidentLevel(0, 5, 3, maxLevel, (l, x, y) => {
+      const k = tileKey(l, x, y);
+      return r.has(k) && g.has(k) && b.has(k);
+    });
+    expect(found).toEqual({ level: 2, tileX: 1, tileY: 0 });
+  });
+
+  it('returns null when no level is common to all bands', () => {
+    const r = new Set([tileKey(0, 5, 3)]);
+    const g = new Set([tileKey(1, 2, 1)]);
+    const found = commonResidentLevel(0, 5, 3, maxLevel, (l, x, y) => {
+      const k = tileKey(l, x, y);
+      return r.has(k) && g.has(k); // B has nothing
+    });
+    expect(found).toBeNull();
+  });
+
+  it('probes the target level first (inclusive), then walks ancestors, stopping at the common level', () => {
+    // The viewer passes a predicate that acquire()s every band at each consulted
+    // level; this records that the helper consults L, then its ancestors, and
+    // stops — the hook that keeps a band-ahead tile from being evicted while a
+    // laggard sibling loads.
+    const calls: Array<[number, number, number]> = [];
+    const resident = new Set([tileKey(2, 1, 0)]);
+    const found = commonResidentLevel(0, 5, 3, maxLevel, (l, x, y) => {
+      calls.push([l, x, y]);
+      return resident.has(tileKey(l, x, y));
+    });
+    expect(found).toEqual({ level: 2, tileX: 1, tileY: 0 });
+    expect(calls).toEqual([
+      [0, 5, 3],
+      [1, 2, 1],
+      [2, 1, 0],
+    ]);
   });
 });
 

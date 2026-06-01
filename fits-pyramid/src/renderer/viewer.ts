@@ -33,6 +33,13 @@ import {
   type Mat2,
 } from './view-transform.js';
 import { parseWcs, pixToSky, type TanWcs } from '../wcs/tan.js';
+import { type GridSpec } from '../wcs/grid-match.js';
+import {
+  isCompatibleGrid,
+  manifestGridSpec,
+  normalizeSource,
+  type RenderSource,
+} from './render-source.js';
 import {
   MarkerStore,
   type MarkerEvent,
@@ -50,6 +57,7 @@ import {
   TileManager,
   buildLevelGeoms,
   coarserFallback,
+  commonResidentLevel,
   fallbackUV,
   targetLevel,
   tileWorldRect,
@@ -168,7 +176,18 @@ export class FitsViewer {
   private readonly vao: WebGLVertexArrayObject;
   private readonly quadBuffer: WebGLBuffer;
   private readonly camera: Camera;
-  private readonly tiles: TileManager;
+  /**
+   * Tile managers, one per band: length 1 for single-band, length 3 (R, G, B)
+   * for an RGB composite. Reassigned by `setSource` (which is grid-preserving),
+   * so it is not `readonly`; everything grid-derived below stays `readonly`.
+   */
+  private bandManagers: TileManager[];
+  /** 'single' or 'rgb' — which draw path and shader mode this frame uses. */
+  private mode: 'single' | 'rgb';
+  /** Per-band GPU texture budget; each manager gets this (so RGB ≈ 3× resident). */
+  private readonly textureBudget: number;
+  /** The construction-time grid every `setSource` band must match (D7). */
+  private readonly gridSpec: GridSpec;
   private readonly geoms: Map<number, LevelGeom>;
   private readonly maxLevel: number;
   private readonly nativeW: number;
@@ -186,6 +205,10 @@ export class FitsViewer {
   private readonly uMin: WebGLUniformLocation | null;
   private readonly uMax: WebGLUniformLocation | null;
   private readonly uTile: WebGLUniformLocation | null;
+  private readonly uTileG: WebGLUniformLocation | null;
+  private readonly uTileB: WebGLUniformLocation | null;
+  private readonly uMinRGB: WebGLUniformLocation | null;
+  private readonly uMaxRGB: WebGLUniformLocation | null;
   private readonly uMode: WebGLUniformLocation | null;
   private readonly uStretchMode: WebGLUniformLocation | null;
   private readonly uUseColormap: WebGLUniformLocation | null;
@@ -194,6 +217,10 @@ export class FitsViewer {
   private stretchMin = 0;
   private stretchMax = 1;
   private stretchMode: StretchMode = 'linear';
+  /** Per-channel display interval for RGB mode (R, G, B). The transfer curve
+   *  (`stretchMode`) is shared across channels; only min/max are independent. */
+  private channelMin: [number, number, number] = [0, 0, 0];
+  private channelMax: [number, number, number] = [1, 1, 1];
   /** Single-band colormap LUT (texture unit 1), or null for grayscale. */
   private colormapTexture: WebGLTexture | null = null;
 
@@ -242,14 +269,25 @@ export class FitsViewer {
   private readonly frame: () => void;
   private readonly pointerFrame: () => void;
 
-  constructor(canvas: HTMLCanvasElement, pyramid: TilePyramid, options: FitsViewerOptions = {}) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    source: TilePyramid | RenderSource,
+    options: FitsViewerOptions = {},
+  ) {
     this.canvas = canvas;
-    this.manifest = pyramid.getManifest();
+    const norm = normalizeSource(source);
+    this.mode = norm.mode;
+    // The representative band defines the grid/WCS; in RGB mode every band shares
+    // it (verified below), so any band would do.
+    const representative = norm.pyramids[0];
+    this.manifest = representative.getManifest();
     const [nativeH, nativeW] = this.manifest.native_shape;
     this.nativeW = nativeW;
     this.nativeH = nativeH;
     this.maxLevel = this.manifest.n_levels;
     this.geoms = buildLevelGeoms(this.manifest);
+    this.textureBudget = options.textureBudget ?? DEFAULT_TEXTURE_BUDGET;
+    this.gridSpec = manifestGridSpec(this.manifest);
     this.onFrame = options.onFrame;
     this.onCursor = options.onCursor;
     this.hiDpiLevels = options.hiDpiLevels ?? false;
@@ -287,19 +325,31 @@ export class FitsViewer {
     this.uMin = gl.getUniformLocation(this.program, 'u_min');
     this.uMax = gl.getUniformLocation(this.program, 'u_max');
     this.uTile = gl.getUniformLocation(this.program, 'u_tile');
+    this.uTileG = gl.getUniformLocation(this.program, 'u_tileG');
+    this.uTileB = gl.getUniformLocation(this.program, 'u_tileB');
+    this.uMinRGB = gl.getUniformLocation(this.program, 'u_minRGB');
+    this.uMaxRGB = gl.getUniformLocation(this.program, 'u_maxRGB');
     this.uMode = gl.getUniformLocation(this.program, 'u_mode');
     this.uStretchMode = gl.getUniformLocation(this.program, 'u_stretchMode');
     this.uUseColormap = gl.getUniformLocation(this.program, 'u_useColormap');
     this.uColormap = gl.getUniformLocation(this.program, 'u_colormap');
 
     this.camera = new Camera(Math.max(1, canvas.width), Math.max(1, canvas.height));
-    this.tiles = new TileManager(
-      gl,
-      pyramid,
-      this.geoms,
-      options.textureBudget ?? DEFAULT_TEXTURE_BUDGET,
-      () => this.requestRender(),
+    // In RGB mode every band must share the construction grid (identical shape +
+    // WCS), so compositing samples all three at one shared texcoord (D7). Verify
+    // the non-representative bands before building managers; throw on mismatch.
+    for (let i = 1; i < norm.pyramids.length; i++) {
+      this.assertCompatibleGrid(norm.pyramids[i]);
+    }
+    this.bandManagers = norm.pyramids.map(
+      (p) => new TileManager(gl, p, this.geoms, this.textureBudget, () => this.requestRender()),
     );
+    // Prime the coarsest level (one tile per band) so an RGB composite shows a
+    // whole-image low-res preview almost immediately rather than staying blank
+    // until the finest common level loads (the common-level-hold policy).
+    if (this.mode === 'rgb') {
+      for (const m of this.bandManagers) m.request(this.maxLevel, 0, 0);
+    }
 
     // Overlay subsystem (M3): the instanced marker renderer + a reused DOM popup.
     // The marker store/grid stay empty until the host adds markers.
@@ -445,6 +495,67 @@ export class FitsViewer {
     }
   }
 
+  // ---- RGB compositing (M4, decisions D7/D8) -----------------------------
+
+  /**
+   * Switch what the viewer draws between a single band and an RGB composite, or
+   * swap which pyramids fill R/G/B — live, for a band-picker UX. Every band in
+   * the new source must share the construction grid (identical shape + WCS, D7);
+   * a mismatch throws and the current source is kept. The grid is preserved, so
+   * North-up, the cursor sky readout, and any markers stay registered. New
+   * managers are built and primed before the old ones are destroyed, so GPU
+   * textures are never leaked. (A genuinely different grid needs a new viewer.)
+   */
+  setSource(source: RenderSource): void {
+    const norm = normalizeSource(source);
+    for (const p of norm.pyramids) this.assertCompatibleGrid(p);
+
+    const next = norm.pyramids.map(
+      (p) => new TileManager(this.gl, p, this.geoms, this.textureBudget, () => this.requestRender()),
+    );
+    if (norm.mode === 'rgb') {
+      for (const m of next) m.request(this.maxLevel, 0, 0);
+    }
+    const old = this.bandManagers;
+    this.bandManagers = next;
+    this.mode = norm.mode;
+    for (const m of old) m.destroy();
+    this.requestRender();
+  }
+
+  /**
+   * Set one RGB channel's display interval (min/max). RGB only — in single-band
+   * mode use `setStretch`. The transfer curve set by `setStretchMode` is shared
+   * across all three channels (decision D5); only the per-channel min/max are
+   * independent.
+   */
+  setChannelStretch(role: 'r' | 'g' | 'b', min: number, max: number): void {
+    const i = role === 'r' ? 0 : role === 'g' ? 1 : 2;
+    this.channelMin[i] = min;
+    this.channelMax[i] = max;
+    this.requestRender();
+  }
+
+  /** Whether the viewer is currently in RGB composite mode. */
+  get isRgb(): boolean {
+    return this.mode === 'rgb';
+  }
+
+  /**
+   * Throw unless `pyramid` shares the viewer's construction grid: identical
+   * native shape + WCS (`gridsMatch`) and identical per-level geometry
+   * (`geomsEqual`, which catches a same-shape pyramid built with a different
+   * tile size). This is what lets every band reuse the one set of grid-derived
+   * viewer state and one shared UV per composite tile.
+   */
+  private assertCompatibleGrid(pyramid: TilePyramid): void {
+    if (!isCompatibleGrid(this.gridSpec, this.geoms, pyramid.getManifest())) {
+      throw new Error(
+        'FitsViewer: RGB band grid does not match the viewer grid — identical native shape and WCS are required for compositing (decision D7).',
+      );
+    }
+  }
+
   /**
    * Turn North-up rendering on or off. A no-op (stays off) when the pyramid has
    * no usable WCS. Re-fits the zoom limits to the new orientation's extent and
@@ -563,7 +674,7 @@ export class FitsViewer {
     this.destroyed = true;
     if (this.pointerScheduled) cancelAnimationFrame(this.pointerRaf);
     this.detachHandlers();
-    this.tiles.destroy();
+    for (const m of this.bandManagers) m.destroy();
     this.clearColormapTexture();
     this.overlay.destroy(); // marker program, VAO, instance + quad buffers
     this.popup.destroy(); // remove the popup DOM node
@@ -670,27 +781,16 @@ export class FitsViewer {
   private draw(): void {
     const gl = this.gl;
     this.frameCounter++;
-    this.tiles.frame = this.frameCounter;
+    // One frame clock per band; advance all so each manager's LRU stays in step
+    // (a desync would let a band evict tiles its siblings still need to composite).
+    for (const m of this.bandManagers) m.frame = this.frameCounter;
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
-    gl.uniform1i(this.uMode, 0); // single-band (RGB composite is the M4 slot)
+    // The transfer curve is shared by single-band and RGB (decision D5).
     gl.uniform1i(this.uStretchMode, STRETCH_MODE_IDS[this.stretchMode]);
-    gl.uniform1f(this.uMin, this.stretchMin);
-    gl.uniform1f(this.uMax, this.stretchMax);
-    // Colormap LUT lives on texture unit 1; tiles bind to unit 0 in drawTile.
-    if (this.colormapTexture !== null) {
-      gl.uniform1i(this.uUseColormap, 1);
-      gl.uniform1i(this.uColormap, 1);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, this.colormapTexture);
-    } else {
-      gl.uniform1i(this.uUseColormap, 0);
-    }
-    gl.uniform1i(this.uTile, 0);
-    gl.activeTexture(gl.TEXTURE0);
 
     const orient = this.currentOrientation();
     // Under rotation the viewport maps to a rotated world rectangle; intersect
@@ -702,7 +802,8 @@ export class FitsViewer {
     // of what the user sees and would keep z=0 resident far past native. Dividing
     // by dpr drops to coarser levels as soon as the *displayed* image shrinks
     // below native (Leaflet's default). `hiDpiLevels` opts back into full
-    // device-pixel crispness.
+    // device-pixel crispness. Tile selection is grid-only, so it is identical
+    // for every band and computed once.
     const selectionZoom = this.hiDpiLevels ? this.camera.zoom : this.camera.zoom / this.dpr;
     const level = targetLevel(selectionZoom, this.maxLevel);
     const geom = this.geoms.get(level);
@@ -710,31 +811,11 @@ export class FitsViewer {
     if (geom !== undefined) {
       const tiles = visibleTiles(geom, bounds);
       visibleTileCount = tiles.length;
-      for (const t of tiles) {
-        const rect = tileWorldRect(geom, t.tileX, t.tileY);
-        const entry = this.tiles.acquire(level, t.tileX, t.tileY);
-        if (entry !== undefined) {
-          this.drawTile(orient, rect, entry.texture, 0, 0, 1, 1);
-          continue;
-        }
-        // Not resident yet: request it, and fill from the best coarser ancestor.
-        this.tiles.request(level, t.tileX, t.tileY);
-        const fb = coarserFallback(level, t.tileX, t.tileY, this.maxLevel, (l, x, y) =>
-          this.tiles.has(l, x, y),
-        );
-        if (fb !== null) {
-          const fbEntry = this.tiles.acquire(fb.level, fb.tileX, fb.tileY);
-          const fbGeom = this.geoms.get(fb.level);
-          if (fbEntry !== undefined && fbGeom !== undefined) {
-            const ancestor = tileWorldRect(fbGeom, fb.tileX, fb.tileY);
-            const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
-            this.drawTile(orient, rect, fbEntry.texture, u0, v0, u1, v1);
-          }
-        }
-      }
+      if (this.mode === 'rgb') this.drawRgbTiles(orient, geom, level, tiles);
+      else this.drawSingleBandTiles(orient, geom, level, tiles);
     }
 
-    this.tiles.evict(MAX_IDLE_FRAMES);
+    for (const m of this.bandManagers) m.evict(MAX_IDLE_FRAMES);
 
     // Markers draw on top of the tiles, sharing the oriented transform so they
     // stay registered under pan/zoom and North-up (decision D10). The marker pass
@@ -770,6 +851,122 @@ export class FitsViewer {
   }
 
   /**
+   * Single-band tile pass: set the single-band uniforms, then draw each visible
+   * tile (or its best coarser ancestor while loading). Byte-identical to the
+   * pre-M4 draw loop, operating on the lone band manager.
+   */
+  private drawSingleBandTiles(
+    orient: Mat2,
+    geom: LevelGeom,
+    level: number,
+    tiles: ReadonlyArray<{ tileX: number; tileY: number }>,
+  ): void {
+    const gl = this.gl;
+    gl.uniform1i(this.uMode, 0);
+    gl.uniform1f(this.uMin, this.stretchMin);
+    gl.uniform1f(this.uMax, this.stretchMax);
+    // Colormap LUT lives on texture unit 1; tiles bind to unit 0 in drawTile.
+    if (this.colormapTexture !== null) {
+      gl.uniform1i(this.uUseColormap, 1);
+      gl.uniform1i(this.uColormap, 1);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.colormapTexture);
+    } else {
+      gl.uniform1i(this.uUseColormap, 0);
+    }
+    gl.uniform1i(this.uTile, 0);
+    // Restore unit 0 as active (an RGB frame leaves it at TEXTURE3); drawTile
+    // binds to whichever unit is active.
+    gl.activeTexture(gl.TEXTURE0);
+
+    const mgr = this.bandManagers[0];
+    for (const t of tiles) {
+      const rect = tileWorldRect(geom, t.tileX, t.tileY);
+      const entry = mgr.acquire(level, t.tileX, t.tileY);
+      if (entry !== undefined) {
+        this.drawTile(orient, rect, entry.texture, 0, 0, 1, 1);
+        continue;
+      }
+      // Not resident yet: request it, and fill from the best coarser ancestor.
+      mgr.request(level, t.tileX, t.tileY);
+      const fb = coarserFallback(level, t.tileX, t.tileY, this.maxLevel, (l, x, y) =>
+        mgr.has(l, x, y),
+      );
+      if (fb !== null) {
+        const fbEntry = mgr.acquire(fb.level, fb.tileX, fb.tileY);
+        const fbGeom = this.geoms.get(fb.level);
+        if (fbEntry !== undefined && fbGeom !== undefined) {
+          const ancestor = tileWorldRect(fbGeom, fb.tileX, fb.tileY);
+          const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
+          this.drawTile(orient, rect, fbEntry.texture, u0, v0, u1, v1);
+        }
+      }
+    }
+  }
+
+  /**
+   * RGB composite tile pass (decisions D7/D8). Tile selection is grid-only, so
+   * the visible tiles are shared by all three bands. For each tile, draw from
+   * the finest level common to R, G, AND B (the vertex shader's single shared UV
+   * forces one source level + sub-rect across channels); request the target tile
+   * from every band; draw nothing for the tile if no common level is resident
+   * yet (common-level-hold). The all-three-NaN→transparent rule (D8) lives in
+   * the fragment shader.
+   */
+  private drawRgbTiles(
+    orient: Mat2,
+    geom: LevelGeom,
+    level: number,
+    tiles: ReadonlyArray<{ tileX: number; tileY: number }>,
+  ): void {
+    const gl = this.gl;
+    gl.uniform1i(this.uMode, 1);
+    gl.uniform3f(this.uMinRGB, this.channelMin[0], this.channelMin[1], this.channelMin[2]);
+    gl.uniform3f(this.uMaxRGB, this.channelMax[0], this.channelMax[1], this.channelMax[2]);
+    // Sampler units: R→0, G→2, B→3 (the colormap keeps unit 1, unused here). An
+    // UNSET sampler2D defaults to unit 0, so G and B MUST be assigned explicitly
+    // or they would both sample the R texture.
+    gl.uniform1i(this.uTile, 0);
+    gl.uniform1i(this.uTileG, 2);
+    gl.uniform1i(this.uTileB, 3);
+
+    const mr = this.bandManagers[0];
+    const mg = this.bandManagers[1];
+    const mb = this.bandManagers[2];
+    for (const t of tiles) {
+      const rect = tileWorldRect(geom, t.tileX, t.tileY);
+      // Drive every band toward the target tile.
+      mr.request(level, t.tileX, t.tileY);
+      mg.request(level, t.tileX, t.tileY);
+      mb.request(level, t.tileX, t.tileY);
+      // Finest level resident in ALL three bands. acquire() (not has()) marks
+      // each band's consulted tile visible this frame, so a band that is ahead
+      // cannot evict an ancestor its laggard siblings still need (cross-band
+      // eviction oscillation). Call all three unconditionally (no &&
+      // short-circuit) so every resident tile at the level is marked.
+      const common = commonResidentLevel(level, t.tileX, t.tileY, this.maxLevel, (l, x, y) => {
+        const hr = mr.acquire(l, x, y) !== undefined;
+        const hg = mg.acquire(l, x, y) !== undefined;
+        const hb = mb.acquire(l, x, y) !== undefined;
+        return hr && hg && hb;
+      });
+      if (common === null) continue; // common-level-hold: nothing to draw yet
+      const er = mr.acquire(common.level, common.tileX, common.tileY);
+      const eg = mg.acquire(common.level, common.tileX, common.tileY);
+      const eb = mb.acquire(common.level, common.tileX, common.tileY);
+      const fbGeom = this.geoms.get(common.level);
+      if (er === undefined || eg === undefined || eb === undefined || fbGeom === undefined) {
+        continue;
+      }
+      // One shared UV for all three channels (same grid ⟹ same sub-rect); when
+      // common.level === level the ancestor is the tile itself ⟹ UV (0,0,1,1).
+      const ancestor = tileWorldRect(fbGeom, common.tileX, common.tileY);
+      const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
+      this.drawTileRGB(orient, rect, er.texture, eg.texture, eb.texture, u0, v0, u1, v1);
+    }
+  }
+
+  /**
    * Draw a world rectangle textured by `texture` over the [u0,v0]-[u1,v1]
    * sub-rect, under orientation `orient`. The four destination corners are
    * transformed individually so a rotated/flipped orientation draws a rotated
@@ -795,6 +992,43 @@ export class FitsViewer {
     gl.uniform2f(this.uP11, p11.x, p11.y);
     gl.uniform4f(this.uUV, u0, v0, u1, v1);
     gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  /**
+   * Draw one composite tile from three same-grid band textures (RGB mode). The
+   * destination quad and the single shared UV are computed exactly as `drawTile`
+   * (same grid ⟹ identical for all three channels); R/G/B bind to texture units
+   * 0/2/3 to match the sampler uniforms set in `drawRgbTiles`. Leaves unit 3 as
+   * the active unit — the single-band pass re-activates unit 0 before drawing.
+   */
+  private drawTileRGB(
+    orient: Mat2,
+    rect: WorldRect,
+    texR: WebGLTexture,
+    texG: WebGLTexture,
+    texB: WebGLTexture,
+    u0: number,
+    v0: number,
+    u1: number,
+    v1: number,
+  ): void {
+    const gl = this.gl;
+    const p00 = this.worldToNdc(orient, rect.x0, rect.y0);
+    const p10 = this.worldToNdc(orient, rect.x1, rect.y0);
+    const p01 = this.worldToNdc(orient, rect.x0, rect.y1);
+    const p11 = this.worldToNdc(orient, rect.x1, rect.y1);
+    gl.uniform2f(this.uP00, p00.x, p00.y);
+    gl.uniform2f(this.uP10, p10.x, p10.y);
+    gl.uniform2f(this.uP01, p01.x, p01.y);
+    gl.uniform2f(this.uP11, p11.x, p11.y);
+    gl.uniform4f(this.uUV, u0, v0, u1, v1);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texR);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, texG);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, texB);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 

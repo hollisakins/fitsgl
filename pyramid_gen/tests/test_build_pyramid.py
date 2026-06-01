@@ -271,3 +271,39 @@ def test_downsample_preserves_all_nan_block():
     r = _downsample(a, 4)
     assert r.shape == (1, 1)
     assert np.isnan(r[0, 0])
+
+
+# --------------------------------------------------------------------------- #
+# RGB registration prerequisite (M4, roadmap Risk #7): same native shape ->
+# identical per-level tiling, so three same-grid bands composite under one
+# shared UV; an off-by-one native shape diverges at z>=1 and must be rejected.
+# --------------------------------------------------------------------------- #
+def test_same_native_shape_bands_share_per_level_geometry(tmp_path):
+    # 600 is non-divisible, so block_reduce trims at z>=1 -- exercise the trim.
+    h, w = 600, 600
+    img_a, hdr, _ = generate_synthetic_mosaic(shape=(h, w), seed=1)
+    img_b, _, _ = generate_synthetic_mosaic(shape=(h, w), seed=2)  # different pixels
+    pa, pb = tmp_path / "a.fits", tmp_path / "b.fits"
+    fits.PrimaryHDU(data=img_a, header=hdr).writeto(pa, overwrite=True)
+    fits.PrimaryHDU(data=img_b, header=hdr).writeto(pb, overwrite=True)
+    ma = build_pyramid(pa, output_dir=tmp_path / "a_out")
+    mb = build_pyramid(pb, output_dir=tmp_path / "b_out")
+    assert ma.native_shape == mb.native_shape
+    assert [lvl.shape for lvl in ma.levels] == [lvl.shape for lvl in mb.levels]
+    assert [lvl.fpack_tile_count for lvl in ma.levels] == [
+        lvl.fpack_tile_count for lvl in mb.levels
+    ]
+
+
+def test_off_by_one_native_shape_diverges_per_level(tmp_path):
+    img_a, hdr_a, _ = generate_synthetic_mosaic(shape=(1024, 1024), seed=1)
+    img_b, hdr_b, _ = generate_synthetic_mosaic(shape=(1023, 1024), seed=1)
+    pa, pb = tmp_path / "a.fits", tmp_path / "b.fits"
+    fits.PrimaryHDU(data=img_a, header=hdr_a).writeto(pa, overwrite=True)
+    fits.PrimaryHDU(data=img_b, header=hdr_b).writeto(pb, overwrite=True)
+    ma = build_pyramid(pa, output_dir=tmp_path / "a_out")
+    mb = build_pyramid(pb, output_dir=tmp_path / "b_out")
+    assert ma.native_shape != mb.native_shape
+    # Off-by-one native height trims to different per-level shapes -- which is why
+    # composite compatibility requires EXACT shape, not just matching WCS.
+    assert [lvl.shape for lvl in ma.levels] != [lvl.shape for lvl in mb.levels]

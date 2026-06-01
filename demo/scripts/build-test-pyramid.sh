@@ -48,9 +48,13 @@ if [[ $# -ge 1 ]]; then
 else
   WORK="$(mktemp -d)"
   trap 'rm -rf "$WORK"' EXIT
-  INPUT="$WORK/synthetic.fits"
-  echo "==> generating ${SIZE}x${SIZE} synthetic mosaic (roll ${ROTATE:-30}°)"
-  "$PY" - "$INPUT" "$SIZE" "${SOURCES:-}" <<'PY'
+  # Three synthetic bands (M4): same TAN WCS + shape (so they share a grid and
+  # composite without resampling), different RNG seeds (so each band has its own
+  # source field + NaN blobs — registered colour, with rare all-NaN overlaps to
+  # exercise the D8 transparent path). Named like NIRCam filters so the demo's
+  # R/G/B picker is meaningful (reddest filter -> red channel).
+  echo "==> generating 3x ${SIZE}x${SIZE} synthetic bands (roll ${ROTATE:-30}°)"
+  "$PY" - "$WORK" "$SIZE" "${SOURCES:-}" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -58,28 +62,48 @@ from astropy.io import fits
 from pyramid_gen.synthetic import generate_synthetic_mosaic
 from pyramid_gen.catalog import write_catalog_csv
 
-out = sys.argv[1]
+work = Path(sys.argv[1])
 size = int(sys.argv[2])
-# Gaussian sources on a flat background + low noise, with a few NaN blobs.
-# Keep source density matched to the 512x512 reference (~50 per 512x512) so a
-# larger field doesn't become 50 needles in a haystack; SOURCES overrides it.
+# Source density matched to the 512x512 reference (~50 per 512x512); SOURCES overrides.
 default_sources = max(50, round(50 * (size / 512) ** 2))
 sources = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else default_sources
 # Roll the WCS so the client's North-up rendering visibly rotates the field.
 rotation = float(os.environ.get("ROTATE", "30"))
-image, header, catalog = generate_synthetic_mosaic(
-    shape=(size, size), n_sources=sources, rotation_deg=rotation
-)
-fits.PrimaryHDU(data=image, header=header).writeto(out, overwrite=True)
-# Emit the overlay catalog here (no multiprocessing in this stdin context, so it
-# is safe) for the demo to show markers; the pyramid build runs separately below.
-write_catalog_csv(catalog, Path(out).with_name("catalog.csv"))
-print(f"  wrote {image.shape[1]}x{image.shape[0]} {image.dtype} mosaic, {sources} sources, roll {rotation}°")
+
+# (band name, RNG seed). The header is seed-independent, so all three share an
+# identical WCS — gridsMatch passes and the composite needs no resampling.
+bands = [("f150w", 3), ("f277w", 2), ("f444w", 1)]
+catalog = None
+for name, seed in bands:
+    image, header, cat = generate_synthetic_mosaic(
+        shape=(size, size), n_sources=sources, rotation_deg=rotation, seed=seed
+    )
+    fits.PrimaryHDU(data=image, header=header).writeto(work / f"{name}.fits", overwrite=True)
+    if catalog is None:
+        catalog = cat  # overlay markers come from the first band's sources
+print(f"  wrote 3 bands {size}x{size}, {sources} sources each, roll {rotation}°")
+# Emit the overlay catalog here (pure, no multiprocessing in this stdin context).
+write_catalog_csv(catalog, work / "catalog.csv")
 PY
-  echo "==> building pyramid"
-  "$PY" -m pyramid_gen "$INPUT" -o "$OUT_DIR"
-  # Serve the catalog next to the manifest so the demo overlay can fetch it.
-  cp "$(dirname "$INPUT")/catalog.csv" "$OUT_DIR/catalog.csv"
+  echo "==> building 3 band pyramids"
+  for band in f150w f277w f444w; do
+    "$PY" -m pyramid_gen "$WORK/$band.fits" -o "$OUT_DIR/$band"
+  done
+  # Write the dataset manifest grouping the three bands (pure helper, no Pool).
+  echo "==> writing dataset.json"
+  "$PY" - "$OUT_DIR" <<'PY'
+import sys
+from pathlib import Path
+from pyramid_gen.dataset import build_dataset
+
+out = Path(sys.argv[1])
+bands = [(b, out / b / "manifest.json") for b in ("f150w", "f277w", "f444w")]
+ds = build_dataset(bands, out / "dataset.json", default_rgb={"r": "f444w", "g": "f277w", "b": "f150w"})
+print(f"  dataset.json: {len(ds.bands)} bands, default RGB = "
+      f"{ds.default_rgb['r']}/{ds.default_rgb['g']}/{ds.default_rgb['b']}")
+PY
+  # Serve the catalog next to the dataset so the demo overlay can fetch it.
+  cp "$WORK/catalog.csv" "$OUT_DIR/catalog.csv"
   echo "==> copied catalog.csv into $OUT_DIR"
 fi
 

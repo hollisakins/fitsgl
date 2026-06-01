@@ -11,7 +11,7 @@
 export { riceDecompress, BitReader } from './rice/index.js';
 
 // Phase 2b — manifest
-export { loadManifest, validateManifest, resolveLevelUrl } from './manifest.js';
+export { loadManifest, validateManifest, resolveLevelUrl, SUPPORTED_MANIFEST_VERSION } from './manifest.js';
 export type { Manifest, LevelInfo } from './manifest.js';
 
 // Phase 2b — high-level tile access
@@ -32,6 +32,8 @@ export type { WorkerLike, WorkerReply, WorkerRequest } from './fpack/worker-prot
 // Phase 3 — WebGL2 viewer
 export { FitsViewer, Camera } from './renderer/index.js';
 export type { FitsViewerOptions, ViewerFrameInfo, CursorInfo } from './renderer/index.js';
+// M4 — RGB composite render source (single band, or three same-grid bands).
+export type { RenderSource, SingleBandSource, RgbSource } from './renderer/index.js';
 // Phase 3 — tile-selection helpers (for tools/demos building on the viewer).
 export { targetLevel, visibleTiles, buildLevelGeoms, TILE_SIZE } from './renderer/index.js';
 export type { TileCoord, LevelGeom, WorldRect } from './renderer/index.js';
@@ -46,6 +48,21 @@ export type { ColormapName, ColormapLUT } from './renderer/index.js';
 // M2 — WCS: client-side TAN pixel<->sky (ICRS) + sexagesimal formatting.
 export { parseWcs, pixToSky, skyToPix, formatRA, formatDec } from './wcs/index.js';
 export type { TanWcs, SkyCoord, PixelCoord } from './wcs/index.js';
+
+// M4 — RGB compositing: grid-compatibility gate + dataset manifest (decisions
+// D7/D9). The dataset manifest groups composite-compatible single-band pyramids;
+// `gridsMatch` is the authoritative same-grid check. Types flagged M5-narrowable.
+export { gridsMatch, GRID_MATCH_SUBPIXEL_FRACTION } from './wcs/index.js';
+export type { GridSpec } from './wcs/index.js';
+export {
+  loadDataset,
+  validateDataset,
+  resolveDatasetBandUrl,
+  bandGridSpec,
+  compatibleBands,
+  DATASET_VERSION,
+} from './dataset.js';
+export type { DatasetManifest, DatasetBand, DatasetRgbRoles } from './dataset.js';
 
 // M3 — overlays: catalog/region markers (sky or pixel), instanced WebGL render +
 // CPU hit-testing + one reused DOM popup (decision D10).

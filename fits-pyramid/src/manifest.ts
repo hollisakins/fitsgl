@@ -33,6 +33,15 @@ export interface Manifest {
   levels: LevelInfo[];
 }
 
+/**
+ * The per-pyramid manifest schema major version this client understands. The
+ * RGB work is additive (decision D9: a separate dataset manifest groups bands),
+ * so this stays 1 — no migration, every existing pyramid keeps working. v1.0
+ * begins *checking* it (see `validateManifest`) so a future breaking change is
+ * detected rather than silently mis-parsed.
+ */
+export const SUPPORTED_MANIFEST_VERSION = 1;
+
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
@@ -72,12 +81,41 @@ export function validateManifest(raw: unknown): Manifest {
 
   if (levels.length === 0) throw new Error('manifest: "levels" is empty');
 
+  // Version: a MISSING field coerces to the current version (D9 — every existing
+  // pyramid, all of which write version 1, stays valid). An EXPLICIT unsupported
+  // version throws, so a future breaking schema change surfaces immediately
+  // instead of being silently mis-parsed.
+  let version = SUPPORTED_MANIFEST_VERSION;
+  if (raw.version !== undefined) {
+    if (typeof raw.version !== 'number' || !Number.isInteger(raw.version)) {
+      throw new Error(`manifest: "version" must be an integer (got ${JSON.stringify(raw.version)})`);
+    }
+    if (raw.version !== SUPPORTED_MANIFEST_VERSION) {
+      throw new Error(
+        `manifest: unsupported version ${raw.version} (this client supports version ${SUPPORTED_MANIFEST_VERSION}).`,
+      );
+    }
+    version = raw.version;
+  }
+
+  // n_levels is the deepest z index, so a well-formed manifest has exactly
+  // n_levels + 1 levels. Cross-check (a missing field is derived) to reject an
+  // internally inconsistent manifest rather than mis-select levels later.
+  const expectedNLevels = levels.length - 1;
+  if (raw.n_levels !== undefined) {
+    if (typeof raw.n_levels !== 'number' || raw.n_levels !== expectedNLevels) {
+      throw new Error(
+        `manifest: n_levels ${JSON.stringify(raw.n_levels)} disagrees with ${levels.length} level(s) (expected ${expectedNLevels}).`,
+      );
+    }
+  }
+
   return {
-    version: typeof raw.version === 'number' ? raw.version : 1,
+    version,
     source_file: typeof raw.source_file === 'string' ? raw.source_file : '',
     native_shape: asPair(raw.native_shape, 'native_shape'),
     fpack_tile_size: typeof raw.fpack_tile_size === 'number' ? raw.fpack_tile_size : 256,
-    n_levels: typeof raw.n_levels === 'number' ? raw.n_levels : levels.length - 1,
+    n_levels: expectedNLevels,
     levels,
   };
 }

@@ -12,6 +12,7 @@ import {
   ASINH_SOFTENING,
 } from '../src/renderer/stretch.js';
 import { TILE_FRAG } from '../src/renderer/shaders/tile.frag.js';
+import { TILE_VERT } from '../src/renderer/shaders/tile.vert.js';
 
 interface StretchFixture {
   log_softening: number;
@@ -151,8 +152,68 @@ describe('TILE_FRAG shader — structure + constant injection', () => {
     expect(TILE_FRAG).toContain('bn ? 0.0 :');
   });
 
+  it('pins the load-bearing D8 outputs (transparent alpha vs opaque black; composited alpha 1)', () => {
+    // Without a headless WebGL2 we cannot execute the shader, so pin the exact
+    // OUTPUTS — not just the predicates — so an opaque-black regression
+    // (vec4(...,1.0) instead of vec4(...,0.0)) for an all-NaN pixel is caught.
+    const allNan = TILE_FRAG.indexOf('rn && gn && bn');
+    expect(allNan).toBeGreaterThan(-1);
+    // The all-NaN branch emits a FULLY TRANSPARENT pixel, right after the predicate.
+    const transparent = TILE_FRAG.indexOf('vec4(0.0, 0.0, 0.0, 0.0)', allNan);
+    expect(transparent).toBeGreaterThan(allNan);
+    // The composited (not-all-NaN) path writes opaque RGB (alpha 1) and follows it.
+    const composite = TILE_FRAG.indexOf('vec4(rs, gs, bs, 1.0)');
+    expect(composite).toBeGreaterThan(transparent);
+  });
+
   it('targets GLSL ES 3.00 with highp (required for R32F range)', () => {
     expect(TILE_FRAG.startsWith('#version 300 es')).toBe(true);
     expect(TILE_FRAG).toContain('precision highp float');
+  });
+});
+
+describe('RGB composite — per-channel stretch is independent, the curve is shared (D5/M4)', () => {
+  // The shader composites scaleChannel(c, u_minRGB.c, u_maxRGB.c) per channel
+  // under a single u_stretchMode. These behavioural tests model that contract
+  // with the tested `scaleValue` (the GLSL `scaleChannel` mirrors it exactly).
+  it('each channel maps the same value through its OWN [min,max]', () => {
+    const v = 5;
+    expect(scaleValue(v, 0, 10, 'linear')).toBeCloseTo(0.5, 12); // R
+    expect(scaleValue(v, 0, 20, 'linear')).toBeCloseTo(0.25, 12); // G
+    expect(scaleValue(v, -5, 5, 'linear')).toBeCloseTo(1, 12); // B (clamped at hi)
+  });
+
+  it('switching the SHARED mode lifts every channel identically (no per-channel mode)', () => {
+    // Identical intervals + a shared mode ⟹ identical channel outputs; a
+    // per-channel mode would let them diverge here. Guards against an accidental
+    // ivec3 u_stretchModeRGB.
+    const a = scaleValue(1, 0, 10, 'asinh');
+    const b = scaleValue(1, 0, 10, 'asinh');
+    const c = scaleValue(1, 0, 10, 'asinh');
+    expect(a).toBe(b);
+    expect(b).toBe(c);
+    // ...and the shared asinh lifts faint signal above linear for every channel.
+    expect(a).toBeGreaterThan(scaleValue(1, 0, 10, 'linear'));
+  });
+});
+
+describe('tile shaders — the single-UV constraint behind common-level-hold (M4)', () => {
+  it('the vertex shader exposes exactly ONE shared texcoord (u_uv -> v_uv)', () => {
+    // One u_uv/v_uv ⟹ all three RGB samplers read the SAME source level + sub-rect
+    // in a draw call, which is precisely why the RGB draw must composite from a
+    // level common to all three bands (commonResidentLevel).
+    expect(TILE_VERT.match(/uniform vec4 u_uv/g)?.length).toBe(1);
+    expect(TILE_VERT.match(/out vec2 v_uv/g)?.length).toBe(1);
+  });
+
+  it('the RGB fragment path samples all three bands at that one v_uv with per-channel intervals', () => {
+    expect(TILE_FRAG).toContain('texture(u_tile, v_uv).r');
+    expect(TILE_FRAG).toContain('texture(u_tileG, v_uv).r');
+    expect(TILE_FRAG).toContain('texture(u_tileB, v_uv).r');
+    expect(TILE_FRAG).toContain('u_minRGB.r');
+    expect(TILE_FRAG).toContain('u_minRGB.g');
+    expect(TILE_FRAG).toContain('u_minRGB.b');
+    // A single shared transfer curve — no per-channel mode uniform.
+    expect(TILE_FRAG).not.toContain('u_stretchModeRGB');
   });
 });

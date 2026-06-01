@@ -16,16 +16,22 @@ import {
   formatDec,
   COLORMAP_NAMES,
   STRETCH_MODES,
+  compatibleBands,
   type ColormapName,
   type CursorInfo,
+  type DatasetManifest,
   type FitsViewer,
   type LevelGeom,
   type Manifest,
   type MarkerInput,
+  type RenderSource,
   type StretchMode,
   type TilePyramid,
   type ViewerFrameInfo,
 } from 'fits-pyramid';
+
+/** Which RGB channel the min/max inputs currently edit. */
+type Channel = 'r' | 'g' | 'b';
 
 export interface ControlsElements {
   minInput: HTMLInputElement;
@@ -35,6 +41,11 @@ export interface ControlsElements {
   colormapSelect: HTMLSelectElement;
   northUpCheckbox: HTMLInputElement;
   markersCheckbox: HTMLInputElement;
+  rgbCheckbox: HTMLInputElement;
+  bandRSelect: HTMLSelectElement;
+  bandGSelect: HTMLSelectElement;
+  bandBSelect: HTMLSelectElement;
+  channelSelect: HTMLSelectElement;
   statZoom: HTMLElement;
   statRaDec: HTMLElement;
   statCenter: HTMLElement;
@@ -59,6 +70,15 @@ export class DemoControls {
   private didInitialAuto = false;
   private readonly frameTimes: number[] = [];
   private readonly telemetryTimer: number;
+
+  // ---- RGB compositing (M4) ----------------------------------------------
+  private readonly bandPyramids = new Map<string, TilePyramid>();
+  /** Current R/G/B band-name assignment (null until a dataset is provided). */
+  private roles: { r: string; g: string; b: string } | null = null;
+  /** Which channel the min/max inputs edit while in RGB mode. */
+  private channel: Channel = 'r';
+  /** Auto-computed [min,max] per band name, reused when a band fills a role. */
+  private readonly bandStretch = new Map<string, [number, number]>();
 
   constructor(
     private readonly el: ControlsElements,
@@ -92,6 +112,17 @@ export class DemoControls {
     this.el.markersCheckbox.disabled = true; // enabled once a catalog loads
     this.el.markersCheckbox.addEventListener('change', () => this.applyMarkers());
 
+    // RGB controls stay disabled until a dataset (3+ bands) is provided.
+    this.el.rgbCheckbox.disabled = true;
+    this.el.rgbCheckbox.addEventListener('change', () => this.onRgbToggle());
+    this.el.bandRSelect.addEventListener('change', () => this.onRoleChange());
+    this.el.bandGSelect.addEventListener('change', () => this.onRoleChange());
+    this.el.bandBSelect.addEventListener('change', () => this.onRoleChange());
+    this.el.channelSelect.addEventListener('change', () => {
+      this.channel = this.el.channelSelect.value as Channel;
+      this.loadChannelStretchIntoInputs();
+    });
+
     // Repaint the HUD a few times a second so FPS decays to "idle" and the
     // byte counter keeps ticking even between rendered frames.
     this.telemetryTimer = window.setInterval(() => this.renderTelemetry(), 250);
@@ -120,6 +151,98 @@ export class DemoControls {
     } else {
       this.viewer.clearMarkers();
     }
+  }
+
+  // ---- RGB compositing (M4) ----------------------------------------------
+
+  /**
+   * Provide the dataset bands; enables the RGB toggle and the R/G/B band
+   * pickers. The view stays single-band until the toggle is switched on.
+   */
+  setDataset(dataset: DatasetManifest, pyramids: Map<string, TilePyramid>): void {
+    this.bandPyramids.clear();
+    for (const [name, p] of pyramids) this.bandPyramids.set(name, p);
+
+    // Offer only bands that share a grid with the first band (the picker rule).
+    const choices = compatibleBands(dataset.bands[0], dataset.bands).map((b) => b.name);
+    if (choices.length < 3) return; // need three bands to composite
+
+    const def = dataset.default_rgb ?? { r: choices[0], g: choices[1], b: choices[2] };
+    this.roles = { r: def.r, g: def.g, b: def.b };
+    populateSelect(this.el.bandRSelect, choices, this.roles.r);
+    populateSelect(this.el.bandGSelect, choices, this.roles.g);
+    populateSelect(this.el.bandBSelect, choices, this.roles.b);
+    this.el.rgbCheckbox.disabled = false;
+  }
+
+  private onRgbToggle(): void {
+    if (this.viewer === null || this.roles === null) return;
+    const on = this.el.rgbCheckbox.checked;
+    document.body.classList.toggle('rgb-mode', on);
+    if (on) {
+      void this.enterRgb();
+    } else {
+      // Back to single-band on the representative pyramid (the viewer was built
+      // single-band on it; setSource preserves the grid).
+      this.viewer.setSource({ kind: 'single', pyramid: this.pyramid });
+      this.loadSingleStretchIntoInputs();
+    }
+  }
+
+  private onRoleChange(): void {
+    if (this.roles === null) return;
+    this.roles = {
+      r: this.el.bandRSelect.value,
+      g: this.el.bandGSelect.value,
+      b: this.el.bandBSelect.value,
+    };
+    if (this.el.rgbCheckbox.checked) void this.enterRgb();
+  }
+
+  /** Build the RGB source from the current roles, then auto + sync the inputs. */
+  private async enterRgb(): Promise<void> {
+    if (this.viewer === null || this.roles === null) return;
+    const source = this.rgbSource(this.roles);
+    if (source === null) return;
+    this.viewer.setSource(source);
+    await this.autoStretchRgb();
+    this.loadChannelStretchIntoInputs();
+  }
+
+  private rgbSource(roles: { r: string; g: string; b: string }): RenderSource | null {
+    const r = this.bandPyramids.get(roles.r);
+    const g = this.bandPyramids.get(roles.g);
+    const b = this.bandPyramids.get(roles.b);
+    if (r === undefined || g === undefined || b === undefined) return null;
+    return { kind: 'rgb', r, g, b };
+  }
+
+  /** Per-channel auto-stretch: percentile of each role's band, in view. */
+  private async autoStretchRgb(): Promise<void> {
+    if (this.viewer === null || this.roles === null) return;
+    for (const ch of ['r', 'g', 'b'] as const) {
+      const name = this.roles[ch];
+      const pyr = this.bandPyramids.get(name);
+      if (pyr === undefined) continue;
+      const range = (await this.percentileForPyramid(pyr)) ?? this.bandStretch.get(name);
+      if (range === undefined) continue;
+      this.bandStretch.set(name, range);
+      this.viewer.setChannelStretch(ch, range[0], range[1]);
+    }
+  }
+
+  /** Reflect the selected channel's band stretch in the min/max inputs. */
+  private loadChannelStretchIntoInputs(): void {
+    if (this.roles === null) return;
+    const range = this.bandStretch.get(this.roles[this.channel]);
+    if (range === undefined) return;
+    this.el.minInput.value = formatStretch(range[0]);
+    this.el.maxInput.value = formatStretch(range[1]);
+  }
+
+  private loadSingleStretchIntoInputs(): void {
+    // The single-band path keeps its own stretch in the inputs already; a fresh
+    // Auto re-derives it if the user wants. Nothing to restore here.
   }
 
   /** Called by the viewer on cursor movement; updates the RA/Dec readout. */
@@ -154,37 +277,50 @@ export class DemoControls {
   private applyManualStretch(): void {
     const lo = parseFloat(this.el.minInput.value);
     const hi = parseFloat(this.el.maxInput.value);
-    if (this.viewer !== null && Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) {
+    if (this.viewer === null || !Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return;
+    if (this.el.rgbCheckbox.checked && this.roles !== null) {
+      // RGB: the inputs edit the currently-selected channel only (independence).
+      this.viewer.setChannelStretch(this.channel, lo, hi);
+      this.bandStretch.set(this.roles[this.channel], [lo, hi]);
+    } else {
       this.viewer.setStretch(lo, hi);
     }
   }
 
-  /** Stretch to the 1st–99th percentile of the decoded data currently in view. */
+  /** "Auto": per-channel percentile in RGB mode, else the single-band stretch. */
   async autoStretch(): Promise<void> {
-    const info = this.latest;
-    if (info === null || this.viewer === null) return;
-    const geom = this.geoms.get(info.level);
-    if (geom === undefined) return;
-    const tiles = visibleTiles(geom, info.bounds);
-    if (tiles.length === 0) return;
-
-    let arrays: Float32Array[];
-    try {
-      // These are the same tiles the viewer drew, so they are cache hits.
-      arrays = await Promise.all(
-        tiles.map((t) => this.pyramid.getTile(info.level, t.tileX, t.tileY)),
-      );
-    } catch (err) {
-      this.setStatus(`Auto-stretch failed: ${(err as Error).message}`, true);
+    if (this.el.rgbCheckbox.checked) {
+      await this.autoStretchRgb();
+      this.loadChannelStretchIntoInputs();
       return;
     }
-
-    const range = percentileRange(arrays, 0.01, 0.99, PERCENTILE_SAMPLE_CAP);
+    if (this.viewer === null) return;
+    const range = await this.percentileForPyramid(this.pyramid);
     if (range === null) return;
     const [lo, hi] = range;
     this.viewer.setStretch(lo, hi);
     this.el.minInput.value = formatStretch(lo);
     this.el.maxInput.value = formatStretch(hi);
+  }
+
+  /** 1st–99th percentile of the tiles a pyramid has in the current viewport. */
+  private async percentileForPyramid(pyramid: TilePyramid): Promise<[number, number] | null> {
+    const info = this.latest;
+    if (info === null) return null;
+    const geom = this.geoms.get(info.level);
+    if (geom === undefined) return null;
+    const tiles = visibleTiles(geom, info.bounds);
+    if (tiles.length === 0) return null;
+    try {
+      // These are the same tiles the viewer drew, so they are cache hits.
+      const arrays = await Promise.all(
+        tiles.map((t) => pyramid.getTile(info.level, t.tileX, t.tileY)),
+      );
+      return percentileRange(arrays, 0.01, 0.99, PERCENTILE_SAMPLE_CAP);
+    } catch (err) {
+      this.setStatus(`Auto-stretch failed: ${(err as Error).message}`, true);
+      return null;
+    }
   }
 
   private fps(): number {
