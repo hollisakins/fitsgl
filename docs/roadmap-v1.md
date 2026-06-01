@@ -1,7 +1,10 @@
 # FitsGL v1.0 Roadmap
 
 A planning document for the work between the current state (Phases 1–4) and a
-v1.0 release. Scope is locked: six features (below), three delivery tiers. This
+v1.0 release. Scope is locked: six features (below), three delivery tiers. A
+seventh capability — **tiled-mosaic rendering** for fields too large to drizzle
+whole (e.g. COSMOS) — is planned as **M6, after the v1.0 freeze** (§2.7, §5); its
+architecture is still being finalized. This
 document inventories what exists, analyzes each feature against the real code,
 **records the design decisions taken (with reasoning)**, and proposes a
 milestone sequence. Decisions are summarized in the Decisions log and elaborated
@@ -26,12 +29,15 @@ that log.
 | D10 | Overlays | **WebGL marker geometry** (instanced, per-instance style) + **CPU spatial-index hit-testing** (click/hover callbacks) + **one reused DOM popup**. Simple shapes only (points, circles, boxes). | WebGL handles large catalogs without DOM-node slowdown; CPU picking + a single DOM popup give CAMPFIRE per-marker callbacks and rich tooltips without thousands of nodes. | 2.6 |
 | D11 | Public API | **Narrow** the public surface + an `/internal` subpath; route `Camera` mutation through methods; tile-selection helpers become internal. | The current `index.ts` over-exports internals that shouldn't carry a v1.0 stability promise. | 4.4 |
 | D12 | React wrapper | Stays in **M5**; controlled stretch/colormap props + an imperative handle for the overlay API. | Wrapping a settled surface avoids mirroring a churning API into three tiers. | 3.2, 5 |
+| D13 | Tiled mosaics | Render a field too large to drizzle whole as **N co-gridded tile-pyramids placed by integer pixel offset** (tiles share tangent point + CD + scale; CRPIX/footprint differ). No reprojection, no sub-pixel sampling; a per-tile **interior clip** resolves the ~1000-px overlap; a **synthesized virtual WCS** drives readout/North-up/markers. | The data already exists as independently-drizzled aligned tiles, so *placement* (not resampling) composites them — reusing the world-space tile-culling and multi-manager machinery. **M6, post-v1.0; architecture still being finalized.** | 2.7, 5 |
+| D14 | ViewerConfig band shape | A band is a **list of tile-pyramid manifest URLs** (`tiles[]`, length 1 in the common case), not a single URL — baked into the M5 `ViewerConfig` even though the multi-tile renderer is M6. | Freezes the config shape once: a large field lights up when the M6 renderer lands with **no `ViewerConfig` change**. | 3.1, 5 |
 
 **Deliberately left open** (low-risk, decided on observation/implementation): the
 NEAREST→LINEAR move and its method (extension vs in-shader bilinear), pending the
 M2 visual check (D3); the exact rounding/canonicalization for the WCS-grid hash,
 an M4 implementation detail (D9); the precise controlled-vs-imperative split in
-the React wrapper, an M5 detail (D12).
+the React wrapper, an M5 detail (D12); the **M6 tiled-mosaic architecture**
+(placement / overlap-clip / virtual-WCS details — still being finalized, D13).
 
 ---
 
@@ -322,6 +328,67 @@ index + DOM popup) is more than a single layer, and it must respect M2 rotation.
 
 **Dependencies.** M2 (sky transforms + rotation).
 
+### 2.7 Tiled-mosaic rendering (M6, post-v1.0)
+
+**What it is.** Render a field too large to drizzle as a single image — e.g.
+COSMOS, ~90k×90k at 0.03″/px, beyond the drizzle algorithm on a standard machine
+— directly from the **tiles that already exist on disk**, without ever
+materializing the full mosaic. The producer drizzles the field as ~20 overlapping
+tiles that **share one tangent point, CD matrix, and pixel scale**, differing only
+in CRPIX and footprint: integer-offset windows of one virtual grid, with **no
+sub-pixel offset by construction** (the producer drizzles onto a single predefined
+global grid). The host lists the tile manifests in `ViewerConfig`; the viewer
+composites them into one seamless, pannable image under a single sky coordinate
+system. Acceptance: load N aligned tiles; they render seam-free across the
+overlap; RA/Dec, North-up, and markers operate against one virtual WCS; only the
+tiles intersecting the viewport fetch detail.
+
+**What changes architecturally.** A generalization of the existing world-space
+machinery, not a reprojection engine (D13):
+- **`TileManager` gains a world offset.** Tile culling (`visibleTiles`) and draw
+  are already world-space; placement = subtract the offset from the cull bounds,
+  add it back at draw. The viewer already holds an *array* of managers (the 3 RGB
+  bands), so "N placed managers" extends "3 RGB managers."
+- **A relaxed co-grid check.** Today `gridsMatch` requires *identical* WCS;
+  mosaicking needs "same CTYPE/CRVAL/CD/scale/tiling, CRPIX & footprint may differ
+  → derive the integer offset."
+- **A synthesized virtual WCS** (shared CRVAL+CD, a chosen virtual CRPIX) so the
+  readout/North-up/markers use one frame; one shared CD ⇒ one North-up matrix.
+- **Overlap handling** via a per-tile **interior clip rectangle** (trim the
+  ~1000-px overlap / noisy drizzle edge so tiles tile the plane exactly once).
+- **Virtual extent** replaces the single `nativeW/H` for zoom limits / fit-to-image
+  / marker hit-test bounds. RGB composes on top (N tiles × 3 co-gridded bands).
+
+**Manifest schema impact.** None to the per-pyramid manifest — each tile is an
+ordinary pyramid. The mosaic is expressed in `ViewerConfig` as a band's `tiles`
+list (D14); the geometry is **derived from each tile's self-describing WCS**, not
+restated by the host. (A serialized "mosaic manifest" — the `dataset.json`
+analogue — may be added for the SSG path.)
+
+**Design questions & decisions.**
+
+| Question | Decision |
+|---|---|
+| Composite model | **D13: placed sub-pyramids on a shared grid** (integer offset, no resampling). |
+| Config shape | **D14: a band is a `tiles[]` list** (length 1 normally), baked into M5. |
+| Overlap | Per-tile interior clip; the ~1000-px overlap is trimmed, not blended. |
+| Sub-pixel offsets | Out of scope — producers drizzle onto one global grid, so offsets are integer. |
+
+**Alternative (zero-renderer-change fallback).** `pyramid_gen` could **stream the
+N tiles into one field pyramid** at build time — *re-tiling, not re-drizzling*, so
+it sidesteps the whole-field drizzle bottleneck (at z=0 the aligned pixels are
+cropped/copied). It puts a large field on screen with today's renderer, at the
+cost of one big artifact and a build step. Inferior to the renderer-native path
+for a producer whose data already lives as independently-buildable per-tile
+pyramids, but a viable stopgap before M6.
+
+**Estimated complexity: L.** Bounded — every piece generalizes existing
+world-space code — but it touches the camera-extent, tile-culling, grid-match,
+and overlay-WCS paths at once.
+
+**Dependencies.** M2 (sky transforms — the virtual WCS) and M4 (the multi-manager
+/ grid-match machinery it extends). Lands after the v1.0 freeze.
+
 ---
 
 ## 3. Three-tier delivery architecture
@@ -337,10 +404,18 @@ methods/options on `FitsViewer`/`TilePyramid`. The single most important
 invariant: **a feature is "done" only when it is a core capability**; the tiers
 must add no behavior of their own, only adapt the interface.
 
-This argues for a single high-level `ViewerConfig` type (manifest URL(s), stretch
-mode + min/max, colormap, RGB band roles, overlay source, North-up on/off) that
-the core accepts and **all three tiers consume**, so a new feature is added in
-exactly one type and is automatically reachable from every tier.
+This argues for a single high-level `ViewerConfig` type that the core accepts and
+**all three tiers consume**, so a new feature is added in exactly one type and is
+automatically reachable from every tier. Its shape (settled in M5): a **list of
+bands** — each band a short name, an optional RGB role, and a `tiles` list of
+pyramid-manifest URLs (length 1 for an ordinary image, N for an M6 mosaic, D14) —
+plus the view state: stretch mode + min/max, colormap, North-up on/off, and an
+overlay source. Markers are **not** a static config field for the React path: the
+M3 push API (`setMarkers`/`setMarkerHandlers`, sky-coordinate input, an opaque
+per-marker `data` payload, click/hover callbacks) lets a host like CAMPFIRE own
+the catalog DB and push the filtered set live; the SSG's CSV + built-in popup is
+the convenience layer on the same core. The D11 narrowing must keep that push API
+in the public surface.
 
 ### 3.2 React wrapper
 
@@ -503,6 +578,36 @@ soonest. It *can* be pulled forward (after M2) at the cost of API churn as M3/M4
 land — acceptable if integration pressure is high. The vanilla embed and SSG stay
 in M5 because they vendor a frozen bundle (D12).
 
+**M5 design notes (from the CAMPFIRE design review).**
+- **Grid policy resolved.** Same-field bands share a pixel grid in practice
+  (photometry requires it), so band-switching and RGB are the same-grid case the
+  renderer already handles; the only multi-pyramid case is large-field *tiling*
+  (M6), which is integer *placement*, not in-viewer reprojection.
+- **`ViewerConfig` bakes in the `tiles[]` band shape now** (D14) so an M6 mosaic
+  needs no config change — model a band as a (usually length-1) list of tile
+  manifests from the start, even though the renderer initially handles only the
+  one-tile case.
+- **Markers are already CAMPFIRE-shaped.** The M3 push API (`setMarkers`/
+  `setMarkerHandlers`, sky input, an opaque per-marker `data` payload, click/hover
+  callbacks) already lets a host own the catalog DB and push the filtered set live
+  (10–20k markers is well within the instanced-WebGL + CPU-index budget). M5's job
+  is to surface it through the React imperative handle and **keep it public through
+  the D11 narrowing** — not to add marker behavior.
+- **Move URL→`RenderSource` orchestration into the library.** Building a source
+  from a manifest/dataset URL currently lives in the demo; the library must own it
+  so a `ViewerConfig` is consumable by URL (not by pre-built `TilePyramid`
+  objects) across all three tiers.
+
+### M6 — Tiled-mosaic rendering (post-v1.0, total ~L)
+*Feature:* render large fields from aligned on-disk tiles without a whole-field
+drizzle (§2.7, per D13/D14). *Why after v1.0:* it extends M4's multi-manager and
+M2's WCS machinery but is **new scope beyond the locked six features**, and the
+architecture is still being finalized. Because the M5 `ViewerConfig` already
+carries the `tiles[]` shape (D14), it lands with **no config-contract change** —
+only renderer work (world-offset managers, the relaxed co-grid check, the virtual
+WCS, the overlap clip). *Deployable:* COSMOS-scale fields in the viewer.
+*Depends on:* M2, M4; config shape frozen in M5.
+
 ---
 
 ## 6. Risks and unknowns
@@ -552,3 +657,6 @@ polygon region overlays (simple shapes only, D10); overlay-driven measurement.
 LINEAR/bilinear filtering is out of v1.0 unless the M2 visual check forces it
 (D3). Stated so that, e.g., "the overlay layer could also do measurement" does
 not quietly expand M3.
+
+Large-field **tiled-mosaic rendering** is likewise out of v1.0 — but, unlike the
+above, it is **planned as M6** (§2.7, §5), not indefinitely deferred.
