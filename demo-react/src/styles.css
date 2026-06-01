@@ -1,0 +1,99 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font: 13px/1.4 system-ui, -apple-system, sans-serif;
+  background: #0b0b0e;
+  color: #ddd;
+}
+
+.app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: #16161c;
+  border-bottom: 1px solid #2a2a33;
+}
+
+.controls strong {
+  color: #fff;
+  margin-right: 4px;
+}
+
+.controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  user-select: none;
+}
+
+.controls select,
+.controls button {
+  font: inherit;
+  background: #23232c;
+  color: #ddd;
+  border: 1px solid #3a3a44;
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+.controls button {
+  cursor: pointer;
+}
+
+.controls button:hover {
+  background: #2d2d38;
+}
+
+.controls input:disabled + *,
+.controls label:has(input:disabled) {
+  opacity: 0.45;
+}
+
+/* The <FitsViewer> container fills this (its default style is width/height 100%). */
+.viewer-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.status {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 5px 12px;
+  background: #16161c;
+  border-top: 1px solid #2a2a33;
+  font-variant-numeric: tabular-nums;
+  color: #9aa3ad;
+}
+
+.overlay {
+  display: grid;
+  place-items: center;
+  height: 100vh;
+  color: #aaa;
+  text-align: center;
+  white-space: pre-line;
+}
+
+.overlay.error {
+  color: #ff8a8a;
+  padding: 24px;
+}
