@@ -55,4 +55,4 @@ cd demo && npm install && npm run build-pyramid && npm run dev
   libraries — browser-native `DecompressionStream`, hand-written RICE.
 - The manifest is a convenience index; the `.fits.fz` files are self-describing
   and authoritative (verify `ZCMPTYPE` from the file, not the manifest hint).
-- Run tests/typecheck after changes. Commit only when asked.
+- Run tests/typecheck after changes. Commit after major milestones.

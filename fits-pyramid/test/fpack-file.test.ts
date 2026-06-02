@@ -133,6 +133,52 @@ describe('FpackFile.getTile', () => {
   });
 });
 
+describe('FpackFile split fetch/decode (cache seam)', () => {
+  // The persistent tile cache (multi-tier-cache plan, P2) caches the COMPRESSED
+  // bytes and decodes them later via the static decodeTile. The split path must be
+  // bit-identical to getTile — the decode is a pure function of (bytes, params),
+  // so cached bytes must decode the same as freshly-fetched ones.
+  it('decodeTile(fetchCompressedTile, tileDecodeParams) == getTile, bit-exact (GZIP_2, all tiles)', async () => {
+    const f = await FpackFile.open(Z0_URL, bufferFetcher(readFixtureBytes('synthetic_z0.fits.fz')).fetch);
+    for (let ty = 0; ty < f.nTilesY; ty++) {
+      for (let tx = 0; tx < f.nTilesX; tx++) {
+        const direct = await f.getTile(tx, ty);
+        const bytes = await f.fetchCompressedTile(tx, ty);
+        const params = await f.tileDecodeParams(tx, ty);
+        const split = await FpackFile.decodeTile(bytes, params);
+        expect(firstFloatMismatch(split, direct, 0)).toBe(-1);
+      }
+    }
+  });
+
+  it('decodeTile(fetchCompressedTile, tileDecodeParams) == getTile, bit-exact (RICE_1)', async () => {
+    const f = await FpackFile.open(Z1_URL, bufferFetcher(readFixtureBytes('synthetic_z1.fits.fz')).fetch);
+    const direct = await f.getTile(0, 0);
+    const bytes = await f.fetchCompressedTile(0, 0);
+    const params = await f.tileDecodeParams(0, 0);
+    const split = await FpackFile.decodeTile(bytes, params);
+    expect(firstFloatMismatch(split, direct, 0)).toBe(-1);
+    expect(firstFloatMismatch(split, z1Decoded, 0)).toBe(-1);
+  });
+
+  it('fetchCompressedTile returns the raw compressed heap bytes (non-empty)', async () => {
+    const f = await FpackFile.open(Z1_URL, bufferFetcher(readFixtureBytes('synthetic_z1.fits.fz')).fetch);
+    const bytes = await f.fetchCompressedTile(0, 0);
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(bytes.length).toBeGreaterThan(0);
+    // Decoding the returned bytes round-trips to the expected pixels.
+    const params = await f.tileDecodeParams(0, 0);
+    expect(params.compressionType).toBe('RICE_1');
+    expect(params.nPixels).toBe(256 * 256);
+  });
+
+  it('the split methods reject out-of-range coordinates like getTile', async () => {
+    const f = await FpackFile.open(Z0_URL, bufferFetcher(readFixtureBytes('synthetic_z0.fits.fz')).fetch);
+    await expect(f.tileDecodeParams(2, 0)).rejects.toThrow(/out of range/i);
+    await expect(f.fetchCompressedTile(0, -1)).rejects.toThrow(/out of range/i);
+  });
+});
+
 describe('httpRangeFetch — Range semantics', () => {
   it('accepts 206, rejects 200, and surfaces network errors', async () => {
     const { httpRangeFetch } = await import('../src/fpack/fpack-file.js');

@@ -8,9 +8,10 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { attachTileWorker } from '../src/worker.js';
+import { attachDecodeWorker } from '../src/worker.js';
 import type { RangeFetcher } from '../src/index.js';
 import type { WorkerLike, WorkerScopeLike } from '../src/fpack/worker-protocol.js';
+import type { BlobStore } from '../src/fpack/blob-store.js';
 
 const FIX_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'pyramid2b');
 
@@ -166,14 +167,12 @@ export function manifestFetch(): typeof fetch {
 }
 
 /**
- * An in-process Web Worker: routes messages between a real `attachTileWorker`
- * scope and a main-side `WorkerLike` via microtasks. Lets the worker protocol be
- * tested end-to-end in Node with injected (closure) fetchers.
+ * An in-process stateless decode worker: routes messages between a real
+ * `attachDecodeWorker` scope and a main-side `WorkerLike` via microtasks. Lets the
+ * decode worker protocol be tested end-to-end in Node (the worker only decodes;
+ * fetch + caches live on the main-thread `TileEngine`).
  */
-export function createInProcessWorker(injected: {
-  rangeFetch: RangeFetcher;
-  fetchImpl: typeof fetch;
-}): WorkerLike & { terminated: boolean } {
+export function createInProcessWorker(): WorkerLike & { terminated: boolean } {
   let terminated = false;
 
   const main: WorkerLike & { terminated: boolean } = {
@@ -195,7 +194,7 @@ export function createInProcessWorker(injected: {
     onmessage: null,
   };
 
-  attachTileWorker(scope, { rangeFetch: injected.rangeFetch, fetchImpl: injected.fetchImpl });
+  attachDecodeWorker(scope);
 
   main.postMessage = (msg: unknown) => {
     queueMicrotask(() => {
@@ -204,4 +203,36 @@ export function createInProcessWorker(injected: {
   };
 
   return main;
+}
+
+/**
+ * In-memory {@link BlobStore} for testing the disk tier without IndexedDB. Records
+ * gets/hits/puts (and stores compact copies) so a test can assert write-through,
+ * cross-engine hits, and that a tile fetch was avoided.
+ */
+export function createMemoryBlobStore(): {
+  store: BlobStore;
+  map: Map<string, Uint8Array>;
+  gets: string[];
+  hits: string[];
+  puts: string[];
+} {
+  const map = new Map<string, Uint8Array>();
+  const gets: string[] = [];
+  const hits: string[] = [];
+  const puts: string[] = [];
+  const store: BlobStore = {
+    get(key) {
+      gets.push(key);
+      const v = map.get(key);
+      if (v !== undefined) hits.push(key);
+      return Promise.resolve(v ? v.slice() : undefined);
+    },
+    put(key, bytes) {
+      puts.push(key);
+      map.set(key, bytes.slice());
+      return Promise.resolve();
+    },
+  };
+  return { store, map, gets, hits, puts };
 }

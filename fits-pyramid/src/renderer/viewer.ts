@@ -59,7 +59,9 @@ import {
   coarserFallback,
   commonResidentLevel,
   fallbackUV,
+  ringTiles,
   targetLevel,
+  tileKey,
   tileWorldRect,
   visibleTiles,
   type LevelGeom,
@@ -74,6 +76,16 @@ const MAX_NATIVE_ZOOM = 16;
 const MAX_IDLE_FRAMES = 60;
 /** Default GPU texture budget (tiles). */
 const DEFAULT_TEXTURE_BUDGET = 200;
+/**
+ * Max decoded tiles uploaded to the GPU per band per frame. Frame-budgets the
+ * texImage2D burst when many tiles arrive at once (parallel decode / warm reload
+ * from disk); the rest upload over the next frames, masked by coarse-to-fine.
+ */
+const MAX_UPLOADS_PER_FRAME = 8;
+/** Prefetch ring width in tiles beyond the viewport edge (P5). */
+const PREFETCH_MARGIN = 1;
+/** Quiet period after the last camera move before the ring is prefetched (ms). */
+const PREFETCH_IDLE_MS = 150;
 /** Wheel sensitivity: zoom factor per deltaY unit (exponential). */
 const WHEEL_ZOOM_RATE = 0.0015;
 
@@ -274,6 +286,10 @@ export class FitsViewer {
   private frameCounter = 0;
   private renderScheduled = false;
   private destroyed = false;
+  /** Whether the camera has settled (no move for PREFETCH_IDLE_MS): gates ring
+   *  prefetch so it never competes with visible-tile fetches mid-interaction. */
+  private cameraIdle = false;
+  private idleTimerId: ReturnType<typeof setTimeout> | 0 = 0;
   /** Level + world bounds of the last drawn frame; `autoStretch` reuses them so
    *  it samples exactly the tiles already on screen (cache hits). */
   private lastLevel = 0;
@@ -371,12 +387,13 @@ export class FitsViewer {
       (p) => new TileManager(gl, p, this.geoms, this.textureBudget, () => this.requestRender()),
     );
     this.bandPyramids = norm.pyramids;
-    // Prime the coarsest level (one tile per band) so an RGB composite shows a
-    // whole-image low-res preview almost immediately rather than staying blank
-    // until the finest common level loads (the common-level-hold policy).
-    if (this.mode === 'rgb') {
-      for (const m of this.bandManagers) m.request(this.maxLevel, 0, 0);
-    }
+    // Prime the coarsest level (one tile per band) so the viewer shows a whole-
+    // image low-res preview almost immediately rather than staying blank until the
+    // target level loads. Single-band uses it as the last-resort coarse-to-fine
+    // fallback (coarserFallback walks up to maxLevel); RGB additionally needs it so
+    // the common-level-hold always has a common ancestor. draw() re-acquires it
+    // every frame so it is never evicted (see the pin in draw()).
+    for (const m of this.bandManagers) m.request(this.maxLevel, 0, 0);
 
     // Overlay subsystem (M3): the instanced marker renderer + a reused DOM popup.
     // The marker store/grid stay empty until the host adds markers.
@@ -420,6 +437,7 @@ export class FitsViewer {
       this.camera.setCenter(c.centerX, c.centerY);
       this.lastDragX = p.x;
       this.lastDragY = p.y;
+      this.markCameraMoved();
       this.requestRender();
     };
     this.onMouseUp = (e) => {
@@ -449,6 +467,7 @@ export class FitsViewer {
       const c = anchoredZoomCenter(this.camera, this.currentOrientation(), p.x, p.y, newZoom);
       this.camera.setZoom(newZoom);
       this.camera.setCenter(c.centerX, c.centerY);
+      this.markCameraMoved();
       this.requestRender();
     };
     this.onCanvasMove = (e) => {
@@ -598,9 +617,8 @@ export class FitsViewer {
     const next = norm.pyramids.map(
       (p) => new TileManager(this.gl, p, this.geoms, this.textureBudget, () => this.requestRender()),
     );
-    if (norm.mode === 'rgb') {
-      for (const m of next) m.request(this.maxLevel, 0, 0);
-    }
+    // Prime the coarsest level for the new managers (mirrors the constructor).
+    for (const m of next) m.request(this.maxLevel, 0, 0);
     const old = this.bandManagers;
     this.bandManagers = next;
     this.bandPyramids = norm.pyramids;
@@ -738,11 +756,13 @@ export class FitsViewer {
 
   setCenter(x: number, y: number): void {
     this.camera.setCenter(x, y);
+    this.markCameraMoved();
     this.requestRender();
   }
 
   setZoom(zoom: number): void {
     this.camera.setZoom(zoom);
+    this.markCameraMoved();
     this.requestRender();
   }
 
@@ -750,6 +770,7 @@ export class FitsViewer {
   fitToImage(): void {
     this.camera.setCenter(this.nativeW / 2, this.nativeH / 2);
     this.camera.setZoom(this.fitZoom());
+    this.markCameraMoved();
     this.requestRender();
   }
 
@@ -757,6 +778,7 @@ export class FitsViewer {
     if (this.destroyed) return;
     this.destroyed = true;
     if (this.pointerScheduled) cancelAnimationFrame(this.pointerRaf);
+    if (this.idleTimerId !== 0) clearTimeout(this.idleTimerId);
     this.detachHandlers();
     for (const m of this.bandManagers) m.destroy();
     this.clearColormapTexture();
@@ -862,12 +884,34 @@ export class FitsViewer {
     requestAnimationFrame(this.frame);
   }
 
+  /**
+   * Note a camera change: clear the idle flag and (re)arm a debounce so the
+   * prefetch ring fires only once interaction settles (PREFETCH_IDLE_MS after the
+   * last move). The fired timer schedules a frame so the now-idle draw prefetches.
+   * Cheap enough to call on every pointer move.
+   */
+  private markCameraMoved(): void {
+    this.cameraIdle = false;
+    if (this.idleTimerId !== 0) clearTimeout(this.idleTimerId);
+    this.idleTimerId = setTimeout(() => {
+      this.idleTimerId = 0;
+      if (this.destroyed) return;
+      this.cameraIdle = true;
+      this.requestRender();
+    }, PREFETCH_IDLE_MS);
+  }
+
   private draw(): void {
     const gl = this.gl;
     this.frameCounter++;
     // One frame clock per band; advance all so each manager's LRU stays in step
     // (a desync would let a band evict tiles its siblings still need to composite).
     for (const m of this.bandManagers) m.frame = this.frameCounter;
+
+    // Drain a bounded number of pending GPU uploads per band before drawing, so a
+    // burst of decoded tiles can't stall the frame; uploaded tiles draw this frame.
+    let queuedUploads = 0;
+    for (const m of this.bandManagers) queuedUploads += m.flushUploads(MAX_UPLOADS_PER_FRAME);
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -900,7 +944,29 @@ export class FitsViewer {
       visibleTileCount = tiles.length;
       if (this.mode === 'rgb') this.drawRgbTiles(orient, geom, level, tiles);
       else this.drawSingleBandTiles(orient, geom, level, tiles);
+
+      // Prefetch ring (P5) + cancel abandoned in-flight fetches (P6a). The
+      // retention region is the visible tiles plus a one-tile margin; the ring is
+      // requested only when the camera is idle (so it never competes with visible
+      // fetches mid-pan), and any in-flight fetch at this level outside the region
+      // is aborted (a tile the user scrolled away from before it loaded).
+      const ring = ringTiles(geom, bounds, PREFETCH_MARGIN);
+      const retain = new Set<string>();
+      for (const t of tiles) retain.add(tileKey(level, t.tileX, t.tileY));
+      for (const t of ring) retain.add(tileKey(level, t.tileX, t.tileY));
+      if (this.cameraIdle) {
+        for (const t of ring) {
+          for (const m of this.bandManagers) m.request(level, t.tileX, t.tileY);
+        }
+      }
+      for (const m of this.bandManagers) m.cancelExcept(level, retain);
     }
+
+    // Pin the coarsest whole-image tile (per band) as the last-resort coarse-to-
+    // fine fallback: re-acquiring it every frame refreshes its last-visible frame
+    // so idle/budget eviction never drops it, and a fast pan into never-visited
+    // territory shows a blur rather than black. A no-op until the prime loads.
+    for (const m of this.bandManagers) m.acquire(this.maxLevel, 0, 0);
 
     for (const m of this.bandManagers) m.evict(MAX_IDLE_FRAMES);
 
@@ -935,6 +1001,10 @@ export class FitsViewer {
         console.error('FitsViewer: onFrame callback threw:', err);
       }
     }
+
+    // Uploads still queued past this frame's budget: keep drawing to drain them.
+    // Coarse-to-fine covers the not-yet-uploaded tiles until they land.
+    if (queuedUploads > 0) this.requestRender();
   }
 
   /**
