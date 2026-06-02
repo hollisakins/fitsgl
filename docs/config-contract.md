@@ -146,7 +146,7 @@ Single-band default:
 | `band` | string | mode=single; defaults to first band if omitted |
 | `r` `g` `b` | string | mode=rgb; each names a band |
 | `colormap` | ColormapName? | mode=single only; ignored for rgb |
-| `stretch` | `{ mode?, range?, channels? }`? | `mode` ∈ linear/asinh/log. Omit ranges → auto-stretch on first frame. Producers pin per-channel `channels.{r,g,b}` / single `range` for reproducible science defaults |
+| `stretch` | `{ mode? }`? | `mode` ∈ linear/asinh/log. **v1 reads only `mode`** — the explorer auto-stretches the data in view and drives the black/white points itself. Pinned `range`/`channels` (for reproducible science defaults) are *reserved* for a later version (when the explorer seeds from them instead of auto). |
 | `northUp` | boolean? | omit → viewer default (on when WCS present) |
 
 ---
@@ -223,27 +223,33 @@ arbitrary CSV with `ra_col`/`dec_col` aliasing) is a later addition; the field s
 
 ---
 
-## 9. TS type refactor (Phase 0)
+## 9. TS types (shipped — `src/fitsgl-config.ts`)
 
-Today's `ViewerConfig = { bands, view, stretch?, northUp?, overlay? }` becomes:
+`FitsglConfig` sits **above** `ViewerConfig`, which is unchanged — it stays the bare
+`<FitsViewer>`'s controlled *view* contract, while `FitsglConfig` is the producer
+artifact (inventory + default view) that `<FitsExplorer config>` consumes and that a
+host maps to a static `ViewerConfig.view` when wiring the bare viewer.
 
 ```ts
-interface FitsglConfig {
-  schemaVersion: 1;
-  dataset: {
-    name: string;
-    title?: string;
-    bands: BandConfig[];                 // BandConfig gains `grid: { group, pixelScaleArcsec? }`
-    catalog?: { url: string };           // was top-level `overlay`
-  };
-  defaultView: ViewerView & {            // was top-level `view` + siblings
-    stretch?: ViewerStretchConfig;
-    northUp?: boolean;
-  };
+interface FitsglBand { name: string; tiles: string[]; grid: { group: number; pixelScaleArcsec?: number }; label?: string; }
+interface FitsglDataset { name: string; title?: string; bands: FitsglBand[]; catalog?: { url: string }; }
+interface FitsglDefaultView {
+  mode: 'single' | 'rgb';
+  band?: string; r?: string; g?: string; b?: string;   // band selection
+  colormap?: ColormapName;                              // single only
+  stretch?: { mode?: StretchMode };                     // v1: mode only (§3)
+  northUp?: boolean;
 }
+interface FitsglConfig { schemaVersion: number; dataset: FitsglDataset; defaultView: FitsglDefaultView; }
 ```
 
-`ViewerView` (single|rgb, with single's `colormap`) and `ViewerStretchConfig` are
-unchanged. `loadViewerSource` gains a base-URL parameter; `loadFitsglConfig(url)`
-wraps fetch + `validateFitsglConfig` + URL resolution. Inline host-pushed markers
-remain a runtime API (`{ markers }`), not a producer-emitted field.
+- `validateFitsglConfig(raw)` — structural validation (§7).
+- `resolveFitsglConfig(config, baseUrl)` — resolve `tiles`/`catalog.url` against the
+  config URL. `loadFitsglConfig(url)` = fetch + validate + resolve. **This is the
+  cross-origin fix**: resolution happens at load, so the viewer always receives
+  absolute URLs — no `loadViewerSource` change was needed.
+- `fitsglConfigFromDataset(dataset, url)` — transition bridge from a legacy
+  `dataset.json` (grid groups via `gridsMatch`; `default_rgb` → default view).
+- `<FitsExplorer>` takes `config?: FitsglConfig` (turnkey) or the loose
+  `bands`/`defaultView`/`catalog`/`title` props. Inline host-pushed markers remain a
+  runtime API (`{ markers }`), not a producer-emitted field.

@@ -99,3 +99,17 @@ export type {
   OverlaySource,
   LoadedViewerSource,
 } from './viewer-config.js';
+
+// The producer contract (`fitsgl.json`): the dataset inventory + an overridable
+// default view, sitting above `ViewerConfig`. `loadFitsglConfig` fetches +
+// validates + resolves relative URLs against the config URL (the cross-origin fix);
+// `fitsglConfigFromDataset` bridges a legacy `dataset.json` until `fitsgl build`
+// emits `fitsgl.json`.
+export {
+  validateFitsglConfig,
+  resolveFitsglConfig,
+  loadFitsglConfig,
+  fitsglConfigFromDataset,
+  FITSGL_SCHEMA_VERSION,
+} from './fitsgl-config.js';
+export type { FitsglConfig, FitsglDataset, FitsglBand, FitsglDefaultView } from './fitsgl-config.js';

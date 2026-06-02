@@ -452,7 +452,13 @@ export type { FitsExplorerProps } from './explorer.js';
 export {
   defaultExplorerState,
   deriveViewerConfig,
+  explorerBandsFromConfig,
+  defaultViewFromConfig,
   explorerBandsFromDataset,
   defaultViewFromDataset,
 } from './explorer-state.js';
 export type { ExplorerBand, ExplorerDefaultView, ExplorerState } from './explorer-state.js';
+// Convenience re-exports so a host using only the `/react` subpath can load and
+// type the producer contract without also importing the core barrel.
+export { loadFitsglConfig, fitsglConfigFromDataset } from '../index.js';
+export type { FitsglConfig } from '../index.js';

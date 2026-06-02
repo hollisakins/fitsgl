@@ -50,6 +50,7 @@ vi.mock('../../src/react/index.js', async () => {
 
 import { FitsExplorer } from '../../src/react/explorer.js';
 import type { ExplorerBand } from '../../src/react/explorer-state.js';
+import type { FitsglConfig } from '../../src/index.js';
 
 const BANDS: ExplorerBand[] = [
   { name: 'f150w', tiles: ['/f150w.json'], gridGroup: 0, label: 'F150W' },
@@ -103,6 +104,28 @@ describe('<FitsExplorer>', () => {
       fireEvent.click(button(container, 'R = f150w'));
     });
     await waitFor(() => expect(getByText('F150W·F277W·F150W')).toBeTruthy());
+  });
+
+  it('accepts a turnkey FitsglConfig (bands + default view + title) directly', async () => {
+    const config: FitsglConfig = {
+      schemaVersion: 1,
+      dataset: {
+        name: 'set',
+        title: 'My Dataset',
+        bands: [
+          { name: 'f150w', tiles: ['/f150w.json'], grid: { group: 0 } },
+          { name: 'f277w', tiles: ['/f277w.json'], grid: { group: 0 } },
+          { name: 'f444w', tiles: ['/f444w.json'], grid: { group: 0 } },
+          { name: 'subaru_r', tiles: ['/subaru.json'], grid: { group: 1 } },
+        ],
+      },
+      defaultView: { mode: 'rgb', r: 'f444w', g: 'f277w', b: 'f150w' },
+    };
+    const { container, getByText } = render(<FitsExplorer config={config} />);
+    await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
+    expect(getByText('My Dataset')).toBeTruthy(); // title from config.dataset.title
+    expect(button(container, 'R = subaru_r').disabled).toBe(true); // cross-grid greyed
+    expect(button(container, 'R = f150w').disabled).toBe(false);
   });
 
   it('toggles between single and RGB layer modes', async () => {

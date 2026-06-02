@@ -34,6 +34,7 @@ import {
   type BandHistogram,
   type ColormapName,
   type CursorInfo,
+  type FitsglConfig,
   type MarkerEvent,
   type MarkerInput,
   type ResolvedMarker,
@@ -44,7 +45,9 @@ import {
 import {
   activeBandNames,
   defaultExplorerState,
+  defaultViewFromConfig,
   deriveViewerConfig,
+  explorerBandsFromConfig,
   isBandSelectableForRgb,
   type ExplorerBand,
   type ExplorerDefaultView,
@@ -55,13 +58,16 @@ const CH_COLOR = { r: '#ff6b6b', g: '#56d089', b: '#5c8cff' } as const;
 type Role = 'r' | 'g' | 'b';
 
 export interface FitsExplorerProps {
-  /** The dataset inventory: bands + where their pyramids live + grid groups. */
-  bands: ExplorerBand[];
+  /** Turnkey: a producer `FitsglConfig` (e.g. from `loadFitsglConfig`). Supplies
+   *  bands + default view + catalog + title; takes precedence over the loose props. */
+  config?: FitsglConfig;
+  /** The dataset inventory (when not using `config`): bands + pyramids + grid groups. */
+  bands?: ExplorerBand[];
   /** The producer's default view (mode, R/G/B or band, stretch, colormap, north-up). */
   defaultView?: ExplorerDefaultView;
   /** Overlay catalog: pre-parsed markers, or a CSV URL the component fetches. */
   catalog?: MarkerInput[] | { url: string };
-  /** Dataset label shown in the status bar. */
+  /** Dataset label shown in the status bar (overrides `config.dataset.title`). */
   title?: string;
   /** Tile-fetch options forwarded to `<FitsViewer>`. */
   tileOptions?: TilePyramidOptions;
@@ -309,26 +315,44 @@ function RgbRow({
 }
 
 export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
-  const { bands, title } = props;
   const handle = useRef<FitsViewerHandle>(null);
   const getViewer = useCallback((): FitsViewerCore | null => handle.current?.getViewer() ?? null, []);
 
-  const [state, setState] = useState<ExplorerState>(() => defaultExplorerState(bands, props.defaultView));
+  // Accept either the turnkey `config` (a FitsglConfig) or the loose
+  // `bands`/`defaultView`/`catalog`/`title` props; `config` wins when present.
+  const bands = useMemo<ExplorerBand[]>(
+    () => (props.config !== undefined ? explorerBandsFromConfig(props.config) : props.bands ?? []),
+    [props.config, props.bands],
+  );
+  const initialView = useMemo<ExplorerDefaultView | undefined>(
+    () => (props.config !== undefined ? defaultViewFromConfig(props.config) : props.defaultView),
+    [props.config, props.defaultView],
+  );
+  const catalogSource = useMemo<MarkerInput[] | { url: string } | undefined>(
+    () =>
+      props.config?.dataset.catalog !== undefined
+        ? { url: props.config.dataset.catalog.url }
+        : props.catalog,
+    [props.config, props.catalog],
+  );
+  const title = props.title ?? props.config?.dataset.title;
+
+  const [state, setState] = useState<ExplorerState>(() => defaultExplorerState(bands, initialView));
   const [collapsed, setCollapsed] = useState(false);
   const [readyTick, setReadyTick] = useState(0);
   const [cursor, setCursor] = useState<CursorInfo | null>(null);
   const [frame, setFrame] = useState<ViewerFrameInfo | null>(null);
   const [limits, setLimits] = useState<Record<string, { min: number; max: number }>>({});
   const [histos, setHistos] = useState<Record<string, BandHistogram>>({});
-  const [markers, setMarkers] = useState<MarkerInput[]>(Array.isArray(props.catalog) ? props.catalog : []);
+  const [markers, setMarkers] = useState<MarkerInput[]>(Array.isArray(catalogSource) ? catalogSource : []);
 
   useEffect(ensureStyles, []);
 
-  const config = useMemo(() => deriveViewerConfig(bands, state), [bands, state]);
+  const viewerConfig = useMemo(() => deriveViewerConfig(bands, state), [bands, state]);
 
   // Fetch a catalog URL into markers (a pre-parsed array is used as-is).
   useEffect(() => {
-    const cat = props.catalog;
+    const cat = catalogSource;
     if (cat === undefined || Array.isArray(cat)) return;
     let live = true;
     fetch(cat.url)
@@ -342,7 +366,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     return () => {
       live = false;
     };
-  }, [props.catalog]);
+  }, [catalogSource]);
 
   // Push markers when the overlay is toggled (and re-push after a reload).
   useEffect(() => {
@@ -425,7 +449,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     <div className={`fgl-explorer${props.className === undefined ? '' : ` ${props.className}`}`} style={containerStyle}>
       <div className="fgl-stage">
         <FitsViewer
-          config={config}
+          config={viewerConfig}
           ref={handle}
           tileOptions={props.tileOptions}
           textureBudget={props.textureBudget}

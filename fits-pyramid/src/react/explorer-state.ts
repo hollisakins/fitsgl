@@ -17,11 +17,10 @@
  */
 
 import {
-  compatibleBands,
-  resolveDatasetBandUrl,
+  fitsglConfigFromDataset,
   type ColormapName,
-  type DatasetBand,
   type DatasetManifest,
+  type FitsglConfig,
   type StretchMode,
   type ViewerConfig,
   type ViewerView,
@@ -202,32 +201,42 @@ export function deriveViewerConfig(bands: readonly ExplorerBand[], state: Explor
   };
 }
 
+/** Map a `FitsglConfig`'s inventory to explorer bands (the turnkey `config` path). */
+export function explorerBandsFromConfig(config: FitsglConfig): ExplorerBand[] {
+  return config.dataset.bands.map((b) => {
+    const band: ExplorerBand = { name: b.name, tiles: b.tiles.slice(), gridGroup: b.grid.group };
+    if (b.label !== undefined) band.label = b.label;
+    if (b.grid.pixelScaleArcsec !== undefined) band.pixelScaleArcsec = b.grid.pixelScaleArcsec;
+    return band;
+  });
+}
+
+/** Map a `FitsglConfig`'s `defaultView` to the explorer's default-view shape. */
+export function defaultViewFromConfig(config: FitsglConfig): ExplorerDefaultView {
+  const dv = config.defaultView;
+  const out: ExplorerDefaultView = { mode: dv.mode };
+  if (dv.band !== undefined) out.band = dv.band;
+  if (dv.r !== undefined) out.r = dv.r;
+  if (dv.g !== undefined) out.g = dv.g;
+  if (dv.b !== undefined) out.b = dv.b;
+  if (dv.stretch?.mode !== undefined) out.stretch = dv.stretch.mode;
+  if (dv.colormap !== undefined) out.colormap = dv.colormap;
+  if (dv.northUp !== undefined) out.northUp = dv.northUp;
+  return out;
+}
+
 /**
- * Build the explorer's inventory from a `dataset.json` (`DatasetManifest`),
- * resolving each band's manifest URL against the dataset URL and assigning grid
- * groups via the authoritative `gridsMatch` (through `compatibleBands`): bands are
- * bucketed by the first earlier band they are grid-compatible with. Lets a host
- * (or the refactored demo) feed today's dataset manifest straight into
- * `<FitsExplorer>` until the unified `loadFitsglConfig` lands.
+ * Build the explorer's inventory from a legacy `dataset.json` (`DatasetManifest`)
+ * — a thin wrapper over `fitsglConfigFromDataset` (grid groups via the
+ * authoritative `gridsMatch`, URLs resolved against `datasetUrl`). Lets a host (or
+ * the demo) feed today's dataset manifest into `<FitsExplorer>` until a
+ * `fitsgl.json` is emitted and `loadFitsglConfig` is used instead.
  */
 export function explorerBandsFromDataset(
   dataset: DatasetManifest,
   datasetUrl: string,
 ): ExplorerBand[] {
-  const reps: DatasetBand[] = [];
-  const groupOf = (band: DatasetBand): number => {
-    const existing = reps.findIndex((rep) => compatibleBands(rep, [band]).length > 0);
-    if (existing !== -1) return existing;
-    reps.push(band);
-    return reps.length - 1;
-  };
-  return dataset.bands.map((b) => ({
-    name: b.name,
-    label: b.name,
-    tiles: [resolveDatasetBandUrl(datasetUrl, b.path)],
-    gridGroup: groupOf(b),
-    pixelScaleArcsec: b.pixel_scale_arcsec,
-  }));
+  return explorerBandsFromConfig(fitsglConfigFromDataset(dataset, datasetUrl));
 }
 
 /** The producer's default view from a dataset manifest's `default_rgb` (if any). */
