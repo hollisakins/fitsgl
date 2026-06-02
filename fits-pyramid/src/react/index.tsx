@@ -443,3 +443,16 @@ FitsViewerComponent.displayName = 'FitsViewer';
 
 export const FitsViewer = FitsViewerComponent;
 export default FitsViewerComponent;
+
+// The batteries-included tier: `<FitsViewer>` + a built-in control panel. Exported
+// last so this module's `FitsViewer` binding is defined before `./explorer` (which
+// imports it) is evaluated by this re-export.
+export { FitsExplorer } from './explorer.js';
+export type { FitsExplorerProps } from './explorer.js';
+export {
+  defaultExplorerState,
+  deriveViewerConfig,
+  explorerBandsFromDataset,
+  defaultViewFromDataset,
+} from './explorer-state.js';
+export type { ExplorerBand, ExplorerDefaultView, ExplorerState } from './explorer-state.js';

@@ -27,11 +27,14 @@ export type {
   ViewerFrameInfo,
   CursorInfo,
   AutoStretchResult,
+  BandHistogram,
+  VisibleHistogram,
   WorldBounds,
 } from './renderer/index.js';
-// M5 — percentile auto-stretch (`FitsViewer.autoStretch` applies it; `percentileRange`
-// is the pure underlying math, for a host computing a stretch from its own data).
-export { percentileRange, PERCENTILE_SAMPLE_CAP } from './renderer/index.js';
+// M5 — percentile auto-stretch + visible-data histogram (`FitsViewer.autoStretch`
+// and `.visibleHistogram` apply them; `percentileRange`/`histogram` are the pure
+// underlying math, for a host computing a stretch/histogram from its own data).
+export { percentileRange, histogram, PERCENTILE_SAMPLE_CAP } from './renderer/index.js';
 // M4 — render source (single band, or three same-grid bands) accepted by the viewer.
 export type { RenderSource, SingleBandSource, RgbSource } from './renderer/index.js';
 

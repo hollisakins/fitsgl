@@ -7,10 +7,17 @@
  */
 
 export { FitsViewer } from './viewer.js';
-export type { FitsViewerOptions, ViewerFrameInfo, CursorInfo, AutoStretchResult } from './viewer.js';
+export type {
+  FitsViewerOptions,
+  ViewerFrameInfo,
+  CursorInfo,
+  AutoStretchResult,
+  BandHistogram,
+  VisibleHistogram,
+} from './viewer.js';
 
-// Percentile auto-stretch math (M5), promoted from the demo (decision D11).
-export { percentileRange, PERCENTILE_SAMPLE_CAP } from './auto-stretch.js';
+// Percentile auto-stretch + histogram math (M5), promoted from the demo (decision D11).
+export { percentileRange, histogram, PERCENTILE_SAMPLE_CAP } from './auto-stretch.js';
 
 // M4 — render-source model (single band, or three same-grid bands) + the pure
 // grid-compatibility guard (GL-free, so it unit-tests under Node).

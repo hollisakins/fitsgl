@@ -68,7 +68,7 @@ import {
   type TileCoord,
   type WorldRect,
 } from './tile-manager.js';
-import { percentileRange, PERCENTILE_SAMPLE_CAP } from './auto-stretch.js';
+import { histogram, percentileRange, PERCENTILE_SAMPLE_CAP } from './auto-stretch.js';
 
 /** Maximum zoom-in: this many drawing-buffer pixels per native pixel. */
 const MAX_NATIVE_ZOOM = 16;
@@ -141,6 +141,27 @@ export type AutoStretchResult =
       g: [number, number] | null;
       b: [number, number] | null;
     };
+
+/**
+ * One band's distribution of the data currently in view: `bins` raw counts over
+ * the half-open domain `[lo, hi)`. The domain is a robust wide percentile (not
+ * raw min/max) so a few hot pixels don't flatten it; pair it with `setStretch`/
+ * `setChannelStretch` to drive a histogram + black/white-point control.
+ */
+export interface BandHistogram {
+  counts: Float32Array;
+  lo: number;
+  hi: number;
+}
+
+/**
+ * What `visibleHistogram` returns: one distribution in single-band mode, or one
+ * per channel in RGB mode (a channel is `null` when its visible tiles held no
+ * finite data — same convention as `AutoStretchResult`).
+ */
+export type VisibleHistogram =
+  | { mode: 'single'; band: BandHistogram }
+  | { mode: 'rgb'; r: BandHistogram | null; g: BandHistogram | null; b: BandHistogram | null };
 
 export interface FitsViewerOptions {
   /** GPU texture budget in tiles (LRU by last visible frame). Default 200. */
@@ -578,6 +599,62 @@ export class FitsViewer {
     if (range === null) return null;
     this.setStretch(range[0], range[1]);
     return { mode: 'single', min: range[0], max: range[1] };
+  }
+
+  /**
+   * The level + tile coords drawn last frame — the set `autoStretch` and
+   * `visibleHistogram` sample, so they read exactly what's on screen (cache hits).
+   * Returns null before the first frame or when nothing is in view.
+   */
+  private gatherVisibleTiles(): { level: number; tiles: readonly TileCoord[] } | null {
+    const bounds = this.lastBounds;
+    if (bounds === null) return null;
+    const level = this.lastLevel;
+    const geom = this.geoms.get(level);
+    if (geom === undefined) return null;
+    const tiles = visibleTiles(geom, bounds);
+    if (tiles.length === 0) return null;
+    return { level, tiles };
+  }
+
+  /**
+   * The distribution of the data currently in view, as `bins` counts per active
+   * band over a robust `[lo, hi]` domain (the 0.1–99.9 percentile, so hot pixels
+   * don't flatten it). Single-band → one histogram; RGB → one per channel (each
+   * null when that band's visible tiles held no finite data). Resolves null before
+   * the first frame or when no tile is in view. Samples the same tiles the last
+   * frame drew (cache hits) — the host-facing companion to `autoStretch` for a
+   * histogram + black/white-point control (decision D11: a supported capability,
+   * not a reach into the internal tile helpers).
+   */
+  async visibleHistogram(bins = 128): Promise<VisibleHistogram | null> {
+    const gathered = this.gatherVisibleTiles();
+    if (gathered === null) return null;
+    const { level, tiles } = gathered;
+    const bandHist = async (pyramid: TilePyramid): Promise<BandHistogram | null> => {
+      let arrays: Float32Array[];
+      try {
+        arrays = await Promise.all(tiles.map((t) => pyramid.getTile(level, t.tileX, t.tileY)));
+      } catch (err) {
+        console.warn('FitsViewer.visibleHistogram: tile fetch failed; skipping this band:', err);
+        return null;
+      }
+      const domain = percentileRange(arrays, 0.001, 0.999, PERCENTILE_SAMPLE_CAP);
+      if (domain === null) return null;
+      const [lo, hi] = domain;
+      return { counts: histogram(arrays, bins, lo, hi, PERCENTILE_SAMPLE_CAP), lo, hi };
+    };
+    if (this.mode === 'rgb') {
+      // mode==='rgb' ⇒ bandPyramids has exactly 3 entries (normalizeSource invariant).
+      const [r, g, b] = await Promise.all([
+        bandHist(this.bandPyramids[0]),
+        bandHist(this.bandPyramids[1]),
+        bandHist(this.bandPyramids[2]),
+      ]);
+      return { mode: 'rgb', r, g, b };
+    }
+    const band = await bandHist(this.bandPyramids[0]);
+    return band === null ? null : { mode: 'single', band };
   }
 
   /** Fetch the given tiles from `pyramid` (cache hits) and percentile them. */
