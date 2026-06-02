@@ -16,5 +16,7 @@ export {
   readFloat64BE,
 } from './bintable.js';
 export type { BinTableLayout, ColumnDef } from './bintable.js';
-export { attachTileWorker } from '../worker.js';
+export { attachDecodeWorker } from '../worker.js';
 export type { WorkerLike, WorkerScopeLike, WorkerRequest, WorkerReply } from './worker-protocol.js';
+export { inlineDecoder, WorkerPoolDecoder } from './decode-executor.js';
+export type { DecodeExecutor } from './decode-executor.js';

@@ -27,18 +27,25 @@ export type CompressionType = 'RICE_1' | 'GZIP_2';
 
 /**
  * Range fetcher: return bytes `[start, endInclusive]` of `url`. Implementations
- * must reject a server that ignores the Range header (HTTP 200). Injectable so
- * tests can serve from a local buffer instead of HTTP.
+ * must reject a server that ignores the Range header (HTTP 200). The optional
+ * `signal` lets a caller abort an in-flight fetch (e.g. when the user pans past a
+ * tile before it loads). Injectable so tests can serve from a local buffer.
  */
-export type RangeFetcher = (url: string, start: number, endInclusive: number) => Promise<Uint8Array>;
+export type RangeFetcher = (
+  url: string,
+  start: number,
+  endInclusive: number,
+  signal?: AbortSignal,
+) => Promise<Uint8Array>;
 
 /** Default HTTP range fetcher. Verifies 206 (Partial Content). */
 export async function httpRangeFetch(
   url: string,
   start: number,
   endInclusive: number,
+  signal?: AbortSignal,
 ): Promise<Uint8Array> {
-  const resp = await fetch(url, { headers: { Range: `bytes=${start}-${endInclusive}` } });
+  const resp = await fetch(url, { headers: { Range: `bytes=${start}-${endInclusive}` }, signal });
   if (resp.status === 200) {
     throw new Error(
       `range request for ${url} returned 200, not 206: the server ignored the ` +
@@ -64,6 +71,31 @@ interface TileIndexEntry {
 
 export interface FpackOpenOptions {
   initialBytes?: number;
+}
+
+/**
+ * Everything `FpackFile.decodeTile` needs to turn a tile's compressed bytes into
+ * a `Float32Array`, with no file handle. Carrying these separately from the bytes
+ * lets a caller cache/transport the compressed bytes (which are identical whether
+ * they came from the network or a persistent store) and decode them later — the
+ * decode is a pure function of (bytes, params), so it stays bit-exact regardless
+ * of where the bytes were sourced.
+ */
+export interface TileDecodeParams {
+  compressionType: CompressionType;
+  /** tile pixel count (width * height, accounting for partial edge tiles). */
+  nPixels: number;
+  /** RICE ZBLOCKSIZE. */
+  blockSize: number;
+  /** per-tile quantization scale/offset (RICE); NaN for GZIP_2. */
+  zscale: number;
+  zzero: number;
+  /** integer blank sentinel; NaN when none. */
+  zblank: number;
+  /** ZQUANTIZ dither method + seed, and the tile's row-major index for the RNG. */
+  ditherMethod: number;
+  zdither0: number;
+  tileIndex: number;
 }
 
 export class FpackFile {
@@ -180,11 +212,11 @@ export class FpackFile {
   }
 
   /** Return bytes `[start, start+len)`, served from the head buffer when covered. */
-  private async getBytes(start: number, len: number): Promise<Uint8Array> {
+  private async getBytes(start: number, len: number, signal?: AbortSignal): Promise<Uint8Array> {
     if (start >= 0 && start + len <= this.headLen) {
       return this.headBuffer.subarray(start, start + len);
     }
-    const bytes = await this.fetcher(this.url, start, start + len - 1);
+    const bytes = await this.fetcher(this.url, start, start + len - 1, signal);
     if (bytes.length < len) {
       throw new Error(
         `fpack ${this.url}: expected ${len} bytes at offset ${start}, got ${bytes.length}`,
@@ -251,7 +283,16 @@ export class FpackFile {
     return { width, height };
   }
 
-  async getTile(tileX: number, tileY: number): Promise<Float32Array> {
+  /**
+   * Validate the coordinates and resolve the tile's index entry + row + pixel
+   * count. Shared by `tileDecodeParams` and `fetchCompressedTile`; the tile index
+   * is fetched once and memoized (`loadTileIndex`), so calling this twice for one
+   * tile is cheap arithmetic.
+   */
+  private async resolveTile(
+    tileX: number,
+    tileY: number,
+  ): Promise<{ entry: TileIndexEntry; row: number; nPixels: number }> {
     if (!Number.isInteger(tileX) || !Number.isInteger(tileY) || tileX < 0 || tileY < 0 || tileX >= this.nTilesX || tileY >= this.nTilesY) {
       throw new Error(
         `fpack ${this.url}: tile (${tileX}, ${tileY}) is out of range for a ` +
@@ -262,8 +303,30 @@ export class FpackFile {
     const row = tileY * this.nTilesX + tileX;
     const entry = index[row]!;
     const { width, height } = this.tileDims(tileX, tileY);
-    const nPixels = width * height;
+    return { entry, row, nPixels: width * height };
+  }
 
+  /** The (file-handle-free) parameters needed to decode tile (x, y). */
+  async tileDecodeParams(tileX: number, tileY: number): Promise<TileDecodeParams> {
+    const { entry, row, nPixels } = await this.resolveTile(tileX, tileY);
+    return {
+      compressionType: this.compressionType,
+      nPixels,
+      blockSize: this.blockSize,
+      zscale: entry.zscale,
+      zzero: entry.zzero,
+      zblank: entry.zblank,
+      // `row` is the 0-based row-major tile index = the tile's BINTABLE row, which
+      // is exactly the index the dither sequence keys off.
+      ditherMethod: this.ditherMethod,
+      zdither0: this.zdither0,
+      tileIndex: row,
+    };
+  }
+
+  /** Range-fetch just the compressed heap bytes for tile (x, y). */
+  async fetchCompressedTile(tileX: number, tileY: number, signal?: AbortSignal): Promise<Uint8Array> {
+    const { entry } = await this.resolveTile(tileX, tileY);
     if (entry.nBytes === 0) {
       if (entry.gzipNBytes > 0) {
         throw new Error(
@@ -273,27 +336,38 @@ export class FpackFile {
       }
       throw new Error(`fpack ${this.url}: tile (${tileX}, ${tileY}) has empty COMPRESSED_DATA`);
     }
-
     const start = this.layout.heapStart + entry.heapOffset;
-    const bytes = await this.getBytes(start, entry.nBytes);
+    return this.getBytes(start, entry.nBytes, signal);
+  }
 
-    if (this.compressionType === 'RICE_1') {
-      // `row` (computed above) is the 0-based row-major tile index = the tile's
-      // BINTABLE row, which is exactly the index the dither sequence keys off.
+  /**
+   * Pure decode of a tile's compressed bytes. Static (no file handle) so cached or
+   * transported bytes decode identically to freshly-fetched ones. Dispatches on the
+   * compression type recorded in `params`. Async because GZIP_2 decode uses the
+   * browser-native `DecompressionStream`; the RICE_1 path is synchronous internally.
+   */
+  static async decodeTile(bytes: Uint8Array, params: TileDecodeParams): Promise<Float32Array> {
+    if (params.compressionType === 'RICE_1') {
       const dither =
-        this.ditherMethod === NO_DITHER
+        params.ditherMethod === NO_DITHER
           ? undefined
-          : { method: this.ditherMethod, seed: this.zdither0, tileIndex: row };
+          : { method: params.ditherMethod, seed: params.zdither0, tileIndex: params.tileIndex };
       return decodeRiceTile(
         bytes,
-        entry.zscale,
-        entry.zzero,
-        entry.zblank,
-        nPixels,
-        this.blockSize,
+        params.zscale,
+        params.zzero,
+        params.zblank,
+        params.nPixels,
+        params.blockSize,
         dither,
       );
     }
-    return decodeGzip2Tile(bytes, nPixels);
+    return decodeGzip2Tile(bytes, params.nPixels);
+  }
+
+  async getTile(tileX: number, tileY: number): Promise<Float32Array> {
+    const params = await this.tileDecodeParams(tileX, tileY);
+    const bytes = await this.fetchCompressedTile(tileX, tileY);
+    return FpackFile.decodeTile(bytes, params);
   }
 }

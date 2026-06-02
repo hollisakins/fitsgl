@@ -17,7 +17,7 @@
  */
 
 import type { Manifest } from '../manifest.js';
-import type { TilePyramid } from '../fpack/tile-source.js';
+import { isAbortError, type TilePyramid } from '../fpack/tile-source.js';
 import type { WorldBounds } from './camera.js';
 import { createTileTexture } from './gl-util.js';
 
@@ -134,6 +134,46 @@ export function visibleTiles(geom: LevelGeom, bounds: WorldBounds): TileCoord[] 
   const tiles: TileCoord[] = [];
   for (let ty = ty0; ty <= ty1; ty++) {
     for (let tx = tx0; tx <= tx1; tx++) {
+      tiles.push({ level: geom.z, tileX: tx, tileY: ty });
+    }
+  }
+  return tiles;
+}
+
+/**
+ * Tiles in a `margin`-tile band just outside the viewport (the visible tiles are
+ * excluded) — the prefetch ring, so a pan reveals already-loading tiles instead
+ * of a cold edge. Same intersection + edge-nudge math as `visibleTiles`, then the
+ * tile box is grown by `margin` on each side and the visible box subtracted.
+ * Returns `[]` for `margin <= 0` or when the viewport does not overlap the level.
+ */
+export function ringTiles(geom: LevelGeom, bounds: WorldBounds, margin: number): TileCoord[] {
+  if (margin <= 0) return [];
+  const f = 2 ** geom.z;
+  const span = TILE_SIZE * f;
+  const worldW = geom.levelW * f;
+  const worldH = geom.levelH * f;
+
+  const minX = Math.max(0, Math.min(bounds.x0, bounds.x1));
+  const maxX = Math.min(worldW, Math.max(bounds.x0, bounds.x1));
+  const minY = Math.max(0, Math.min(bounds.y0, bounds.y1));
+  const maxY = Math.min(worldH, Math.max(bounds.y0, bounds.y1));
+  if (maxX <= minX || maxY <= minY) return [];
+
+  const vtx0 = Math.max(0, Math.floor(minX / span));
+  const vtx1 = Math.min(geom.nTilesX - 1, Math.floor((maxX - 1e-6) / span));
+  const vty0 = Math.max(0, Math.floor(minY / span));
+  const vty1 = Math.min(geom.nTilesY - 1, Math.floor((maxY - 1e-6) / span));
+
+  const tx0 = Math.max(0, vtx0 - margin);
+  const tx1 = Math.min(geom.nTilesX - 1, vtx1 + margin);
+  const ty0 = Math.max(0, vty0 - margin);
+  const ty1 = Math.min(geom.nTilesY - 1, vty1 + margin);
+
+  const tiles: TileCoord[] = [];
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      if (tx >= vtx0 && tx <= vtx1 && ty >= vty0 && ty <= vty1) continue; // visible: skip
       tiles.push({ level: geom.z, tileX: tx, tileY: ty });
     }
   }
@@ -265,6 +305,26 @@ interface TileTexture {
 export class TileManager {
   private readonly textures = new Map<string, TileTexture>();
   private readonly inflight = new Set<string>();
+  /**
+   * In-flight FETCH-phase requests (not yet decoded): their abort controller +
+   * level, so `cancelExcept` can abort tiles that scrolled out of the retention
+   * region before loading. A tile leaves this map once decoded (it moves to
+   * `pendingUploads`) — decoded work can't be unspent, so it isn't cancellable.
+   */
+  private readonly fetches = new Map<string, { controller: AbortController; level: number }>();
+  /**
+   * Decoded tiles awaiting GPU upload. The upload (texImage2D) is deferred out of
+   * the fetch/decode callback into `flushUploads`, which the viewer calls with a
+   * per-frame budget — so a burst of tiles decoded in parallel (or served fast
+   * from the disk cache on a warm reload) can't stall the frame with many uploads
+   * at once. A queued tile stays in `inflight` so it is not re-requested.
+   */
+  private readonly pendingUploads: Array<{
+    key: string;
+    data: Float32Array;
+    width: number;
+    height: number;
+  }> = [];
   /** Current render frame, set by the viewer at the start of each draw. */
   frame = 0;
   private destroyed = false;
@@ -295,11 +355,18 @@ export class TileManager {
     const geom = this.geoms.get(level);
     if (geom === undefined) return;
     this.inflight.add(key);
+    const controller = new AbortController();
+    this.fetches.set(key, { controller, level });
     this.pyramid
-      .getTile(level, tileX, tileY)
+      .getTile(level, tileX, tileY, controller.signal)
       .then((data) => {
-        this.inflight.delete(key);
-        if (this.destroyed) return;
+        this.fetches.delete(key); // left the fetch phase
+        // Torn down, or cancelled after the fetch resolved: drop it rather than
+        // upload a tile the user has panned away from.
+        if (this.destroyed || controller.signal.aborted) {
+          this.inflight.delete(key);
+          return;
+        }
         const { width, height } = tilePixelDims(geom, tileX, tileY);
         // Tile dims are derived from the manifest's 256-px tiling; if the decoded
         // length disagrees (e.g. a pyramid with a non-256 fpack tile size), the
@@ -309,23 +376,57 @@ export class TileManager {
           console.warn(
             `TileManager: tile ${key} decoded length ${data.length} != ${width}×${height}; skipping upload`,
           );
+          this.inflight.delete(key);
           return;
         }
-        const texture = createTileTexture(this.gl, width, height, data);
-        this.textures.set(key, {
-          texture,
-          width,
-          height,
-          lastVisibleFrame: this.frame,
-        });
+        // Defer the GPU upload to flushUploads (frame-budgeted). The key stays in
+        // `inflight` until uploaded so it is not re-requested while it waits.
+        this.pendingUploads.push({ key, data, width, height });
         this.onTileLoaded();
       })
       .catch((err: unknown) => {
+        this.fetches.delete(key);
         this.inflight.delete(key);
-        if (!this.destroyed) {
-          console.warn(`TileManager: failed to load tile ${key}:`, err);
-        }
+        // A cancelled fetch (pan-away) is expected, not a failure — stay quiet.
+        if (this.destroyed || isAbortError(err)) return;
+        console.warn(`TileManager: failed to load tile ${key}:`, err);
       });
+  }
+
+  /**
+   * Abort in-flight FETCHES at `level` whose key is not in `retain` — tiles that
+   * scrolled out of the viewport + prefetch ring before they finished loading.
+   * Only fetch-phase tiles at the current level are cancelled; already-decoded
+   * tiles and tiles at other levels (coarse fallbacks, the coarsest prime) are
+   * left untouched. The aborted requests clean themselves up in their `.catch`.
+   */
+  cancelExcept(level: number, retain: Set<string>): void {
+    for (const [key, f] of this.fetches) {
+      if (f.level === level && !retain.has(key)) f.controller.abort();
+    }
+  }
+
+  /**
+   * Upload up to `budget` queued tiles to the GPU (marking them resident this
+   * frame) and return the number still queued. The viewer calls this once per
+   * frame; when the return is > 0 it schedules another frame to drain the rest.
+   */
+  flushUploads(budget: number): number {
+    if (this.destroyed) return 0;
+    let uploaded = 0;
+    while (uploaded < budget && this.pendingUploads.length > 0) {
+      const u = this.pendingUploads.shift()!;
+      this.inflight.delete(u.key);
+      const texture = createTileTexture(this.gl, u.width, u.height, u.data);
+      this.textures.set(u.key, {
+        texture,
+        width: u.width,
+        height: u.height,
+        lastVisibleFrame: this.frame,
+      });
+      uploaded++;
+    }
+    return this.pendingUploads.length;
   }
 
   /** Evict textures no longer needed, per `selectEvictions`. */
@@ -352,8 +453,11 @@ export class TileManager {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    for (const f of this.fetches.values()) f.controller.abort();
+    this.fetches.clear();
     for (const t of this.textures.values()) this.gl.deleteTexture(t.texture);
     this.textures.clear();
     this.inflight.clear();
+    this.pendingUploads.length = 0;
   }
 }

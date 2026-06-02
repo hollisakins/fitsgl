@@ -3,6 +3,7 @@ import type { Manifest } from '../src/manifest.js';
 import {
   targetLevel,
   visibleTiles,
+  ringTiles,
   coarserFallback,
   commonResidentLevel,
   selectEvictions,
@@ -99,6 +100,40 @@ describe('visibleTiles', () => {
     // [305,320] is beyond the 300-px imaged width; a regression clamping to
     // nTilesX*span (=512) instead of worldW (=300) would wrongly return tile 1.
     expect(visibleTiles(gPartial, { x0: 305, y0: 305, x1: 320, y1: 320 })).toEqual([]);
+  });
+});
+
+describe('ringTiles (prefetch margin)', () => {
+  const g = geom({ z: 0, levelW: 2048, levelH: 2048 }); // 8x8 tiles, span 256
+
+  const keys = (ts: ReturnType<typeof ringTiles>): Set<string> =>
+    new Set(ts.map((t) => `${t.tileX},${t.tileY}`));
+
+  it('returns the 1-tile band around the viewport, excluding visible tiles', () => {
+    // Viewport over tiles (2,2)-(3,3); margin 1 -> box (1..4)x(1..4) minus (2..3)².
+    const ring = ringTiles(g, { x0: 512, y0: 512, x1: 1024, y1: 1024 }, 1);
+    expect(ring.length).toBe(4 * 4 - 2 * 2); // 16 expanded - 4 visible = 12
+    const k = keys(ring);
+    expect(k.has('2,2')).toBe(false); // visible excluded
+    expect(k.has('1,1')).toBe(true); // corner of the ring
+    expect(k.has('4,4')).toBe(true);
+    for (const t of ring) {
+      expect(t.tileX).toBeGreaterThanOrEqual(1);
+      expect(t.tileX).toBeLessThanOrEqual(4);
+    }
+  });
+
+  it('clamps the ring at the image edge', () => {
+    // Viewport over tiles (0,0)-(1,1); margin 1 clamps low at 0 -> (0..2)² minus (0..1)².
+    const ring = ringTiles(g, { x0: 0, y0: 0, x1: 512, y1: 512 }, 1);
+    expect(ring.length).toBe(3 * 3 - 2 * 2); // 9 - 4 = 5
+    expect(keys(ring).has('0,0')).toBe(false);
+    expect(keys(ring).has('2,2')).toBe(true);
+  });
+
+  it('returns [] for margin 0 or a non-overlapping viewport', () => {
+    expect(ringTiles(g, { x0: 0, y0: 0, x1: 512, y1: 512 }, 0)).toEqual([]);
+    expect(ringTiles(g, { x0: 5000, y0: 5000, x1: 6000, y1: 6000 }, 1)).toEqual([]);
   });
 });
 

@@ -1,25 +1,28 @@
 /**
- * Shared message protocol for the tile Web Worker. Pure types + constants only,
- * so both the main-thread façade (`tile-source.ts`) and the worker entry
- * (`worker.ts`) can depend on it without a circular import.
+ * Shared message protocol for the decode worker pool (plan P4, "Shape B"). Pure
+ * types + constants only, so the main-thread coordinator (`tile-source.ts`,
+ * `decode-executor.ts`) and the worker entry (`worker.ts`) can depend on it
+ * without a circular import.
+ *
+ * Workers are STATELESS decode units: the main thread owns the manifest, file
+ * metadata, fetch, and the RAM/disk caches, and hands a worker only a tile's
+ * compressed bytes + decode params. The worker returns the decoded floats.
  */
 
-import type { Manifest } from '../manifest.js';
+import type { TileDecodeParams } from './fpack-file.js';
 
+/** Default decoded-tile (RAM) LRU capacity, used by `TileEngine`. */
 export const DEFAULT_CACHE_SIZE = 256;
 
-/** Main thread → worker. */
+/** Main thread → decode worker. */
 export type WorkerRequest =
-  | { type: 'init'; manifestUrl: string; cacheSize: number }
-  | { type: 'getTile'; id: number; level: number; tileX: number; tileY: number }
+  | { type: 'decode'; id: number; bytes: Uint8Array; params: TileDecodeParams }
   | { type: 'close' };
 
-/** Worker → main thread. */
+/** Decode worker → main thread. */
 export type WorkerReply =
-  | { type: 'inited'; manifest: Manifest }
-  | { type: 'initError'; error: string }
-  | { type: 'tile'; id: number; buffer: ArrayBuffer }
-  | { type: 'error'; id: number; error: string };
+  | { type: 'decoded'; id: number; buffer: ArrayBuffer }
+  | { type: 'decodeError'; id: number; error: string };
 
 /** The subset of the main-thread `Worker` interface this library uses. */
 export interface WorkerLike {
