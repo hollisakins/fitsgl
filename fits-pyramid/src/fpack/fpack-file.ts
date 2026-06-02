@@ -21,6 +21,7 @@ import {
 } from './bintable.js';
 import { decodeRiceTile } from './decode-rice.js';
 import { decodeGzip2Tile } from './decode-gzip2.js';
+import { ditherMethodFromZquantiz, NO_DITHER } from './dither.js';
 
 export type CompressionType = 'RICE_1' | 'GZIP_2';
 
@@ -75,6 +76,8 @@ export class FpackFile {
   readonly nTilesX: number;
   readonly nTilesY: number;
   readonly blockSize: number; // RICE ZBLOCKSIZE
+  readonly ditherMethod: number; // ZQUANTIZ: NO_DITHER | SUBTRACTIVE_DITHER_1 | _2
+  readonly zdither0: number; // ZDITHER0 dither seed (0 when absent / no dither)
 
   private readonly fetcher: RangeFetcher;
   private readonly layout: BinTableLayout;
@@ -106,6 +109,8 @@ export class FpackFile {
     this.ztile2 = bintable.getInt('ZTILE2') ?? 1;
     this.blockSize = bintable.getInt('ZBLOCKSIZE') ?? 32;
     this.zblankHeader = bintable.getInt('ZBLANK') ?? NaN;
+    this.ditherMethod = ditherMethodFromZquantiz(bintable.getString('ZQUANTIZ'));
+    this.zdither0 = bintable.getInt('ZDITHER0') ?? 0;
 
     this.nTilesX = Math.ceil(this.znaxis1 / this.ztile1);
     this.nTilesY = Math.ceil(this.znaxis2 / this.ztile2);
@@ -273,7 +278,21 @@ export class FpackFile {
     const bytes = await this.getBytes(start, entry.nBytes);
 
     if (this.compressionType === 'RICE_1') {
-      return decodeRiceTile(bytes, entry.zscale, entry.zzero, entry.zblank, nPixels, this.blockSize);
+      // `row` (computed above) is the 0-based row-major tile index = the tile's
+      // BINTABLE row, which is exactly the index the dither sequence keys off.
+      const dither =
+        this.ditherMethod === NO_DITHER
+          ? undefined
+          : { method: this.ditherMethod, seed: this.zdither0, tileIndex: row };
+      return decodeRiceTile(
+        bytes,
+        entry.zscale,
+        entry.zzero,
+        entry.zblank,
+        nPixels,
+        this.blockSize,
+        dither,
+      );
     }
     return decodeGzip2Tile(bytes, nPixels);
   }

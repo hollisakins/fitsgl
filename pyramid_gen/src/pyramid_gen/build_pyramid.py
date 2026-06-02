@@ -1,14 +1,17 @@
 """Main pyramid-building pipeline.
 
 Converts a single FITS mosaic into an N+1 level pyramid of independently
-fpacked FITS files (astropy ``CompImageHDU``), one file per resolution level:
+fpacked FITS files (astropy ``CompImageHDU``), one file per resolution level.
 
-- z=0   GZIP_2, quantization disabled -> LOSSLESS science-distribution product.
-- z>=1  RICE_1, quantize_level=16     -> lossy visualization tiles.
+Every level is a **display-only** product: RICE_1, ``quantize_level=8``,
+``SUBTRACTIVE_DITHER_2``. This is lossy but scientifically negligible -- q=8
+preserves source photometry to ~0.03% on real (noise-dominated) data, and the
+dither seed is stored per level (ZDITHER0) so the browser can reverse it. The
+raw, lossless science mosaic is distributed separately, not by this pipeline.
 
 Every level shares a 256x256 fpack-internal tile size. Each file is written and
-then read back to verify the pixels round-trip (exactly at z=0, within the
-quantization tolerance at z>0); a failed round-trip raises rather than emitting
+then read back to verify the pixels round-trip within the quantization tolerance
+(and the NaN mask exactly); a failed round-trip raises rather than emitting
 broken output.
 """
 
@@ -32,12 +35,21 @@ from .manifest import LevelInfo, Manifest, write_manifest
 #: fpack-internal tile size; the unit of HTTP byte ranges the browser requests.
 FPACK_TILE_SIZE = 256
 
-#: Default lossy quantization for z>0 RICE_1 levels.
-DEFAULT_QUANTIZE_LEVEL = 16
+#: Lossy quantization level applied to every RICE_1 level. q=8 preserves source
+#: photometry to ~0.03% on real (noise-dominated) data while compressing ~5-6x;
+#: the pyramid is display-only, so this is scientifically negligible.
+DEFAULT_QUANTIZE_LEVEL = 8
 
-#: GZIP_2 quantizes floats by default (quantize_level=16); setting it to 0
-#: disables quantization, which is what makes the z=0 product truly lossless.
-LOSSLESS_QUANTIZE_LEVEL = 0
+#: astropy/CFITSIO quantize_method for SUBTRACTIVE_DITHER_2. Dithering removes the
+#: quantization contour-banding on smooth regions; method 2 (vs 1) additionally
+#: stores exact-zero pixels losslessly. The browser decoder reverses the dither
+#: from the per-level ZDITHER0 seed.
+SUBTRACTIVE_DITHER_2 = 2
+
+#: dither_seed sentinel: derive a per-image seed from the data checksum. This is
+#: deterministic (reproducible builds) and distinct per level/filter, as the FITS
+#: tiled-compression convention recommends.
+DITHER_SEED_CHECKSUM = -1
 
 
 class StopAndAsk(Exception):
@@ -131,12 +143,12 @@ def estimate_noise(data: np.ndarray) -> float:
 
 
 def quant_atol(data: np.ndarray) -> float:
-    """Absolute tolerance for a q=16 RICE round-trip.
+    """Absolute tolerance for a q=8 RICE round-trip.
 
-    The quantization step is ~noise_sigma/16, so the per-pixel error is well
-    under noise_sigma. We use one noise_sigma as a safe upper bound that still
-    flags gross corruption (which would be many sigma). A small floor handles
-    degenerate noiseless inputs.
+    The quantization step is ~noise_sigma/8, so the per-pixel error (including the
+    subtractive-dither residual) stays well under noise_sigma. We use one
+    noise_sigma as a safe upper bound that still flags gross corruption (which
+    would be many sigma). A small floor handles degenerate noiseless inputs.
     """
     sigma = estimate_noise(data)
     return max(sigma, 1e-6)
@@ -145,29 +157,22 @@ def quant_atol(data: np.ndarray) -> float:
 def _verify_roundtrip(original: np.ndarray, readback: np.ndarray, z: int) -> None:
     """Verify a written level reads back correctly; raise if not.
 
-    NaN masks must match exactly on both compression paths. Finite pixels must
-    match exactly at z=0 (lossless guarantee) and within the q=16 tolerance at
-    z>0.
+    Every level is lossy RICE_1 q=8 (display-only). The NaN mask must round-trip
+    exactly (no finite<->NaN leakage), and finite pixels must match within the
+    quantization tolerance (~one noise sigma; the q=8 step is ~sigma/8).
     """
     if not np.array_equal(np.isnan(original), np.isnan(readback)):
         raise RuntimeError(
             f"z={z}: NaN mask changed on round-trip (NaN handling broken)"
         )
     finite = np.isfinite(original)
-    if z == 0:
-        if not np.array_equal(original[finite], readback[finite]):
-            raise RuntimeError(
-                "z=0: GZIP_2 round-trip is not lossless -- "
-                "quantization is not disabled (expected quantize_level=0)"
-            )
-    else:
-        atol = quant_atol(original)
-        if not np.allclose(original[finite], readback[finite], rtol=0.0, atol=atol):
-            max_err = float(np.max(np.abs(original[finite] - readback[finite])))
-            raise RuntimeError(
-                f"z={z}: lossy round-trip exceeded tolerance "
-                f"(max_err={max_err:.6g} > atol={atol:.6g})"
-            )
+    atol = quant_atol(original)
+    if not np.allclose(original[finite], readback[finite], rtol=0.0, atol=atol):
+        max_err = float(np.max(np.abs(original[finite] - readback[finite])))
+        raise RuntimeError(
+            f"z={z}: lossy round-trip exceeded tolerance "
+            f"(max_err={max_err:.6g} > atol={atol:.6g})"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -250,8 +255,36 @@ class _LevelTask:
     header: fits.Header
 
 
+def _check_descriptor_overflow(bintable_header: fits.Header, z: int) -> None:
+    """Guard against the silent 32-bit heap-offset overflow.
+
+    astropy picks the COMPRESSED_DATA descriptor format from the *uncompressed*
+    size (>4 GiB -> 64-bit 'Q', else 32-bit 'P'), but the real limit is the
+    *compressed* heap fitting a 32-bit offset (<2 GiB). They diverge only when the
+    compression ratio is below 2x, which RICE q=8 on real data never is -- but
+    rather than trust that, refuse to emit a file whose 'P'-format heap (PCOUNT)
+    has overflowed 2 GiB (numpy's offset cumsum would wrap silently, corrupting
+    every tile past the 2 GiB mark).
+    """
+    tfields = int(bintable_header.get("TFIELDS", 0))
+    tforms = [str(bintable_header.get(f"TFORM{i}", "")) for i in range(1, tfields + 1)]
+    uses_p_descriptor = any("P" in tf and "Q" not in tf for tf in tforms)
+    pcount = int(bintable_header.get("PCOUNT", 0))
+    if uses_p_descriptor and pcount >= 2**31:
+        raise RuntimeError(
+            f"z={z}: compressed heap is {pcount} bytes (>2 GiB) but the file uses "
+            f"32-bit 'P' heap descriptors, whose offsets would overflow silently. "
+            f"astropy auto-selects 64-bit 'Q' only when the uncompressed image "
+            f"exceeds 4 GiB."
+        )
+
+
 def _build_level(task: _LevelTask) -> dict:
-    """Build, write, and verify a single pyramid level. Returns a LevelInfo dict."""
+    """Build, write, and verify a single pyramid level. Returns a LevelInfo dict.
+
+    Every level is a display-only RICE_1 + SUBTRACTIVE_DITHER_2 tile set (q=8);
+    there is no lossless level (the raw mosaic is distributed separately).
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         native_wcs = WCS(task.header)
@@ -260,21 +293,14 @@ def _build_level(task: _LevelTask) -> dict:
     level_wcs = _scale_wcs(native_wcs, task.factor)
     level_header = level_wcs.to_header(relax=True)
 
-    if task.z == 0:
-        compression_type = "GZIP_2"
-        quantize_level = LOSSLESS_QUANTIZE_LEVEL
-        lossless = True
-    else:
-        compression_type = "RICE_1"
-        quantize_level = task.quantize_level
-        lossless = False
-
     hdu = fits.CompImageHDU(
         data=level,
         header=level_header,
-        compression_type=compression_type,
+        compression_type="RICE_1",
         tile_shape=(task.tile_size, task.tile_size),
-        quantize_level=quantize_level,
+        quantize_level=task.quantize_level,
+        quantize_method=SUBTRACTIVE_DITHER_2,
+        dither_seed=DITHER_SEED_CHECKSUM,
     )
     fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(task.out_path, overwrite=True)
 
@@ -284,15 +310,18 @@ def _build_level(task: _LevelTask) -> dict:
     _verify_roundtrip(level, readback, task.z)
 
     # Read the ACTUAL compression keyword so the manifest hint can never drift
-    # from the file. ZCMPTYPE lives in the compressed bintable header.
+    # from the file. ZCMPTYPE lives in the compressed bintable header; while it's
+    # open, assert the heap descriptors did not silently overflow.
     with fits.open(task.out_path, disable_image_compression=True) as hdul:
-        zcmptype = str(hdul[1].header["ZCMPTYPE"])
+        bintable_header = hdul[1].header
+        zcmptype = str(bintable_header["ZCMPTYPE"])
+        _check_descriptor_overflow(bintable_header, task.z)
 
     level_info = LevelInfo(
         z=task.z,
         filename=task.filename,
         compression=zcmptype,
-        lossless=lossless,
+        lossless=False,
         shape=[int(level.shape[0]), int(level.shape[1])],
         fpack_tile_count=_tile_count(level.shape, task.tile_size),
         pixel_scale_arcsec=_pixel_scale_arcsec(level_wcs),
@@ -323,7 +352,7 @@ def build_pyramid(
     tile_size
         fpack-internal tile size (default 256).
     quantize_level
-        RICE_1 quantization for z>0 levels (default 16). z=0 is always lossless.
+        RICE_1 quantization level applied to every level (default 8).
     processes
         Worker process count. Defaults to one per level (capped at cpu count).
 

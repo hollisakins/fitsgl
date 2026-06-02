@@ -68,16 +68,18 @@ def test_n_levels_formula():
 
 
 # --------------------------------------------------------------------------- #
-# 2. Compression types per level
+# 2. Compression types per level (every level is display-only RICE_1 + dither)
 # --------------------------------------------------------------------------- #
 def test_compression_types(pyramid):
     outdir = pyramid["outdir"]
     m = pyramid["manifest"]
-    z0 = _read_compression_header(outdir / m.levels[0].filename)
-    assert z0["ZCMPTYPE"] == "GZIP_2"
-    for lvl in m.levels[1:]:
+    for lvl in m.levels:
         hdr = _read_compression_header(outdir / lvl.filename)
         assert hdr["ZCMPTYPE"] == "RICE_1"
+        assert hdr["ZQUANTIZ"] == "SUBTRACTIVE_DITHER_2"
+        # ZDITHER0 (the dither seed) must be present so the browser can reverse
+        # the dither; checksum-derived seeds are in the valid 1..10000 range.
+        assert 1 <= hdr["ZDITHER0"] <= 10000
 
 
 # --------------------------------------------------------------------------- #
@@ -92,33 +94,35 @@ def test_tile_size_256(pyramid):
 
 
 # --------------------------------------------------------------------------- #
-# 4. z=0 lossless round-trip (the science-distribution guarantee)
+# 4. z=0 is now a lossy display level (no lossless guarantee), but its NaN mask
+#    is exact and finite pixels stay within the q=8 quantization tolerance.
 # --------------------------------------------------------------------------- #
-def test_z0_lossless(pyramid):
+def test_z0_lossy_within_tolerance(pyramid):
     m = pyramid["manifest"]
     src_img = pyramid["image"]
     back = _read_image(pyramid["outdir"] / m.levels[0].filename)
-    # NaN mask identical.
+    # NaN mask identical (RICE preserves it exactly via the ZBLANK sentinel).
     assert np.array_equal(np.isnan(src_img), np.isnan(back))
-    # Finite pixels bit-for-bit identical.
+    assert m.levels[0].lossless is False
     finite = np.isfinite(src_img)
-    assert np.array_equal(src_img[finite], back[finite])
+    sigma = estimate_noise(src_img)
+    assert np.allclose(src_img[finite], back[finite], rtol=0.0, atol=sigma / 4.0)
 
 
 # --------------------------------------------------------------------------- #
-# 5. z>0 round-trip within q=16 tolerance
+# 5. every level round-trips within the q=8 tolerance
 # --------------------------------------------------------------------------- #
 def test_lossy_levels_within_tolerance(pyramid):
     m = pyramid["manifest"]
     src_img = pyramid["image"]
-    for lvl in m.levels[1:]:
+    for lvl in m.levels:
         factor = 2**lvl.z
         expected = _downsample(src_img, factor)
         back = _read_image(pyramid["outdir"] / lvl.filename)
         finite = np.isfinite(expected) & np.isfinite(back)
         sigma = estimate_noise(expected)
-        # q=16 -> quantization step ~ sigma/16; per-pixel error well under
-        # sigma/4. A far looser bound here would still pass; this stays tight.
+        # q=8 -> quantization step ~ sigma/8; per-pixel error (incl. dither
+        # residual) well under sigma/4. A looser bound would still pass.
         assert np.allclose(
             expected[finite], back[finite], rtol=0.0, atol=sigma / 4.0
         )
@@ -148,7 +152,7 @@ def test_wcs_projection_per_level(pyramid):
 # --------------------------------------------------------------------------- #
 # 7. NaN pixels survive through both compression paths
 # --------------------------------------------------------------------------- #
-def test_nan_survives_lossless_path(pyramid):
+def test_nan_survives_z0(pyramid):
     m = pyramid["manifest"]
     src_img = pyramid["image"]
     assert np.isnan(src_img).any()  # sanity: input actually has NaNs
@@ -180,9 +184,8 @@ def test_manifest_compression_matches_file(pyramid):
 def test_manifest_on_disk_matches_returned(pyramid):
     disk = read_manifest(pyramid["outdir"] / "manifest.json")
     assert disk.to_dict() == pyramid["manifest"].to_dict()
-    # z=0 marked lossless, z>0 lossy.
-    assert disk.levels[0].lossless is True
-    assert all(not lvl.lossless for lvl in disk.levels[1:])
+    # Every level is a lossy display product now (no lossless level).
+    assert all(not lvl.lossless for lvl in disk.levels)
 
 
 # --------------------------------------------------------------------------- #
@@ -203,9 +206,10 @@ def test_cli_end_to_end(tmp_path):
     assert manifest.n_levels == 2
     for lvl in manifest.levels:
         assert (outdir / lvl.filename).exists()
-    # z0 is GZIP_2 lossless on disk.
+    # z0 is a RICE_1 + SUBTRACTIVE_DITHER_2 display tile set on disk.
     hdr = _read_compression_header(outdir / manifest.levels[0].filename)
-    assert hdr["ZCMPTYPE"] == "GZIP_2"
+    assert hdr["ZCMPTYPE"] == "RICE_1"
+    assert hdr["ZQUANTIZ"] == "SUBTRACTIVE_DITHER_2"
 
 
 def test_cli_synthetic_flag(tmp_path):

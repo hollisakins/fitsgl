@@ -72,8 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--quantize-level",
         type=int,
         default=DEFAULT_QUANTIZE_LEVEL,
-        help=f"RICE_1 quantization for z>0 levels (default {DEFAULT_QUANTIZE_LEVEL}). "
-        "z=0 is always lossless.",
+        help=f"RICE_1 quantization level for every level (default "
+        f"{DEFAULT_QUANTIZE_LEVEL}); the pyramid is a lossy display-only product.",
     )
     p.add_argument(
         "--processes",

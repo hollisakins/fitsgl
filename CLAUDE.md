@@ -12,8 +12,10 @@ both.
 ## Layout
 
 - `pyramid_gen/` — Python pipeline. Reads a FITS mosaic, writes one fpacked
-  `.fits.fz` per resolution level (z=0 GZIP_2 lossless; z>0 RICE_1 lossy) plus
-  a `manifest.json`. Entry: `pyramid_gen.build_pyramid.build_pyramid`.
+  `.fits.fz` per resolution level plus a `manifest.json`. Every level is a
+  display-only product: `RICE_1`, `quantize_level=8`, `SUBTRACTIVE_DITHER_2`
+  (lossy but ~0.03% photometry-faithful; the raw lossless mosaic ships
+  separately). Entry: `pyramid_gen.build_pyramid.build_pyramid`.
 - `fits-pyramid/` — TypeScript library (single entry `src/index.ts`):
   `rice/` (RICE decode), `fpack/` (file parsing + tile fetch over range
   requests, `TilePyramid`), `renderer/` (`FitsViewer`, WebGL2). Builds with
@@ -40,8 +42,13 @@ cd demo && npm install && npm run build-pyramid && npm run dev
 ## Conventions
 
 - **Decode correctness is gated by tests against astropy-generated fixtures.**
-  RICE/GZIP_2 round-trips are exact (z=0 lossless); never weaken a decode test
-  or add tolerance — fix the code.
+  RICE integer and GZIP_2 round-trips are bit-exact — never weaken those tests
+  or add tolerance, fix the code. The lossy float dequant matches astropy
+  exactly for `NO_DITHER` and the NaN-mask/exact-zero handling; with
+  `SUBTRACTIVE_DITHER_2` the final float matches only to ≤1 float32 ULP, because
+  astropy's C unquantizer fuses `value*ZSCALE+ZZERO` (FMA) and JS cannot — the
+  FITS standard does not mandate FMA, so ≤1 ULP is the correct spec, and the
+  dither index/formula themselves are exact (a logic bug diverges by many ULPs).
 - TypeScript is `strict`, **no `any`**. Pure logic (camera/tile/coord math) is
   split from GL/DOM side effects so it unit-tests under Node.
 - No frameworks in the core renderer (raw WebGL2) and no third-party FITS/gunzip

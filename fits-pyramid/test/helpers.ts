@@ -96,6 +96,40 @@ export function firstFloatMismatch(a: Float32Array, b: Float32Array, atol = 0): 
   return -1;
 }
 
+// float32 ULP comparison (used for the dithered RICE decode, which matches
+// astropy only to within ≤1 ULP because astropy's C unquantizer uses an FMA the
+// JS path cannot reproduce; the FITS standard does not mandate FMA).
+const _f32buf = new ArrayBuffer(4);
+const _f32view = new Float32Array(_f32buf);
+const _u32view = new Uint32Array(_f32buf);
+
+/** Monotonic ordering key for a float32 value, so ULP distance = |keyA - keyB|. */
+function f32OrderedKey(x: number): number {
+  _f32view[0] = x;
+  const u = _u32view[0]!;
+  // Positives: shift above the midpoint; negatives: reflect below it.
+  return u < 0x80000000 ? u + 0x80000000 : 0xffffffff - u;
+}
+
+/**
+ * First index where two float32 arrays differ by more than `maxUlps` ULPs
+ * (NaN===NaN; NaN vs finite is always a mismatch). Returns -1 if all within
+ * tolerance, -2 on length mismatch.
+ */
+export function firstUlpMismatch(a: Float32Array, b: Float32Array, maxUlps: number): number {
+  if (a.length !== b.length) return -2;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    const xn = Number.isNaN(x);
+    const yn = Number.isNaN(y);
+    if (xn && yn) continue;
+    if (xn !== yn) return i;
+    if (Math.abs(f32OrderedKey(x) - f32OrderedKey(y)) > maxUlps) return i;
+  }
+  return -1;
+}
+
 export function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
