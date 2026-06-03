@@ -213,12 +213,15 @@ config and the built dataset at `<out>/<dataset.name>/`. Flow:
 1. **Classify** every file in the dataset dir → cache class + content-type +
    content hash; assemble `deploy-manifest.json` (§6).
 2. **Diff** against the previously-deployed manifest fetched from the bucket
-   (DP6); compute the upload set and the purge set (changed tiles only).
+   (DP6); compute the **upload**, **purge**, and **delete** sets (§6). Purge covers
+   changed, header-changed, *and* deleted tiles (see §6); delete removes orphaned
+   objects no longer referenced locally.
 3. **Upload** the delta to R2 (S3 PUT per object) with per-object `Content-Type`
-   and `Cache-Control` (DP4). Order: tiles → pointers → `deploy-manifest.json`
-   **last** (so an interrupted deploy never falsely claims success). Apply bucket
-   CORS (DP8).
-4. **Purge** the changed tile URLs from Cloudflare (DP5; after the full upload).
+   and `Cache-Control` (DP4), then **delete** the orphaned objects. Order: tiles →
+   pointers → orphan deletes → `deploy-manifest.json` **last** (so an interrupted
+   deploy never falsely claims success). Apply bucket CORS (DP8).
+4. **Purge** the changed + deleted tile URLs from Cloudflare (DP5; after the full
+   upload), **batched into ≤100-URL calls** (§8).
 5. **Verify** the live `public_url` (DP7) unless `--no-verify`.
 
 - `--dry-run` — do steps 1–2 and print the upload + purge plan; no writes.
@@ -271,8 +274,19 @@ pytest with no network:
 
 - **`deploy_plan.py` (pure):** walk the dataset dir → classify each file (tile vs.
   pointer vs. site asset) → content hash + content-type + `Cache-Control` →
-  `DeployManifest`. Diff two manifests → `(upload_set, purge_set)`. Fully testable
-  on fixtures; no boto3, no network.
+  `DeployManifest`. Diff two manifests → a `DeployDiff` of `upload` / `purge` /
+  `delete` / `unchanged`. The diff keys on `sha256` (DP6) **and** the serving
+  headers: a tile whose bytes are unchanged but whose `Cache-Control` changed (e.g.
+  a lowered `tile_max_age`) is re-uploaded + purged, since a hash-only diff would
+  silently strand the old header on the R2 object. `purge` collects tiles that
+  changed, that only changed headers, *and* that were deleted — a deleted tile's
+  R2 object is gone but its warm edge copy could shadow the 404 for a client
+  holding a pre-deploy manifest; purging it after the delete trivially satisfies
+  DP5's ordering (no new bytes, so the refill can only resolve toward 404).
+  `delete` is the supertile-era addition: a re-tile (changed `supertile_blocks`, a
+  grown mosaic) renames supertile files, so the old ones must be removed or R2
+  accumulates dead objects (DP3). `chunk_purge_urls` batches the purge list to
+  ≤100 URLs/call. Fully testable on fixtures; no boto3, no network.
 - **`deploy.py` (I/O):** an `R2Target` adapter — boto3, an optional
   `pip install fitsgl[deploy]` extra (R2 speaks S3; all of the following *verified*
   against R2's S3-compat docs). `put_object(..., ContentType=, CacheControl=)` sets
@@ -333,12 +347,16 @@ All open questions are now resolved (Cloudflare/R2 facts verified against offici
 docs, June 2026; the load-bearing default-caching claim was adversarially
 confirmed):
 
-- **Purge granularity.** ✅ The purgeable unit is the **per-level `.fits.fz` file**
-  (one cached object per level; the 256² tiles are byte-ranges *inside* it), so a
-  filter is ~8 objects and a full-rebuild purge is *dozens* of URLs — **one
-  purge-by-URL call** (cap 100 URLs/call on Free/Pro/Business; all purge methods are
-  on all plans as of Apr 2025). No purge-everything in the normal path; keep
-  `--purge-all` only as a guarded escape hatch (e.g. after a cache-policy change).
+- **Purge granularity.** ✅ The purgeable unit is the **per-supertile `.fits.fz`
+  file** (one cached object per supertile; the 256² render-tiles are byte-ranges
+  *inside* it). For a small/un-chunked dataset a level is one file, so a filter is
+  ~8 objects and a full-rebuild purge is *dozens* of URLs. But a **supertiled**
+  large mosaic (the reason supertiles exist) splits deep levels into many files, so
+  a full-rebuild purge can exceed the **100 URLs/call cap** (Free/Pro/Business; all
+  purge methods on all plans as of Apr 2025) — so the purge list is **batched into
+  ≤100-URL calls** (`chunk_purge_urls`), not assumed to fit in one. No
+  purge-everything in the normal path; keep `--purge-all` only as a guarded escape
+  hatch (e.g. after a cache-policy change).
 - **`tile_max_age` default.** ✅ `max-age=604800` (7 days) +
   `stale-while-revalidate=2592000` (30 days) (Cloudflare honors SWR — verified).
   Long `max-age` is the right default because the deploy purge keeps the *edge*
