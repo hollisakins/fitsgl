@@ -82,6 +82,29 @@ def test_render_toml_round_trips_through_load_config(tmp_path):
     assert cfg.viewer.mode == "single" and cfg.viewer.band == "f150w"
     # The grid-group guidance is present as a comment.
     assert "Grid groups" in toml_text
+    # The commented [deploy] stub is present but inert (load_config sees no [deploy]).
+    assert "# [deploy]" in toml_text and "bucket" in toml_text
+    assert cfg.deploy is None
+
+
+def test_deploy_stub_round_trips_when_uncommented(tmp_path):
+    # A producer who uncomments the whole [deploy] block must get valid config — the
+    # scaffold's `prefix = ""` line in particular must parse (it's the default).
+    _write_band(tmp_path / "f150w.fits", seed=1)
+    plan = scan_directory(tmp_path)
+    toml_text = render_toml(plan, tmp_path)
+
+    out_lines, in_deploy = [], False
+    for ln in toml_text.splitlines():
+        if ln.startswith("# [deploy]"):
+            in_deploy = True
+        out_lines.append(ln[2:] if (in_deploy and ln.startswith("# ")) else ln)
+    toml_path = tmp_path / "fitsgl.toml"
+    toml_path.write_text("\n".join(out_lines) + "\n")
+
+    cfg = load_config(toml_path)
+    assert cfg.deploy is not None
+    assert cfg.deploy.bucket == "my-bucket" and cfg.deploy.prefix == "" and cfg.deploy.target == "r2"
 
 
 def test_render_toml_emits_label_for_sanitized_name(tmp_path):

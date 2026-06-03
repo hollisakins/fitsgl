@@ -32,6 +32,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
+from typing import Callable
 
 from .serve import content_type_for  # single source of MIME truth (matches `fitsgl serve`)
 
@@ -255,12 +256,16 @@ def build_deploy_manifest(
     dataset_name: str | None = None,
     tile_max_age: int = DEFAULT_TILE_MAX_AGE,
     swr_grace: int = DEFAULT_SWR_GRACE,
+    include: Callable[[str], bool] | None = None,
 ) -> DeployManifest:
     """Classify + hash every file under a built dataset directory.
 
-    ``dataset_name`` defaults to the directory's name. Raises ``FileNotFoundError``
-    if the directory is missing or has no ``fitsgl.json`` (i.e. it is not a built
-    dataset — run ``fitsgl build`` first). Files are returned sorted by path.
+    ``dataset_name`` defaults to the directory's name. ``include`` (if given) keeps
+    only files whose dataset-relative path it accepts — used by a ``--site-only``
+    deploy to manifest just the viewer files *without* hashing the GB-scale tiles.
+    Raises ``FileNotFoundError`` if the directory is missing or has no
+    ``fitsgl.json`` (i.e. it is not a built dataset — run ``fitsgl build`` first).
+    Files are returned sorted by path.
     """
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.is_dir():
@@ -273,6 +278,8 @@ def build_deploy_manifest(
 
     files: list[DeployFile] = []
     for abs_path, rel_posix in _iter_dataset_files(dataset_dir):
+        if include is not None and not include(rel_posix):
+            continue
         cls = classify_file(rel_posix)
         files.append(
             DeployFile(

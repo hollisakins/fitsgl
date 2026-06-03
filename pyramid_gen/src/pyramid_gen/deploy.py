@@ -34,11 +34,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
+from .config import DeployConfig  # re-exported below; config.py owns the parsed structure
 from .deploy_plan import (
     CLASS_POINTER,
     CLASS_TILE,
-    DEFAULT_SWR_GRACE,
-    DEFAULT_TILE_MAX_AGE,
     DEPLOY_MANIFEST_NAME,
     DeployDiff,
     DeployManifest,
@@ -50,6 +49,11 @@ from .deploy_plan import (
 )
 from .verify import VerifyReport, verify_deployment
 
+__all__ = [
+    "DeployConfig", "DeployError", "DeployResult", "DeployTarget", "Purger",
+    "R2Target", "CloudflarePurge", "deploy_dataset", "object_key", "public_url_for",
+]
+
 #: CORS headers the embedder's ranged fetch needs to read (mirrors ``serve.py``).
 _CORS_EXPOSE = ["Content-Range", "Content-Length", "Accept-Ranges", "ETag"]
 _CLOUDFLARE_PURGE_URL = "https://api.cloudflare.com/client/v4/zones/{zone_id}/purge_cache"
@@ -57,26 +61,6 @@ _CLOUDFLARE_PURGE_URL = "https://api.cloudflare.com/client/v4/zones/{zone_id}/pu
 
 class DeployError(Exception):
     """A deploy step failed (bad credentials, an R2/Cloudflare API error, …)."""
-
-
-@dataclass
-class DeployConfig:
-    """The resolved ``[deploy]`` settings (identifiers only — secrets come from env).
-
-    Parsed from ``fitsgl.toml`` in slice 4; constructed directly here and in tests.
-    ``zone_id`` is optional — without it (and a ``CLOUDFLARE_API_TOKEN``) the edge
-    purge is skipped with a warning.
-    """
-
-    bucket: str
-    endpoint: str
-    public_url: str
-    zone_id: str | None = None
-    prefix: str = ""  # optional key prefix within the bucket
-    viewer_origin: str = "*"  # CORS Allow-Origin (DP8)
-    tile_max_age: int = DEFAULT_TILE_MAX_AGE
-    swr_grace: int = DEFAULT_SWR_GRACE
-    target: str = "r2"  # only "r2" in v1
 
 
 # --------------------------------------------------------------- I/O protocols
@@ -142,10 +126,33 @@ class DeployResult:
     deleted: list[str] = field(default_factory=list)  # orphan paths removed
     purged: list[str] = field(default_factory=list)  # full URLs purged from the edge
     verify_report: VerifyReport | None = None
+    aborted: bool = False  # the confirm callback declined before any writes
 
     @property
     def upload_bytes(self) -> int:
         return self.diff.upload_bytes
+
+
+def is_site_file(path: str) -> bool:
+    """True for the viewer files a ``--site-only`` deploy touches (entry + bundle)."""
+    return path == "index.html" or path.startswith("assets/")
+
+
+def _filter_manifest(manifest: DeployManifest, keep: Callable[[str], bool]) -> DeployManifest:
+    return DeployManifest(
+        dataset=manifest.dataset,
+        files=[f for f in manifest.files if keep(f.path)],
+        schema_version=manifest.schema_version,
+    )
+
+
+def _merge_site_ledger(remote: DeployManifest | None, local_site: DeployManifest) -> DeployManifest:
+    """The ledger to write after a ``--site-only`` deploy: the prior ledger's non-site
+    entries (tiles/pointers, untouched) plus the freshly-deployed site entries — so a
+    partial viewer refresh never orphans the data files' entries."""
+    kept = [f for f in (remote.files if remote is not None else []) if not is_site_file(f.path)]
+    merged = sorted(kept + list(local_site.files), key=lambda f: f.path)
+    return DeployManifest(dataset=local_site.dataset, files=merged)
 
 
 # ----------------------------------------------------------- the orchestration
@@ -159,36 +166,54 @@ def deploy_dataset(
     purger: Purger | None = None,
     dry_run: bool = False,
     run_verify: bool = True,
+    site_only: bool = False,
     verify_fn: Callable[[str], VerifyReport] | None = None,
+    confirm: Callable[[DeployDiff], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> DeployResult:
     """Deploy ``dataset_dir`` to ``target`` (R2) per the §5.1 flow.
 
     ``purger`` (Cloudflare) is optional: without it the edge purge is skipped with a
     warning (tiles may serve stale until ``max-age``). ``dry_run`` does steps 1–2
-    and returns the plan without any writes. ``run_verify`` runs the post-deploy
-    contract check (``verify_fn`` overrides the checker — tests inject a fake to
-    avoid real network). ``on_progress`` is called with human-readable status lines.
+    and returns the plan without any writes. ``site_only`` pushes just the viewer
+    files (``index.html`` + ``assets/``) — hashing only those, and merging their
+    entries into the prior ledger so the data files' entries are preserved.
+    ``confirm`` (if given) is called with the computed diff before any writes; return
+    ``False`` to abort. ``run_verify`` runs the post-deploy contract check
+    (``verify_fn`` overrides the checker — tests inject a fake to avoid real
+    network). ``on_progress`` is called with human-readable status lines.
     """
     log = on_progress if on_progress is not None else (lambda _msg: None)
     dataset_dir = Path(dataset_dir)
+    ledger_key = object_key(config.prefix, DEPLOY_MANIFEST_NAME)
 
-    # 1. Classify the local dataset.
+    # 1. Classify the local dataset (only the viewer files for --site-only).
     local = build_deploy_manifest(
-        dataset_dir, tile_max_age=config.tile_max_age, swr_grace=config.swr_grace
+        dataset_dir, tile_max_age=config.tile_max_age, swr_grace=config.swr_grace,
+        include=is_site_file if site_only else None,
     )
 
-    # 2. Diff against the previously-deployed ledger in the bucket (DP6).
-    ledger_key = object_key(config.prefix, DEPLOY_MANIFEST_NAME)
-    remote = _fetch_remote_manifest(target, ledger_key, log)
-    diff = diff_manifests(remote, local)
+    # 2. Diff against the previously-deployed ledger in the bucket (DP6). For
+    #    --site-only, diff only within the site subset so data files aren't touched.
+    remote_full = _fetch_remote_manifest(target, ledger_key, log)
+    if site_only:
+        if remote_full is None:
+            log("warning: --site-only with no prior deploy — run a full `fitsgl deploy` first for the data")
+        remote_for_diff = _filter_manifest(remote_full, is_site_file) if remote_full is not None else None
+    else:
+        remote_for_diff = remote_full
+    diff = diff_manifests(remote_for_diff, local)
 
     log(
-        f"plan: {len(diff.upload)} to upload ({diff.upload_bytes / (1024 * 1024):.1f} MB), "
-        f"{len(diff.delete)} to delete, {len(diff.purge)} to purge, {len(diff.unchanged)} unchanged"
+        f"plan{' (site-only)' if site_only else ''}: {len(diff.upload)} to upload "
+        f"({diff.upload_bytes / (1024 * 1024):.1f} MB), {len(diff.delete)} to delete, "
+        f"{len(diff.purge)} to purge, {len(diff.unchanged)} unchanged"
     )
     if dry_run:
         return DeployResult(diff=diff, dry_run=True)
+    if confirm is not None and not confirm(diff):
+        log("aborted")
+        return DeployResult(diff=diff, dry_run=False, aborted=True)
 
     result = DeployResult(diff=diff, dry_run=False)
 
@@ -211,10 +236,14 @@ def deploy_dataset(
         result.deleted.append(path)
 
     # Bucket CORS (DP8) — R2 rejects AllowedHeaders ["*"], so list "range" explicitly.
-    log(f"set CORS (origin {config.viewer_origin})")
-    target.put_cors([config.viewer_origin], ["GET", "HEAD"], ["range"])
+    # Skipped for --site-only: it's a viewer refresh, not a data-access change.
+    if not site_only:
+        log(f"set CORS (origin {config.viewer_origin})")
+        target.put_cors([config.viewer_origin], ["GET", "HEAD"], ["range"])
 
     # 4. Purge the edge — strictly after the full upload (DP5: push→purge), batched.
+    #    (site-only touches no tiles, so diff.purge is empty: index.html is no-cache
+    #    and assets are immutable-hashed — neither needs eviction.)
     if diff.purge:
         urls = [public_url_for(config.public_url, p) for p in diff.purge]
         if purger is not None:
@@ -232,9 +261,11 @@ def deploy_dataset(
     #    for BOTH the upload and the purge. If the purge raises, the ledger stays at
     #    the old hashes, so the next deploy re-detects the change and re-purges
     #    (self-heals) instead of a committed new ledger masking an un-evicted edge copy.
-    #    It is a pointer (read fresh), so it gets the no-cache policy.
+    #    For --site-only, merge the fresh site entries into the prior ledger so the
+    #    untouched data files' entries are preserved. It's a pointer → no-cache.
+    ledger = _merge_site_ledger(remote_full, local) if site_only else local
     target.put_bytes(
-        ledger_key, _manifest_bytes(local),
+        ledger_key, _manifest_bytes(ledger),
         content_type="application/json", cache_control=cache_control_for(CLASS_POINTER),
     )
 

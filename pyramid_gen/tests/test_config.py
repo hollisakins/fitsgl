@@ -146,6 +146,66 @@ def test_band_input_list_missing_file_raises(tmp_path):
         load_config(p)
 
 
+def test_parses_full_deploy_block(tmp_path):
+    touch(tmp_path, "a.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "cosmos"
+        [[dataset.bands]]
+        name = "a"
+        input = "a.fits"
+        [deploy]
+        target = "r2"
+        bucket = "cosmos-web"
+        endpoint = "https://acct.r2.cloudflarestorage.com"
+        public_url = "https://data.example.org/cosmos-web"
+        zone_id = "zone123"
+        prefix = "cosmos"
+        viewer_origin = "https://campfire.example"
+        tile_max_age = 86400
+        """,
+    )
+    d = load_config(p).deploy
+    assert d is not None
+    assert (d.bucket, d.endpoint) == ("cosmos-web", "https://acct.r2.cloudflarestorage.com")
+    assert d.public_url == "https://data.example.org/cosmos-web"
+    assert (d.zone_id, d.prefix, d.viewer_origin) == ("zone123", "cosmos", "https://campfire.example")
+    assert d.tile_max_age == 86400 and d.target == "r2"
+
+
+def test_deploy_absent_is_none(tmp_path):
+    touch(tmp_path, "a.fits")
+    p = write_toml(tmp_path, '[dataset]\nname = "x"\n[[dataset.bands]]\nname = "a"\ninput = "a.fits"\n')
+    assert load_config(p).deploy is None
+
+
+def test_deploy_minimal_uses_defaults(tmp_path):
+    touch(tmp_path, "a.fits")
+    base = '[dataset]\nname = "x"\n[[dataset.bands]]\nname = "a"\ninput = "a.fits"\n'
+    p = write_toml(tmp_path, base + '[deploy]\nbucket = "b"\nendpoint = "https://e"\npublic_url = "https://u"\n')
+    d = load_config(p).deploy
+    assert d is not None
+    assert d.zone_id is None and d.prefix == "" and d.viewer_origin == "*"
+    assert d.tile_max_age == 604800 and d.swr_grace == 2592000  # defaults; swr_grace not a TOML knob
+
+
+def test_deploy_validation_errors(tmp_path):
+    touch(tmp_path, "a.fits")
+    base = '[dataset]\nname = "x"\n[[dataset.bands]]\nname = "a"\ninput = "a.fits"\n'
+
+    def load(deploy_body):
+        return load_config(write_toml(tmp_path, base + "[deploy]\n" + deploy_body))
+
+    with pytest.raises(ValueError, match="bucket"):  # required field missing
+        load('endpoint = "https://e"\npublic_url = "https://u"\n')
+    with pytest.raises(ValueError, match="target"):  # only "r2" supported
+        load('target = "s3"\nbucket = "b"\nendpoint = "https://e"\npublic_url = "https://u"\n')
+    with pytest.raises(ValueError, match="tile_max_age"):  # must be positive
+        load('bucket = "b"\nendpoint = "https://e"\npublic_url = "https://u"\ntile_max_age = 0\n')
+
+
 def test_minimal_single_band_uses_defaults(tmp_path):
     touch(tmp_path, "img.fits")
     p = write_toml(

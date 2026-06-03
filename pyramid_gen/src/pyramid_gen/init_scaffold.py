@@ -227,6 +227,22 @@ def render_toml(plan: InitPlan, config_dir: Path) -> str:
         ]
     else:
         lines.append("# (no co-gridded group of >=3 bands found, so RGB is not offered as a default)")
+
+    # Commented [deploy] stub — fill in + uncomment to enable `fitsgl deploy` to
+    # Cloudflare R2. Credentials come from the environment, never this file:
+    # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY and (for the edge purge) CLOUDFLARE_API_TOKEN.
+    lines += [
+        "",
+        "# [deploy]                 # `fitsgl deploy` target — Cloudflare R2 (see docs/deploy-design.md §5.3)",
+        '# target = "r2"',
+        '# bucket = "my-bucket"',
+        '# endpoint = "https://<account-id>.r2.cloudflarestorage.com"',
+        '# public_url = "https://data.example.org/' + plan.name + '"   # where it is served (the cached custom domain)',
+        '# zone_id = "<cloudflare-zone-id>"   # optional; enables the post-deploy edge purge',
+        '# prefix = ""                # optional key prefix within the bucket',
+        '# viewer_origin = "*"        # CORS Allow-Origin for cross-site embedding',
+        "# tile_max_age = 604800      # seconds the edge serves a tile before revalidating (default 7d)",
+    ]
     return "\n".join(lines) + "\n"
 
 

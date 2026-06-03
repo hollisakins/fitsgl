@@ -15,13 +15,14 @@ from pyramid_gen.deploy import (
     CloudflarePurge,
     DeployConfig,
     DeployError,
+    DeployResult,
     R2Target,
     deploy_dataset,
     object_key,
     public_url_for,
 )
-from pyramid_gen.deploy_plan import DEPLOY_MANIFEST_NAME, build_deploy_manifest
-from pyramid_gen.verify import VerifyReport
+from pyramid_gen.deploy_plan import CLASS_TILE, DEPLOY_MANIFEST_NAME, DeployDiff, DeployFile, DeployManifest, build_deploy_manifest
+from pyramid_gen.verify import FAIL, VerifyReport
 
 
 # ------------------------------------------------------------------ fixtures/fakes
@@ -149,6 +150,13 @@ def test_per_object_headers_match_the_classifier(tmp_path):
     assert t.meta["f444w/img_z0.fits.fz"][1].startswith("public, max-age=")
     assert t.meta["fitsgl.json"] == ("application/json", "public, no-cache")
     assert "immutable" in t.meta["assets/index-abc.js"][1]
+
+
+def test_tile_max_age_flows_through_to_cache_control(tmp_path):
+    root = make_dataset(tmp_path)
+    t = FakeTarget()
+    deploy_dataset(root, cfg(tile_max_age=86400), t, run_verify=False)
+    assert t.meta["f444w/img_z0.fits.fz"][1] == "public, max-age=86400, stale-while-revalidate=2592000"
 
 
 def test_verify_is_run_with_the_public_url(tmp_path):
@@ -364,3 +372,180 @@ def test_r2_from_config_requires_credentials(monkeypatch):
     monkeypatch.delenv("R2_SECRET_ACCESS_KEY", raising=False)
     with pytest.raises(DeployError, match="R2_ACCESS_KEY_ID"):
         R2Target.from_config(cfg())  # raises before importing boto3
+
+
+# ------------------------------------------------------------------ confirm
+
+
+def test_confirm_false_aborts_without_writes(tmp_path):
+    root = make_dataset(tmp_path)
+    t = FakeTarget()
+    result = deploy_dataset(root, cfg(), t, run_verify=False, confirm=lambda diff: False)
+    assert result.aborted and result.uploaded == []
+    assert not any(op in ("put_file", "put_bytes", "delete", "cors") for op, _ in t.ops)
+
+
+def test_confirm_receives_diff_and_proceeds(tmp_path):
+    root = make_dataset(tmp_path)
+    t = FakeTarget()
+    captured = []
+
+    def confirm(diff):
+        captured.append(len(diff.upload))
+        return True
+
+    result = deploy_dataset(root, cfg(), t, run_verify=False, confirm=confirm)
+    assert not result.aborted and result.uploaded
+    assert captured == [len(result.uploaded)]  # confirm saw the real plan
+
+
+# ----------------------------------------------------------------- site-only
+
+
+def test_site_only_uploads_only_viewer_files(tmp_path):
+    root = make_dataset(tmp_path)
+    t = FakeTarget()
+    deploy_dataset(root, cfg(), t, run_verify=False)  # full deploy first
+    # Change a viewer file AND a tile; --site-only must push only the viewer file.
+    (root / "index.html").write_text("<!doctype html><title>v2</title><script src=./assets/index-abc.js></script>")
+    (root / "f444w" / "img_z0.fits.fz").write_bytes(b"changed tile, NOT for site-only")
+    t.ops.clear()
+    purger = FakePurger()
+    result = deploy_dataset(root, cfg(), t, purger=purger, site_only=True, run_verify=False)
+    assert result.uploaded == ["index.html"]  # only the viewer file
+    assert result.purged == [] and purger.batches == []  # site files aren't purged
+    assert not any(op == "cors" for op, _ in t.ops)  # CORS not re-set on a viewer refresh
+    assert t.objects["f444w/img_z0.fits.fz"] == b"tile-bytes-0"  # tile untouched in the bucket
+
+
+def test_site_only_preserves_data_entries_in_the_ledger(tmp_path):
+    root = make_dataset(tmp_path)
+    t = FakeTarget()
+    deploy_dataset(root, cfg(), t, run_verify=False)
+    before = DeployManifest.from_dict(json.loads(t.objects[DEPLOY_MANIFEST_NAME]))
+    tiles_before = {f.path for f in before.files if f.path.endswith(".fits.fz")}
+    assert tiles_before  # sanity: the full ledger had tile entries
+
+    (root / "index.html").write_text("<!doctype html><title>v2</title>")
+    deploy_dataset(root, cfg(), t, site_only=True, run_verify=False)
+    after = DeployManifest.from_dict(json.loads(t.objects[DEPLOY_MANIFEST_NAME]))
+
+    # The data entries are preserved (a partial viewer refresh must not orphan them)...
+    assert {f.path for f in after.files if f.path.endswith(".fits.fz")} == tiles_before
+    # ...and the index.html entry reflects the new content.
+    idx_before = next(f for f in before.files if f.path == "index.html")
+    idx_after = next(f for f in after.files if f.path == "index.html")
+    assert idx_after.sha256 != idx_before.sha256
+
+
+def test_site_only_with_no_prior_ledger_warns_and_uploads_site_only(tmp_path):
+    # --site-only before any full deploy: warn, push only the viewer files, and write
+    # a ledger of just those (merge with remote=None).
+    root = make_dataset(tmp_path)
+    t = FakeTarget()
+    logs = []
+    result = deploy_dataset(root, cfg(), t, site_only=True, run_verify=False, on_progress=logs.append)
+    assert set(result.uploaded) == {"index.html", "assets/index-abc.js"}
+    assert any("no prior deploy" in m for m in logs)
+    led = DeployManifest.from_dict(json.loads(t.objects[DEPLOY_MANIFEST_NAME]))
+    assert {f.path for f in led.files} == {"index.html", "assets/index-abc.js"}
+
+
+# -------------------------------------------------------------- CLI wiring
+
+
+def _project(tmp_path, *, with_deploy=True):
+    """A fitsgl.toml + its band input + a built dataset dir at dist/cosmos-web/."""
+    (tmp_path / "a.fits").write_text("")
+    deploy_block = (
+        '[deploy]\nbucket = "b"\nendpoint = "https://e"\npublic_url = "https://u/cosmos-web"\n'
+        if with_deploy else ""
+    )
+    (tmp_path / "fitsgl.toml").write_text(
+        '[dataset]\nname = "cosmos-web"\n[[dataset.bands]]\nname = "a"\ninput = "a.fits"\n' + deploy_block
+    )
+    out = tmp_path / "dist"
+    out.mkdir()
+    make_dataset(out)  # builds dist/cosmos-web/
+    return tmp_path / "fitsgl.toml", out
+
+
+def test_cli_deploy_without_deploy_block_errors(tmp_path, capsys):
+    from pyramid_gen.cli import main
+
+    toml, out = _project(tmp_path, with_deploy=False)
+    assert main(["deploy", "-c", str(toml), "-o", str(out)]) == 2
+    assert "no [deploy]" in capsys.readouterr().err
+
+
+def test_cli_deploy_missing_credentials_errors(tmp_path, monkeypatch, capsys):
+    from pyramid_gen.cli import main
+
+    monkeypatch.delenv("R2_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("R2_SECRET_ACCESS_KEY", raising=False)
+    toml, out = _project(tmp_path)
+    assert main(["deploy", "-c", str(toml), "-o", str(out)]) == 2
+    assert "R2_ACCESS_KEY_ID" in capsys.readouterr().err
+
+
+def test_cli_deploy_full_run_with_stubbed_target(tmp_path, monkeypatch):
+    import pyramid_gen.cli as cli
+
+    toml, out = _project(tmp_path)
+    ft = FakeTarget()
+    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c: ft)}))
+    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify"])
+    assert rc == 0
+    assert "fitsgl.json" in ft.objects and DEPLOY_MANIFEST_NAME in ft.objects  # uploaded + ledger written
+
+
+def test_cli_deploy_dry_run_makes_no_writes(tmp_path, monkeypatch, capsys):
+    import pyramid_gen.cli as cli
+
+    toml, out = _project(tmp_path)
+    ft = FakeTarget()
+    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c: ft)}))
+    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--dry-run"])
+    assert rc == 0
+    assert "dry run" in capsys.readouterr().out
+    assert not any(op in ("put_file", "put_bytes", "delete", "cors") for op, _ in ft.ops)
+
+
+def test_cli_deploy_exits_1_on_verify_failure(tmp_path, monkeypatch):
+    import pyramid_gen.cli as cli
+
+    toml, out = _project(tmp_path)
+    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c: FakeTarget())}))
+    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    bad = VerifyReport(base_url="https://u/cosmos-web")
+    bad.add("Range → 206", FAIL, "host ignores Range")
+    monkeypatch.setattr(
+        cli, "deploy_dataset",
+        lambda *a, **k: DeployResult(diff=DeployDiff(), dry_run=False, verify_report=bad),
+    )
+    assert cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes"]) == 1  # verify failure → exit 1
+
+
+def test_confirm_deploy_prompt(monkeypatch):
+    from pyramid_gen.cli import _confirm_deploy
+
+    confirm = _confirm_deploy("my-bucket")
+    assert confirm(DeployDiff()) is True  # no-op → auto-yes, no prompt
+
+    f = DeployFile(path="x.fits.fz", cls=CLASS_TILE, content_type="application/octet-stream",
+                   cache_control="cc", sha256="s", size=1)
+    nonnoop = DeployDiff(upload=[f])
+    monkeypatch.setattr("builtins.input", lambda _p: "y")
+    assert confirm(nonnoop) is True
+    monkeypatch.setattr("builtins.input", lambda _p: "n")
+    assert confirm(nonnoop) is False
+    monkeypatch.setattr("builtins.input", lambda _p: "")
+    assert confirm(nonnoop) is False
+
+    def _raise_eof(_p):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _raise_eof)
+    assert confirm(nonnoop) is False  # non-interactive stdin → clean decline, not a crash

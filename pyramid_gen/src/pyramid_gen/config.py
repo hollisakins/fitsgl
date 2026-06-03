@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 try:  # tomllib is stdlib on 3.11+; tomli is the backport for 3.10.
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - exercised only on 3.10
     import tomli as tomllib  # type: ignore[no-redef]
+
+from .deploy_plan import DEFAULT_SWR_GRACE, DEFAULT_TILE_MAX_AGE  # CDN cache-window defaults (lightweight, no astropy)
 
 #: Known transfer curves (kept in lockstep with the TS ``StretchMode``).
 STRETCH_MODES = ("linear", "log", "asinh")
@@ -98,6 +100,29 @@ class ViewerSpec:
 
 
 @dataclass
+class DeployConfig:
+    """``[deploy]`` — where + how ``fitsgl deploy`` pushes to Cloudflare R2.
+
+    Identifiers only; secrets come from the environment (``R2_ACCESS_KEY_ID`` /
+    ``R2_SECRET_ACCESS_KEY`` / ``CLOUDFLARE_API_TOKEN``). Lives here (not in
+    ``deploy.py``) so ``config.py`` owns every TOML-parsed structure; ``deploy.py``
+    re-exports it. ``zone_id`` is optional — without it (and a token) the edge purge
+    is skipped. ``swr_grace`` is not a TOML knob (only ``tile_max_age`` is, per the
+    design); it stays at the default.
+    """
+
+    bucket: str
+    endpoint: str
+    public_url: str
+    zone_id: str | None = None
+    prefix: str = ""  # optional key prefix within the bucket
+    viewer_origin: str = "*"  # CORS Allow-Origin (DP8)
+    tile_max_age: int = DEFAULT_TILE_MAX_AGE
+    swr_grace: int = DEFAULT_SWR_GRACE
+    target: str = "r2"  # only "r2" in v1
+
+
+@dataclass
 class DatasetConfig:
     """A fully-parsed, validated ``fitsgl.toml``."""
 
@@ -108,6 +133,7 @@ class DatasetConfig:
     build: BuildSpec
     viewer: ViewerSpec
     config_dir: Path
+    deploy: DeployConfig | None = None  # None when [deploy] is absent
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -226,6 +252,7 @@ def load_config(path: str | Path) -> DatasetConfig:
 
     build = _parse_build(raw.get("build"))
     viewer = _parse_viewer(raw.get("viewer"), alias)
+    deploy = _parse_deploy(raw.get("deploy"))
 
     return DatasetConfig(
         name=name,
@@ -235,7 +262,48 @@ def load_config(path: str | Path) -> DatasetConfig:
         build=build,
         viewer=viewer,
         config_dir=config_dir,
+        deploy=deploy,
     )
+
+
+def _parse_deploy(raw: object) -> DeployConfig | None:
+    """Parse the optional ``[deploy]`` table; ``None`` when it's absent.
+
+    Validates identifiers only (no secrets). ``bucket``/``endpoint``/``public_url``
+    are required; ``zone_id``/``prefix``/``viewer_origin`` optional strings;
+    ``tile_max_age`` an optional positive int; ``target`` must be ``"r2"``.
+    """
+    if raw is None:
+        return None
+    _require(isinstance(raw, dict), "[deploy] must be a table")
+    assert isinstance(raw, dict)
+
+    target = raw.get("target", "r2")
+    _require(target == "r2", '[deploy].target must be "r2" (the only supported target)')
+
+    out = DeployConfig(
+        bucket=_as_str(raw, "bucket", "[deploy].bucket"),
+        endpoint=_as_str(raw, "endpoint", "[deploy].endpoint"),
+        public_url=_as_str(raw, "public_url", "[deploy].public_url"),
+        target="r2",
+    )
+
+    for key in ("zone_id", "viewer_origin"):
+        if key in raw:
+            v = raw[key]
+            _require(isinstance(v, str) and v != "", f"[deploy].{key} must be a non-empty string")
+            setattr(out, key, v)
+    if "prefix" in raw:  # "" is valid (= no prefix, the default) — so the init stub round-trips
+        v = raw["prefix"]
+        _require(isinstance(v, str), "[deploy].prefix must be a string")
+        out.prefix = v
+
+    if "tile_max_age" in raw:
+        v = raw["tile_max_age"]
+        _require(isinstance(v, int) and not isinstance(v, bool) and v > 0, "[deploy].tile_max_age must be a positive integer")
+        out.tile_max_age = v
+
+    return out
 
 
 def _parse_build(raw: object) -> BuildSpec:

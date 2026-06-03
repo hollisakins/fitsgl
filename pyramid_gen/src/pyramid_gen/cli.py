@@ -2,9 +2,9 @@
 
 Subcommands drive the journey from FITS mosaics to a deployable dataset:
 ``init`` (scaffold a ``fitsgl.toml``), ``build`` (one toml → one self-contained
-dataset directory), ``serve`` (preview it locally with Range support), and
-``verify`` (assert a deployed URL satisfies the host contract). ``deploy`` (the R2
-push) is the remaining unbuilt command.
+dataset directory), ``serve`` (preview it locally with Range support), ``deploy``
+(push to Cloudflare R2 + purge the edge), and ``verify`` (assert a deployed URL
+satisfies the host contract).
 
 ``python -m pyramid_gen`` remains the low-level single-pyramid primitive.
 """
@@ -14,10 +14,13 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Callable
 
 from .build import build_dataset, write_site
 from .build_pyramid import StopAndAsk
 from .config import load_config
+from .deploy import CloudflarePurge, DeployError, R2Target, deploy_dataset
+from .deploy_plan import DeployDiff
 from .init_scaffold import scan_directory, write_scaffold
 from .serve import serve
 from .verify import format_report, verify_deployment
@@ -90,6 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Promote warnings (cold edge cache, oversized objects) to failures — for CI.",
     )
+
+    pd = sub.add_parser("deploy", help="Push a built dataset to Cloudflare R2 and purge the edge.")
+    pd.add_argument("-c", "--config", type=Path, default=Path("fitsgl.toml"), help="Path to the fitsgl.toml (default: ./fitsgl.toml).")
+    pd.add_argument("-o", "--out", type=Path, default=Path("dist"), help="Output root holding <dataset.name>/ (default: ./dist).")
+    pd.add_argument("--dry-run", action="store_true", help="Print the upload/delete/purge plan; make no writes.")
+    pd.add_argument("--no-verify", action="store_true", help="Skip the post-deploy contract check against the live URL.")
+    pd.add_argument("--site-only", action="store_true", help="Push only the viewer (index.html + assets/); leave the data + its ledger entries untouched.")
+    pd.add_argument("--yes", action="store_true", help="Skip the upload confirmation prompt.")
     return p
 
 
@@ -188,6 +199,91 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return report.exit_code(strict=args.strict)
 
 
+def _confirm_deploy(bucket: str) -> Callable[[DeployDiff], bool]:
+    """An interactive confirm callback: prompt unless the diff is a no-op."""
+    def confirm(diff: DeployDiff) -> bool:
+        if diff.is_noop:
+            return True  # nothing to push — no prompt
+        print(
+            f"About to upload {len(diff.upload)} file(s) ({diff.upload_bytes / (1024 * 1024):.1f} MB), "
+            f"delete {len(diff.delete)}, purge {len(diff.purge)} from bucket {bucket!r}."
+        )
+        try:
+            return input("Proceed? [y/N] ").strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            # No TTY (CI / piped stdin) or Ctrl-C → a clean decline, not a traceback.
+            print("\naborted (no confirmation — re-run with --yes to deploy non-interactively)")
+            return False
+    return confirm
+
+
+def _cmd_deploy(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(args.config)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"fitsgl deploy: {e}", file=sys.stderr)
+        return 2
+    if config.deploy is None:
+        print(
+            "fitsgl deploy: no [deploy] table in the config — add one with bucket/endpoint/"
+            "public_url (see docs/deploy-design.md §5.3)",
+            file=sys.stderr,
+        )
+        return 2
+    dataset_dir = args.out / config.name
+    if not (dataset_dir / "fitsgl.json").is_file():
+        print(f"fitsgl deploy: no built dataset at {dataset_dir} — run `fitsgl build` first", file=sys.stderr)
+        return 2
+
+    try:
+        target = R2Target.from_config(config.deploy)
+        purger = CloudflarePurge.from_config(config.deploy)
+    except DeployError as e:
+        print(f"fitsgl deploy: {e}", file=sys.stderr)
+        return 2
+    if purger is None and not args.dry_run:
+        print(
+            "fitsgl deploy: note: no zone_id/CLOUDFLARE_API_TOKEN → the edge purge will be skipped",
+            file=sys.stderr,
+        )
+
+    confirm = None if (args.yes or args.dry_run) else _confirm_deploy(config.deploy.bucket)
+    try:
+        result = deploy_dataset(
+            dataset_dir,
+            config.deploy,
+            target,
+            purger=purger,
+            dry_run=args.dry_run,
+            run_verify=not args.no_verify,
+            site_only=args.site_only,
+            confirm=confirm,
+            on_progress=lambda m: print(m, flush=True),
+        )
+    except DeployError as e:
+        print(f"fitsgl deploy: {e}", file=sys.stderr)
+        return 1
+
+    if result.aborted:
+        print("aborted — nothing was uploaded")
+        return 0
+    if result.dry_run:
+        d = result.diff
+        print(f"dry run: would upload {len(d.upload)} file(s), delete {len(d.delete)}, purge {len(d.purge)} URL(s)")
+        return 0
+
+    print(
+        f"deployed {len(result.uploaded)} file(s), deleted {len(result.deleted)}, "
+        f"purged {len(result.purged)} URL(s) → {config.deploy.public_url}"
+    )
+    if result.verify_report is not None:
+        print(format_report(result.verify_report))
+        if not result.verify_report.ok():
+            print("fitsgl deploy: warning: post-deploy verify reported failures (above)", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "init":
@@ -198,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_serve(args)
     if args.command == "verify":
         return _cmd_verify(args)
+    if args.command == "deploy":
+        return _cmd_deploy(args)
     return 1
 
 
