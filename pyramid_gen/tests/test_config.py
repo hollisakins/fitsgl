@@ -53,12 +53,84 @@ def test_parses_a_valid_rgb_config(tmp_path):
     assert cfg.name == "cosmos"
     assert cfg.title == "COSMOS"
     assert [b.name for b in cfg.bands] == ["a", "b", "c"]
-    assert cfg.bands[0].input.name == "a.fits" and cfg.bands[0].input.is_absolute()
+    assert cfg.bands[0].inputs == [tmp_path / "a.fits"]
+    assert cfg.bands[0].inputs[0].is_absolute()
     assert cfg.build.quantize_level == 16 and cfg.build.tile_size == 128
     assert cfg.viewer.mode == "rgb"
     assert (cfg.viewer.r, cfg.viewer.g, cfg.viewer.b) == ("a", "b", "c")
     assert cfg.viewer.stretch == "asinh" and cfg.viewer.north_up is True
     assert cfg.catalog is None
+
+
+def test_band_accepts_a_list_of_tile_inputs(tmp_path):
+    for n in ("t1", "t2", "t3"):
+        touch(tmp_path, f"{n}.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "f277w"
+        input = ["t1.fits", "t2.fits", "t3.fits"]
+        """,
+    )
+    cfg = load_config(p)
+    assert [pth.name for pth in cfg.bands[0].inputs] == ["t1.fits", "t2.fits", "t3.fits"]
+    assert all(pth.is_absolute() for pth in cfg.bands[0].inputs)
+
+
+def test_band_input_glob_expands_sorted(tmp_path):
+    for n in ("B2", "B1", "B3"):
+        touch(tmp_path, f"tile_{n}.fits")
+    touch(tmp_path, "ignore.txt")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "f277w"
+        input = "tile_*.fits"
+        """,
+    )
+    cfg = load_config(p)
+    assert [pth.name for pth in cfg.bands[0].inputs] == [
+        "tile_B1.fits",
+        "tile_B2.fits",
+        "tile_B3.fits",
+    ]
+
+
+def test_band_input_glob_no_match_raises(tmp_path):
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "f277w"
+        input = "missing_*.fits"
+        """,
+    )
+    with pytest.raises(FileNotFoundError, match="glob"):
+        load_config(p)
+
+
+def test_band_input_list_missing_file_raises(tmp_path):
+    touch(tmp_path, "t1.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "f277w"
+        input = ["t1.fits", "nope.fits"]
+        """,
+    )
+    with pytest.raises(FileNotFoundError, match="not found"):
+        load_config(p)
 
 
 def test_minimal_single_band_uses_defaults(tmp_path):

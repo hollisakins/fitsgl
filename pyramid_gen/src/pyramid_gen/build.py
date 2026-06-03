@@ -70,10 +70,15 @@ def build_dataset(
         band_stats: dict[str, dict] = {}  # band name -> {"histogram": {...}} for the viewer panel
         total = len(config.bands)
         for i, band in enumerate(config.bands, 1):
-            log(f"[{i}/{total}] band {band.name}  ({band.input.name})")
+            multi = len(band.inputs) > 1
+            src_desc = f"{len(band.inputs)} tiles" if multi else band.inputs[0].name
+            log(f"[{i}/{total}] band {band.name}  ({src_desc})")
             manifest = build_pyramid(
-                band.input,
+                band.inputs,
                 output_dir=tmp_dir / band.name,
+                # Multi-tile bands get clean {slug}_z… filenames; single-input keeps
+                # its file-stem default (unchanged output).
+                stem=band.name if multi else None,
                 tile_size=config.build.tile_size,
                 quantize_level=config.build.quantize_level,
                 processes=processes,

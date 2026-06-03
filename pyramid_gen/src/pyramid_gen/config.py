@@ -65,10 +65,10 @@ def sanitize_band_name(stem: str, taken: set[str]) -> str:
 
 @dataclass
 class BandSpec:
-    """One band: a stable URL/dir-safe key, a human label, and the source mosaic."""
+    """One band: a stable URL/dir-safe key, a human label, and its source mosaic(s)."""
 
     name: str  # slug — used for the on-disk subdir, tile URLs, and defaultView refs
-    input: Path  # resolved relative to the toml file's directory
+    inputs: list[Path]  # one mosaic, or several pre-tiled tiles; resolved vs the toml dir
     label: str  # human-readable display name (defaults to the original toml name)
 
 
@@ -117,6 +117,42 @@ def _as_str(table: dict, key: str, where: str) -> str:
     _require(isinstance(v, str) and v != "", f"{where} must be a non-empty string")
     assert isinstance(v, str)  # for type-checkers
     return v
+
+
+def _resolve_band_inputs(rb: dict, bname: str, config_dir: Path) -> list[Path]:
+    """Resolve a band's ``input`` to ≥1 existing FITS paths (relative to the toml dir).
+
+    Accepts a single path string, a list of path strings, or a glob (``*?[``) — globs
+    expand sorted. Multiple inputs are pre-tiled tiles placed onto one grid at build
+    time. De-duplicates while preserving order; raises if a path/glob resolves to none.
+    """
+    raw = rb.get("input")
+    _require(raw is not None, f"band {bname!r} is missing 'input'")
+    entries = raw if isinstance(raw, list) else [raw]
+    _require(
+        len(entries) > 0 and all(isinstance(e, str) and e != "" for e in entries),
+        f"band {bname!r} input must be a non-empty path string or list of path strings",
+    )
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for e in entries:
+        if any(ch in e for ch in "*?["):
+            matched = sorted(config_dir.glob(e))
+            if not matched:
+                raise FileNotFoundError(
+                    f"fitsgl.toml: band {bname!r} input glob {e!r} matched no files under {config_dir}"
+                )
+            candidates = matched
+        else:
+            candidates = [config_dir / e]
+        for c in candidates:
+            cr = c.resolve()
+            if not cr.is_file():
+                raise FileNotFoundError(f"fitsgl.toml: band {bname!r} input not found: {cr}")
+            if cr not in seen:
+                seen.add(cr)
+                paths.append(cr)
+    return paths
 
 
 def load_config(path: str | Path) -> DatasetConfig:
@@ -171,11 +207,8 @@ def load_config(path: str | Path) -> DatasetConfig:
                 "`label` to silence this)",
                 stacklevel=2,
             )
-        inp = _as_str(rb, "input", f"band {bname!r} input")
-        inp_path = (config_dir / inp).resolve()
-        if not inp_path.is_file():
-            raise FileNotFoundError(f"fitsgl.toml: band {bname!r} input not found: {inp_path}")
-        bands.append(BandSpec(name=slug, input=inp_path, label=rlabel if rlabel is not None else bname))
+        inp_paths = _resolve_band_inputs(rb, bname, config_dir)
+        bands.append(BandSpec(name=slug, inputs=inp_paths, label=rlabel if rlabel is not None else bname))
         alias[bname] = slug
         alias[slug] = slug
 

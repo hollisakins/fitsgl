@@ -78,7 +78,7 @@ def test_render_toml_round_trips_through_load_config(tmp_path):
 
     cfg = load_config(toml_path)  # the strongest check: the scaffold is valid input
     assert [b.name for b in cfg.bands] == ["f150w", "f277w"]
-    assert cfg.bands[0].input.name == "f150w.fits"
+    assert cfg.bands[0].inputs[0].name == "f150w.fits"
     assert cfg.viewer.mode == "single" and cfg.viewer.band == "f150w"
     # The grid-group guidance is present as a comment.
     assert "Grid groups" in toml_text

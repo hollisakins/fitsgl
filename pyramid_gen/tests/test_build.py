@@ -9,6 +9,7 @@ from astropy.io import fits
 from pyramid_gen.build import build_dataset
 from pyramid_gen.catalog import ingest_catalog, read_catalog_csv, write_catalog_csv
 from pyramid_gen.config import load_config
+from pyramid_gen.manifest import read_manifest
 from pyramid_gen.synthetic import generate_synthetic_mosaic
 
 
@@ -106,6 +107,43 @@ def test_build_dataset_end_to_end(tmp_path):
         "stretch": {"mode": "asinh"},
         "northUp": True,
     }
+
+
+def test_build_dataset_with_pretiled_band(tmp_path):
+    """A band delivered as several overlapping tiles (shared grid) assembles into one
+    mosaic and flows through build_dataset like any single-FITS band (slice 3)."""
+    base, hdr, _ = generate_synthetic_mosaic(shape=(256, 384), n_sources=12, seed=4)
+
+    def crop(x0, x1):
+        sub = base[:, x0:x1].copy()
+        h = hdr.copy()
+        h["CRPIX1"] = float(hdr["CRPIX1"]) - x0
+        return sub, h
+
+    a_img, a_hdr = crop(0, 240)
+    b_img, b_hdr = crop(176, 384)  # overlap on cols [176:240)
+    fits.PrimaryHDU(data=a_img, header=a_hdr).writeto(tmp_path / "f277w_B1.fits", overwrite=True)
+    fits.PrimaryHDU(data=b_img, header=b_hdr).writeto(tmp_path / "f277w_B2.fits", overwrite=True)
+
+    toml = tmp_path / "fitsgl.toml"
+    toml.write_text(
+        '[dataset]\nname = "demo"\n'
+        '[[dataset.bands]]\nname = "f277w"\n'
+        'input = ["f277w_B1.fits", "f277w_B2.fits"]\n'
+        "[build]\ntile_size = 256\nquantize_level = 8\n"
+    )
+    result = build_dataset(load_config(toml), tmp_path / "dist")
+
+    ds = result.dataset_dir
+    m = read_manifest(ds / "f277w" / "manifest.json")
+    assert m.version == 2
+    assert m.native_shape == [256, 384]  # the two tiles reassembled into one grid
+    assert m.levels[0].filename.startswith("f277w_z0")  # multi-tile band -> {slug}_z… names
+    assert (ds / "f277w" / m.levels[0].filename).is_file()
+
+    cfg = json.loads((ds / "fitsgl.json").read_text())
+    assert [b["name"] for b in cfg["dataset"]["bands"]] == ["f277w"]
+    assert cfg["dataset"]["bands"][0]["tiles"] == ["f277w/manifest.json"]
 
 
 def test_build_with_verify_off(tmp_path):
