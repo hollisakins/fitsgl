@@ -217,12 +217,16 @@ config and the built dataset at `<out>/<dataset.name>/`. Flow:
    changed, header-changed, *and* deleted tiles (see §6); delete removes orphaned
    objects no longer referenced locally.
 3. **Upload** the delta to R2 (S3 PUT per object) with per-object `Content-Type`
-   and `Cache-Control` (DP4), then **delete** the orphaned objects. Order: tiles →
-   pointers → orphan deletes → `deploy-manifest.json` **last** (so an interrupted
-   deploy never falsely claims success). Apply bucket CORS (DP8).
+   and `Cache-Control` (DP4): tiles → pointers/assets → orphan **deletes**; then
+   apply bucket CORS (DP8). The `deploy-manifest.json` ledger is *not* written yet.
 4. **Purge** the changed + deleted tile URLs from Cloudflare (DP5; after the full
    upload), **batched into ≤100-URL calls** (§8).
-5. **Verify** the live `public_url` (DP7) unless `--no-verify`.
+5. **Write the `deploy-manifest.json` ledger last** — *after* the purge — so its new
+   hashes mark **both** the upload and the purge as complete. An interrupted upload
+   *or* a failed purge therefore leaves the *old* ledger, and the next deploy
+   re-detects the change and re-uploads/re-purges (self-heals) rather than a
+   committed new ledger masking a stale, un-evicted edge copy.
+6. **Verify** the live `public_url` (DP7) unless `--no-verify`.
 
 - `--dry-run` — do steps 1–2 and print the upload + purge plan; no writes.
 - `--site-only` — push + purge only `index.html`/`assets/` (the analog of `build

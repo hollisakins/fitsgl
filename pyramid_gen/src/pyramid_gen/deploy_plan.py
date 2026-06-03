@@ -174,6 +174,11 @@ class DeployManifest:
 
     @classmethod
     def from_dict(cls, d: dict) -> "DeployManifest":
+        # A legal-but-non-object JSON body (null/array/string from a truncated or
+        # hand-edited ledger) would otherwise AttributeError on .get; raise a TypeError
+        # the deploy's unreadable-ledger fallback catches.
+        if not isinstance(d, dict):
+            raise TypeError(f"deploy manifest must be a JSON object, got {type(d).__name__}")
         return cls(
             schema_version=d.get("schemaVersion", DEPLOY_MANIFEST_SCHEMA),
             dataset=d["dataset"],

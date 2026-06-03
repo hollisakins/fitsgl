@@ -16,6 +16,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
+# `fitsgl deploy` to Cloudflare R2 (S3-compatible). Optional so a build-only
+# install stays lean; the deploy engine imports boto3 lazily and errors with a
+# pointed "pip install 'fitsgl[deploy]'" if it's missing.
+deploy = ["boto3>=1.28"]
 
 [project.scripts]
 pyramid-gen = "pyramid_gen.__main__:main"
