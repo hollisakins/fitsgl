@@ -14,6 +14,7 @@ import { render, waitFor } from '@testing-library/react';
  *   dataset.bands[].label      -> band <select> options + RGB grid heads + status bar
  *   dataset.bands[].grid.group -> RGB cross-grid greying
  *   dataset.bands[].grid.pixelScaleArcsec -> mapped via explorerBandsFromConfig (display TBD)
+ *   dataset.bands[].stats.histogram -> pre-seeds the panel histogram (no live scan)
  *   dataset.catalog.url        -> fetched into the overlay
  *   defaultView.mode           -> single <select> vs RGB grid
  *   defaultView.band           -> single-band selection
@@ -82,9 +83,15 @@ const MAXIMAL_RGB: FitsglConfig = {
     title: 'Conformance Field',
     catalog: { url: 'https://example.test/catalog.csv' },
     bands: [
-      { name: 'jw_a', tiles: ['jw_a/manifest.json'], grid: { group: 0, pixelScaleArcsec: 0.03 }, label: 'A150' },
-      { name: 'jw_b', tiles: ['jw_b/manifest.json'], grid: { group: 0 }, label: 'B200' },
-      { name: 'jw_c', tiles: ['jw_c/manifest.json'], grid: { group: 0 }, label: 'C444' },
+      {
+        name: 'jw_a',
+        tiles: ['jw_a/manifest.json'],
+        grid: { group: 0, pixelScaleArcsec: 0.03 },
+        label: 'A150',
+        stats: { histogram: { counts: [3, 7, 5, 2], lo: 0, hi: 4 } },
+      },
+      { name: 'jw_b', tiles: ['jw_b/manifest.json'], grid: { group: 0 }, label: 'B200', stats: { histogram: { counts: [1, 4, 9, 1], lo: 0, hi: 4 } } },
+      { name: 'jw_c', tiles: ['jw_c/manifest.json'], grid: { group: 0 }, label: 'C444', stats: { histogram: { counts: [2, 2, 6, 3], lo: 0, hi: 4 } } },
       { name: 'gnd', tiles: ['gnd/manifest.json'], grid: { group: 1 }, label: 'Ground' },
     ],
   },
@@ -96,7 +103,15 @@ const MAXIMAL_SINGLE: FitsglConfig = {
   dataset: {
     name: 'conformance',
     title: 'Single Field',
-    bands: [{ name: 'jw_b', tiles: ['jw_b/manifest.json'], grid: { group: 0 }, label: 'B200' }],
+    bands: [
+      {
+        name: 'jw_b',
+        tiles: ['jw_b/manifest.json'],
+        grid: { group: 0 },
+        label: 'B200',
+        stats: { histogram: { counts: [1, 4, 9, 1], lo: 0, hi: 4 } },
+      },
+    ],
   },
   defaultView: { mode: 'single', band: 'jw_b', colormap: 'viridis', stretch: { mode: 'asinh' }, northUp: true },
 };
@@ -137,6 +152,9 @@ describe('FitsglConfig conformance (every key consumed by <FitsExplorer>)', () =
     expect(northUpToggle(container).className).not.toContain('on');
     // dataset.catalog.url -> fetched
     expect(fetchMock).toHaveBeenCalledWith('https://example.test/catalog.csv');
+    // dataset.bands[].stats.histogram -> panel seeded from precomputed; no live-scan placeholder
+    expect(container.querySelector('.fgl-dr-scanning')).toBeNull();
+    expect(container.querySelector('.fgl-hist')).not.toBeNull();
   });
 
   it('consumes every key of a maximal single-band config', async () => {
@@ -160,5 +178,7 @@ describe('FitsglConfig conformance (every key consumed by <FitsExplorer>)', () =
     expect(bands[0].pixelScaleArcsec).toBe(0.03);
     expect(bands.map((b) => b.gridGroup)).toEqual([0, 0, 0, 1]); // grid.group preserved
     expect(bands.map((b) => b.label)).toEqual(['A150', 'B200', 'C444', 'Ground']); // label preserved
+    expect(bands[0].histogram).toEqual({ counts: [3, 7, 5, 2], lo: 0, hi: 4 }); // stats.histogram preserved
+    expect(bands[3].histogram).toBeUndefined(); // no stats on the ground band
   });
 });

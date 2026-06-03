@@ -96,12 +96,15 @@ def build_fitsgl_config(
     default_view: dict,
     title: str | None = None,
     catalog_url: str | None = None,
+    band_stats: dict[str, dict] | None = None,
 ) -> dict:
     """Assemble + write ``fitsgl.json`` from already-built band pyramids.
 
     ``bands`` are ``(name, label, manifest_path)`` triples — ``name`` is the
     URL/dir-safe slug, ``label`` the human display string (the pyramids must
-    exist; this only reads their manifests). Band tile URLs are written RELATIVE
+    exist; this only reads their manifests). ``band_stats`` (optional) maps a band
+    name to a display ``stats`` block (e.g. ``{"histogram": {...}}``) the viewer's
+    stretch panel shows without a live scan. Band tile URLs are written RELATIVE
     to the output file's directory. Returns the config dict (also serialized to
     ``output_path``).
     """
@@ -118,14 +121,15 @@ def build_fitsgl_config(
         grid: dict = {"group": group}
         if isinstance(ps, (int, float)) and ps == ps and ps not in (float("inf"), float("-inf")):
             grid["pixelScaleArcsec"] = float(ps)
-        band_entries.append(
-            {
-                "name": bname,
-                "tiles": [_relative_posix(Path(mpath), out_dir)],
-                "grid": grid,
-                "label": blabel,
-            }
-        )
+        entry: dict = {
+            "name": bname,
+            "tiles": [_relative_posix(Path(mpath), out_dir)],
+            "grid": grid,
+            "label": blabel,
+        }
+        if band_stats is not None and bname in band_stats:
+            entry["stats"] = band_stats[bname]
+        band_entries.append(entry)
 
     dataset: dict = {"name": name, "bands": band_entries}
     if title is not None:

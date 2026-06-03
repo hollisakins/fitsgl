@@ -98,6 +98,27 @@ describe('validateFitsglConfig', () => {
       validateFitsglConfig({ ...raw(), defaultView: { mode: 'single', band: 'a', stretch: { mode: 'sqrt' } } }),
     ).toThrow(/not a known stretch mode/);
   });
+
+  it('accepts and preserves a band stats histogram', () => {
+    const r = raw();
+    (r.dataset as { bands: Record<string, unknown>[] }).bands[0].stats = {
+      histogram: { counts: [1, 2, 3, 0], lo: 0.5, hi: 9.5 },
+    };
+    const c = validateFitsglConfig(r);
+    expect(c.dataset.bands[0].stats).toEqual({ histogram: { counts: [1, 2, 3, 0], lo: 0.5, hi: 9.5 } });
+    expect(c.dataset.bands[1].stats).toBeUndefined(); // omitted ⇒ undefined (viewer scans live)
+  });
+
+  it('rejects a malformed band stats histogram', () => {
+    const bad = (h: unknown): Record<string, unknown> => {
+      const r = raw();
+      (r.dataset as { bands: Record<string, unknown>[] }).bands[0].stats = { histogram: h };
+      return r;
+    };
+    expect(() => validateFitsglConfig(bad({ counts: [], lo: 0, hi: 1 }))).toThrow(/counts/);
+    expect(() => validateFitsglConfig(bad({ counts: ['x'], lo: 0, hi: 1 }))).toThrow(/counts/);
+    expect(() => validateFitsglConfig(bad({ counts: [1, 2], lo: 1, hi: 1 }))).toThrow(/hi > lo/);
+  });
 });
 
 describe('resolveFitsglConfig', () => {
@@ -114,6 +135,14 @@ describe('resolveFitsglConfig', () => {
     abs.defaultView = { mode: 'single', band: 'a' };
     const c = resolveFitsglConfig(validateFitsglConfig(abs), 'https://cdn.example/x/fitsgl.json');
     expect(c.dataset.bands[0].tiles[0]).toBe('https://other.host/a.json');
+  });
+  it('preserves band stats through URL resolution', () => {
+    const r = raw();
+    (r.dataset as { bands: Record<string, unknown>[] }).bands[0].stats = {
+      histogram: { counts: [1, 2], lo: 0, hi: 1 },
+    };
+    const c = resolveFitsglConfig(validateFitsglConfig(r), 'https://cdn.example/sets/cosmos/fitsgl.json');
+    expect(c.dataset.bands[0].stats).toEqual({ histogram: { counts: [1, 2], lo: 0, hi: 1 } });
   });
 });
 

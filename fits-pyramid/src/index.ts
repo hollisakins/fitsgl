@@ -112,4 +112,10 @@ export {
   fitsglConfigFromDataset,
   FITSGL_SCHEMA_VERSION,
 } from './fitsgl-config.js';
-export type { FitsglConfig, FitsglDataset, FitsglBand, FitsglDefaultView } from './fitsgl-config.js';
+export type {
+  FitsglConfig,
+  FitsglDataset,
+  FitsglBand,
+  FitsglBandStats,
+  FitsglDefaultView,
+} from './fitsgl-config.js';

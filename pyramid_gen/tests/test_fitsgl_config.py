@@ -84,6 +84,27 @@ def test_emits_human_label_distinct_from_slug_name(tmp_path):
     assert b["name"] == "nircam_f277w" and b["label"] == "NIRCam F277W"
 
 
+def test_emits_band_stats_histogram(tmp_path):
+    hist = {"counts": [1, 2, 3, 0], "lo": 0.0, "hi": 1.0}
+    cfg = build_fitsgl_config(
+        [_band(tmp_path, "a")],
+        tmp_path / "fitsgl.json",
+        name="set",
+        default_view=default_view_dict(mode="single", band="a"),
+        band_stats={"a": {"histogram": hist}},
+    )
+    assert cfg["dataset"]["bands"][0]["stats"] == {"histogram": hist}
+
+    # A band without stats simply omits the key.
+    cfg2 = build_fitsgl_config(
+        [_band(tmp_path, "b")],
+        tmp_path / "fitsgl2.json",
+        name="set",
+        default_view=default_view_dict(mode="single", band="b"),
+    )
+    assert "stats" not in cfg2["dataset"]["bands"][0]
+
+
 def test_assigns_grid_groups_by_grid_hash(tmp_path):
     # a, b co-gridded (same WCS); c is 50 deg away -> its own group.
     manifests = [_manifest("a", 150.0), _manifest("b", 150.0), _manifest("c", 200.0)]

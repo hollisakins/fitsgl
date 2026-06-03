@@ -41,6 +41,9 @@ export interface ExplorerBand {
   gridGroup?: number;
   /** Native pixel scale, for a scale-bar / label. */
   pixelScaleArcsec?: number;
+  /** Pre-computed display histogram (wire shape) seeding the stretch panel so it
+   *  need not scan live; counts per bin over `[lo, hi]`. Omitted ⇒ scan on first frame. */
+  histogram?: { counts: number[]; lo: number; hi: number };
 }
 
 /** The producer's default view (from `[viewer]` / `defaultView`). All overridable. */
@@ -207,6 +210,7 @@ export function explorerBandsFromConfig(config: FitsglConfig): ExplorerBand[] {
     const band: ExplorerBand = { name: b.name, tiles: b.tiles.slice(), gridGroup: b.grid.group };
     if (b.label !== undefined) band.label = b.label;
     if (b.grid.pixelScaleArcsec !== undefined) band.pixelScaleArcsec = b.grid.pixelScaleArcsec;
+    if (b.stats?.histogram !== undefined) band.histogram = b.stats.histogram;
     return band;
   });
 }

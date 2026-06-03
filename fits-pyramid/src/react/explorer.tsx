@@ -314,6 +314,23 @@ function RgbRow({
   );
 }
 
+/**
+ * Seed the panel's histograms from the producer's pre-computed `band.stats`
+ * (converted to the viewer's `Float32Array` shape). Bands without a precomputed
+ * histogram are omitted — the viewer scans them live on the first frame as before.
+ * Pre-seeding means the panel never shows the "scanning…" placeholder for a built
+ * dataset, even if the live scan later fails (large/HTTP/NaN-padded mosaics).
+ */
+function precomputedHistos(bands: readonly ExplorerBand[]): Record<string, BandHistogram> {
+  const out: Record<string, BandHistogram> = {};
+  for (const b of bands) {
+    if (b.histogram !== undefined) {
+      out[b.name] = { counts: Float32Array.from(b.histogram.counts), lo: b.histogram.lo, hi: b.histogram.hi };
+    }
+  }
+  return out;
+}
+
 export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const handle = useRef<FitsViewerHandle>(null);
   const getViewer = useCallback((): FitsViewerCore | null => handle.current?.getViewer() ?? null, []);
@@ -343,10 +360,16 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const [cursor, setCursor] = useState<CursorInfo | null>(null);
   const [frame, setFrame] = useState<ViewerFrameInfo | null>(null);
   const [limits, setLimits] = useState<Record<string, { min: number; max: number }>>({});
-  const [histos, setHistos] = useState<Record<string, BandHistogram>>({});
+  const [histos, setHistos] = useState<Record<string, BandHistogram>>(() => precomputedHistos(bands));
   const [markers, setMarkers] = useState<MarkerInput[]>(Array.isArray(catalogSource) ? catalogSource : []);
 
   useEffect(ensureStyles, []);
+
+  // Re-seed the panel histograms from the producer's pre-computed stats when the band
+  // inventory changes (a new config); a live scan still refines on the next frame.
+  useEffect(() => {
+    setHistos(precomputedHistos(bands));
+  }, [bands]);
 
   const viewerConfig = useMemo(() => deriveViewerConfig(bands, state), [bands, state]);
 

@@ -5,13 +5,14 @@ import {
   defaultExplorerState,
   defaultViewFromDataset,
   deriveViewerConfig,
+  explorerBandsFromConfig,
   explorerBandsFromDataset,
   gridGroupOf,
   isBandSelectableForRgb,
   rgbActiveGroup,
   type ExplorerBand,
 } from '../../src/react/explorer-state.js';
-import type { DatasetBand, DatasetManifest } from '../../src/index.js';
+import type { DatasetBand, DatasetManifest, FitsglConfig } from '../../src/index.js';
 
 const band = (name: string, gridGroup = 0): ExplorerBand => ({
   name,
@@ -149,6 +150,37 @@ const DATASET: DatasetManifest = {
   bands: [dband('a', 150), dband('b', 150), dband('c', 200)], // a,b co-gridded; c 50° away
   default_rgb: { r: 'a', g: 'b', b: 'c' },
 };
+
+describe('explorerBandsFromConfig', () => {
+  it('maps label, grid group, pixel scale, and the pre-computed histogram', () => {
+    const config: FitsglConfig = {
+      schemaVersion: 1,
+      dataset: {
+        name: 'set',
+        bands: [
+          {
+            name: 'a',
+            tiles: ['a/manifest.json'],
+            grid: { group: 2, pixelScaleArcsec: 0.06 },
+            label: 'Band A',
+            stats: { histogram: { counts: [1, 2, 3], lo: 0.5, hi: 9.5 } },
+          },
+          { name: 'b', tiles: ['b/manifest.json'], grid: { group: 0 } },
+        ],
+      },
+      defaultView: { mode: 'single', band: 'a' },
+    };
+    const bands = explorerBandsFromConfig(config);
+    expect(bands[0]).toMatchObject({
+      name: 'a',
+      label: 'Band A',
+      gridGroup: 2,
+      pixelScaleArcsec: 0.06,
+      histogram: { counts: [1, 2, 3], lo: 0.5, hi: 9.5 },
+    });
+    expect(bands[1].histogram).toBeUndefined(); // no stats ⇒ no precomputed histogram
+  });
+});
 
 describe('explorerBandsFromDataset', () => {
   it('assigns grid groups via gridsMatch (co-gridded bands share a group)', () => {

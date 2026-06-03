@@ -40,6 +40,15 @@ export interface FitsglBand {
   grid: { group: number; pixelScaleArcsec?: number };
   /** Display label; defaults to `name`. */
   label?: string;
+  /** Pre-computed display stats (e.g. a histogram) the stretch panel shows without
+   *  a live scan; producer-emitted, a UI convenience (omitted ⇒ the viewer scans). */
+  stats?: FitsglBandStats;
+}
+
+/** Pre-computed per-band display statistics for the viewer's stretch panel. */
+export interface FitsglBandStats {
+  /** Histogram of the band's data over a robust `[lo, hi]` domain (counts per bin). */
+  histogram: { counts: number[]; lo: number; hi: number };
 }
 
 /** The dataset inventory — pure data, no view. */
@@ -89,6 +98,23 @@ function asOptStr(v: unknown, what: string): string | undefined {
 function asFiniteNum(v: unknown, what: string): number {
   if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`fitsgl-config: ${what} must be a finite number`);
   return v;
+}
+function asBandStats(v: unknown, name: string): FitsglBandStats | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (!isObj(v)) throw new Error(`fitsgl-config: band "${name}" stats must be an object`);
+  const h = v.histogram;
+  if (!isObj(h)) throw new Error(`fitsgl-config: band "${name}" stats.histogram must be an object`);
+  if (
+    !Array.isArray(h.counts) ||
+    h.counts.length === 0 ||
+    !h.counts.every((c) => typeof c === 'number' && Number.isFinite(c))
+  ) {
+    throw new Error(`fitsgl-config: band "${name}" stats.histogram.counts must be a non-empty number array`);
+  }
+  const lo = asFiniteNum(h.lo, `band "${name}" stats.histogram.lo`);
+  const hi = asFiniteNum(h.hi, `band "${name}" stats.histogram.hi`);
+  if (!(hi > lo)) throw new Error(`fitsgl-config: band "${name}" stats.histogram requires hi > lo`);
+  return { histogram: { counts: (h.counts as number[]).slice(), lo, hi } };
 }
 
 /**
@@ -151,6 +177,8 @@ export function validateFitsglConfig(raw: unknown): FitsglConfig {
     const band: FitsglBand = { name, tiles, grid };
     const label = asOptStr(rawBand.label, `band "${name}" label`);
     if (label !== undefined) band.label = label;
+    const stats = asBandStats(rawBand.stats, name);
+    if (stats !== undefined) band.stats = stats;
     return band;
   });
 

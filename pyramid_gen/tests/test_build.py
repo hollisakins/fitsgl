@@ -150,6 +150,17 @@ def test_build_emits_site_by_default(tmp_path):
     assert (ds / "assets").is_dir()
 
 
+def test_build_emits_band_histogram_stats(tmp_path):
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    result = build_dataset(config, tmp_path / "dist", with_site=False)
+    cfg = json.loads((result.dataset_dir / "fitsgl.json").read_text())
+    stats = cfg["dataset"]["bands"][0].get("stats")
+    assert stats is not None and "histogram" in stats  # pre-computed for the stretch panel
+    h = stats["histogram"]
+    assert len(h["counts"]) == 128 and h["lo"] < h["hi"]
+
+
 def test_build_no_site(tmp_path):
     _write_band(tmp_path, "img", 1)
     config = load_config(_toml(tmp_path, [("img", "img.fits")]))

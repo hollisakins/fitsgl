@@ -20,6 +20,7 @@ from .catalog import ingest_catalog
 from .config import DatasetConfig
 from .fitsgl_config import build_fitsgl_config, default_view_dict
 from .site import copy_viewer_into
+from .stats import compute_band_histogram
 
 
 @dataclass
@@ -66,6 +67,7 @@ def build_dataset(
 
     try:
         band_levels: dict[str, int] = {}
+        band_stats: dict[str, dict] = {}  # band name -> {"histogram": {...}} for the viewer panel
         total = len(config.bands)
         for i, band in enumerate(config.bands, 1):
             log(f"[{i}/{total}] band {band.name}  ({band.input.name})")
@@ -79,6 +81,9 @@ def build_dataset(
                 on_progress=lambda m: log(f"    {m}"),
             )
             band_levels[band.name] = manifest.n_levels
+            histogram = compute_band_histogram(tmp_dir / band.name, manifest)
+            if histogram is not None:
+                band_stats[band.name] = {"histogram": histogram}
 
         catalog_url: str | None = None
         if config.catalog is not None:
@@ -109,6 +114,7 @@ def build_dataset(
             title=config.title,
             default_view=dv,
             catalog_url=catalog_url,
+            band_stats=band_stats,
         )
 
         if with_site:
