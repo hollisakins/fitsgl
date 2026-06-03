@@ -21,6 +21,10 @@ both.
   requests, `TilePyramid`), `renderer/` (`FitsViewer`, WebGL2). Builds with
   `tsc` (no bundler).
 - `demo/` — Vite app for end-to-end visual verification.
+- `viewer/` — the SSG viewer app (Vite + the `fits-pyramid` React
+  `<FitsExplorer>`). `npm run build-vendor` compiles it into
+  `pyramid_gen/src/pyramid_gen/_viewer/` — the committed bundle that `fitsgl
+  build` copies next to a dataset to emit a self-contained, deployable site.
 
 ## Commands
 
@@ -37,6 +41,13 @@ npm run build     # tsc -> dist/
 
 # Demo
 cd demo && npm install && npm run build-pyramid && npm run dev
+
+# SSG viewer bundle — re-vendor after ANY change to fits-pyramid/ or viewer/
+# source, or the bundle `fitsgl build` ships stays stale. A pyramid_gen test
+# (test_vendored_viewer_is_fresh) fails until you do; commit the rebuilt
+# pyramid_gen/_viewer/. To refresh only the site in an already-built dataset
+# afterwards: `fitsgl build --site-only`.
+npm --prefix viewer run build-vendor
 ```
 
 ## Conventions

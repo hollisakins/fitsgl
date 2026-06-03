@@ -136,3 +136,33 @@ def build_dataset(
         band_levels=band_levels,
         site_written=with_site,
     )
+
+
+def write_site(
+    config: DatasetConfig,
+    out_root: str | Path,
+    *,
+    on_progress: Callable[[str], None] | None = None,
+) -> Path:
+    """Re-emit only the bundled viewer into an already-built dataset directory.
+
+    Overwrites ``index.html`` + ``assets/`` in ``out_root/<dataset.name>/`` in
+    place, leaving the pyramid data, ``fitsgl.json``, and catalog untouched (no
+    atomic temp-swap — nothing else is rewritten). This is the cheap counterpart
+    to a full :func:`build_dataset`: use it to refresh the SSG viewer after
+    rebuilding the viewer app, skipping the multi-minute pyramid rebuild.
+
+    Raises ``FileNotFoundError`` if there is no built dataset at the target (its
+    ``fitsgl.json`` is missing) — run a full ``fitsgl build`` first — or if the
+    viewer bundle was never vendored.
+    """
+    log = on_progress if on_progress is not None else (lambda _msg: None)
+    dataset_dir = Path(out_root) / config.name
+    if not (dataset_dir / "fitsgl.json").is_file():
+        raise FileNotFoundError(
+            f"no built dataset at {dataset_dir} (missing fitsgl.json); "
+            "run a full `fitsgl build` first"
+        )
+    log("writing viewer (index.html + assets)")
+    copy_viewer_into(dataset_dir)
+    return dataset_dir

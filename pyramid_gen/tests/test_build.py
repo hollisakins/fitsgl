@@ -171,6 +171,64 @@ def test_build_no_site(tmp_path):
     assert (ds / "fitsgl.json").is_file()  # data + config still emitted
 
 
+def test_write_site_refreshes_viewer_without_rebuilding(tmp_path):
+    from pyramid_gen.build import write_site
+
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    out_root = tmp_path / "dist"
+    # Build data + config WITHOUT the viewer, then add only the viewer.
+    result = build_dataset(config, out_root, with_site=False)
+    ds = result.dataset_dir
+    assert not (ds / "index.html").exists()
+    cfg_before = (ds / "fitsgl.json").read_bytes()
+    data_before = (ds / "img" / "manifest.json").read_bytes()
+
+    dataset_dir = write_site(config, out_root)
+
+    assert dataset_dir == ds
+    assert (ds / "index.html").is_file() and (ds / "assets").is_dir()  # viewer now present
+    # Data + config are byte-for-byte untouched: no pyramid rebuild, no temp swap.
+    assert (ds / "fitsgl.json").read_bytes() == cfg_before
+    assert (ds / "img" / "manifest.json").read_bytes() == data_before
+
+
+def test_write_site_requires_existing_dataset(tmp_path):
+    from pyramid_gen.build import write_site
+
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    with pytest.raises(FileNotFoundError, match="run a full"):
+        write_site(config, tmp_path / "dist")  # nothing built yet
+
+
+def test_build_site_only_cli(tmp_path):
+    from pyramid_gen.cli import main
+
+    _write_band(tmp_path, "img", 1)
+    toml = _toml(tmp_path, [("img", "img.fits")])
+    out = tmp_path / "dist"
+    build_dataset(load_config(toml), out, with_site=False)  # data only, no viewer
+
+    assert main(["build", "-c", str(toml), "-o", str(out), "--site-only"]) == 0
+    assert (out / "demo" / "index.html").is_file()  # viewer refreshed in place
+
+
+def test_build_site_only_without_prior_build_errors(tmp_path):
+    from pyramid_gen.cli import main
+
+    _write_band(tmp_path, "img", 1)
+    toml = _toml(tmp_path, [("img", "img.fits")])
+    assert main(["build", "-c", str(toml), "-o", str(tmp_path / "dist"), "--site-only"]) == 2
+
+
+def test_build_no_site_and_site_only_are_mutually_exclusive():
+    from pyramid_gen.cli import main
+
+    with pytest.raises(SystemExit):  # argparse rejects the contradictory pair
+        main(["build", "--no-site", "--site-only"])
+
+
 def test_build_single_band_default_and_rerun(tmp_path):
     _write_band(tmp_path, "img", 1)
     config = load_config(_toml(tmp_path, [("img", "img.fits")]))

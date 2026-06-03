@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .build import build_dataset
+from .build import build_dataset, write_site
 from .build_pyramid import StopAndAsk
 from .config import load_config
 from .init_scaffold import scan_directory, write_scaffold
@@ -56,11 +56,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the per-level read-back verification (a second full decode per "
         "level); use for very large mosaics where memory is the constraint.",
     )
-    pb.add_argument(
+    site = pb.add_mutually_exclusive_group()
+    site.add_argument(
         "--no-site",
         action="store_true",
         help="Skip emitting the bundled viewer (index.html + assets); write data + "
         "fitsgl.json only.",
+    )
+    site.add_argument(
+        "--site-only",
+        action="store_true",
+        help="Re-emit ONLY the bundled viewer (index.html + assets) into an "
+        "already-built dataset; skip the pyramid/catalog/fitsgl.json build. Fast "
+        "refresh after rebuilding the viewer app (other build flags are ignored).",
     )
 
     ps = sub.add_parser("serve", help="Serve a built dataset directory over HTTP with byte-range support.")
@@ -108,6 +116,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"fitsgl build: {e}", file=sys.stderr)
         return 2
+
+    if args.site_only:
+        try:
+            dataset_dir = write_site(config, args.out, on_progress=lambda m: print(m, flush=True))
+        except FileNotFoundError as e:
+            print(f"fitsgl build: {e}", file=sys.stderr)
+            return 2
+        print(f"refreshed viewer in {dataset_dir}")
+        print(f"  open {dataset_dir / 'index.html'} (or run `fitsgl serve {dataset_dir}`)")
+        return 0
 
     try:
         result = build_dataset(
