@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
@@ -340,6 +341,7 @@ def build_pyramid(
     tile_size: int = FPACK_TILE_SIZE,
     quantize_level: int = DEFAULT_QUANTIZE_LEVEL,
     processes: int | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> Manifest:
     """Build a multi-resolution fpacked pyramid from one FITS mosaic.
 
@@ -355,6 +357,9 @@ def build_pyramid(
         RICE_1 quantization level applied to every level (default 8).
     processes
         Worker process count. Defaults to one per level (capped at cpu count).
+    on_progress
+        Optional callback invoked with human-readable progress lines (input read,
+        levels building, each level as it completes). Defaults to silent.
 
     Returns
     -------
@@ -362,7 +367,10 @@ def build_pyramid(
         The written manifest, also serialized to ``output_dir/manifest.json``.
     """
     input_path = Path(input_path)
+    report = on_progress if on_progress is not None else (lambda _msg: None)
+    report(f"reading {input_path.name} …")
     data, header = _read_input(input_path)
+    report(f"read {data.shape[0]}×{data.shape[1]} mosaic")
 
     stem = input_path.stem
     if output_dir is None:
@@ -392,11 +400,22 @@ def build_pyramid(
     # level, and levels are fully independent, so process-per-level is the clean
     # parallel unit. Single level -> run inline to avoid Pool overhead.
     if len(tasks) == 1:
+        report("building 1 level (z=0) …")
         level_dicts = [_build_level(tasks[0])]
+        report(f"  z0 done — {level_dicts[0]['shape'][0]}×{level_dicts[0]['shape'][1]}")
     else:
         n_proc = processes or min(len(tasks), os.cpu_count() or 1)
+        report(f"building {len(tasks)} levels (z=0..{N}) on {n_proc} worker(s) …")
+        # imap_unordered so each level reports as it finishes (the largest, z=0, is
+        # last); results are collected then sorted by z below, so order is preserved.
+        level_dicts = []
         with Pool(processes=n_proc) as pool:
-            level_dicts = pool.map(_build_level, tasks)
+            for d in pool.imap_unordered(_build_level, tasks):
+                level_dicts.append(d)
+                report(
+                    f"  z{d['z']} done — {d['shape'][0]}×{d['shape'][1]} "
+                    f"({len(level_dicts)}/{len(tasks)})"
+                )
 
     levels = [LevelInfo.from_dict(d) for d in level_dicts]
     levels.sort(key=lambda lvl: lvl.z)

@@ -11,6 +11,7 @@ the viewer would choke on.
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,14 +30,18 @@ class BuildResult:
     band_levels: dict[str, int]  # band name -> number of pyramid levels
 
 
-def build_dataset(config: DatasetConfig, out_root: str | Path) -> BuildResult:
+def build_dataset(
+    config: DatasetConfig, out_root: str | Path, *, on_progress: Callable[[str], None] | None = None
+) -> BuildResult:
     """Build the whole dataset described by ``config`` under ``out_root``.
 
     Produces ``out_root/<dataset.name>/`` containing one ``<band>/`` pyramid per
     band, an optional ``catalog.csv``, and ``fitsgl.json``. Re-runnable: an
     existing dataset directory is replaced atomically only after the new one is
-    fully built.
+    fully built. ``on_progress`` (if given) is called with human-readable status
+    lines as each band + level builds; defaults to silent.
     """
+    log = on_progress if on_progress is not None else (lambda _msg: None)
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
     dataset_dir = out_root / config.name
@@ -49,18 +54,22 @@ def build_dataset(config: DatasetConfig, out_root: str | Path) -> BuildResult:
     try:
         processes = None if config.build.processes == 0 else config.build.processes
         band_levels: dict[str, int] = {}
-        for band in config.bands:
+        total = len(config.bands)
+        for i, band in enumerate(config.bands, 1):
+            log(f"[{i}/{total}] band {band.name}  ({band.input.name})")
             manifest = build_pyramid(
                 band.input,
                 output_dir=tmp_dir / band.name,
                 tile_size=config.build.tile_size,
                 quantize_level=config.build.quantize_level,
                 processes=processes,
+                on_progress=lambda m: log(f"    {m}"),
             )
             band_levels[band.name] = manifest.n_levels
 
         catalog_url: str | None = None
         if config.catalog is not None:
+            log(f"ingesting catalog {config.catalog.name}")
             ingest_catalog(config.catalog, tmp_dir / "catalog.csv")
             catalog_url = "catalog.csv"
 
@@ -77,6 +86,7 @@ def build_dataset(config: DatasetConfig, out_root: str | Path) -> BuildResult:
             colormap=view.colormap,
             north_up=view.north_up,
         )
+        log("writing fitsgl.json")
         bands = [(b.name, tmp_dir / b.name / "manifest.json") for b in config.bands]
         config_path_tmp = tmp_dir / "fitsgl.json"
         build_fitsgl_config(

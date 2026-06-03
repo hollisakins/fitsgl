@@ -88,7 +88,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        result = build_dataset(config, args.out)
+        result = build_dataset(config, args.out, on_progress=lambda m: print(m, flush=True))
     except StopAndAsk as e:
         print(f"fitsgl build: STOP: {e}", file=sys.stderr)
         return 3
