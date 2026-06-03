@@ -41,6 +41,18 @@ export type { Point, WorldBounds } from './camera.js';
 // Display modes (M1): stretch curves + bundled colormaps for single-band view.
 export { STRETCH_MODES, isStretchMode } from './stretch.js';
 export type { StretchMode } from './stretch.js';
+// Trilogy stretch: the pure level-determination math + its precomputed-stats type,
+// for a host driving a faithful, color-preserving trilogy from its own data.
+export {
+  trilogyCurve,
+  solveTrilogyK,
+  saturationValue,
+  trilogyLevels,
+  combineTrilogyLuminance,
+  DEFAULT_TRILOGY_PARAMS,
+  DEFAULT_TRILOGY_K,
+} from './stretch.js';
+export type { TrilogyStats, TrilogyParams, TrilogyLevels, TrilogyLuminance } from './stretch.js';
 export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './colormaps.js';
 export type { ColormapName, ColormapLUT } from './colormaps.js';
 

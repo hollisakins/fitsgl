@@ -22,6 +22,9 @@ from .manifest import LevelInfo, Manifest
 STATS_PIXEL_CAP = 2_000_000
 #: Histogram bins (matches the viewer's default `visibleHistogram` bin count).
 HISTOGRAM_BINS = 128
+#: Subsample target for the trilogy reductions (sigma + bright-tail percentiles).
+#: Measured on native z=0 (per-pixel noise + compact peaks), strided to this cap.
+TRILOGY_SAMPLE_CAP = 4_000_000
 
 
 def _choose_level(manifest: Manifest, pixel_cap: int) -> LevelInfo:
@@ -75,3 +78,58 @@ def compute_band_histogram(
     with fits.open(Path(band_dir) / level.filename) as hdul:
         data = np.asarray(_image_hdu(hdul).data, dtype=np.float32)
     return histogram_dict(data, bins)
+
+
+def trilogy_stats_dict(data: np.ndarray, *, sample_cap: int = TRILOGY_SAMPLE_CAP) -> dict | None:
+    """Global trilogy levels for a band: robust sky mean/noise + bright-tail percentiles.
+
+    The browser only ever sees the visible tiles, so a stable trilogy stretch needs
+    a *global* noise floor and saturation level — measured here on the whole band.
+    ``mean``/``sigma`` are the MAD-based robust sky level + noise (the same estimator
+    as ``estimate_noise``, robust to bright sources); ``tail`` carries the bright-tail
+    percentiles the saturation point lives in (beyond the 99.9th the display
+    histogram is clipped to). Strided-subsampled to ``sample_cap`` so the reductions
+    stay cheap on a huge native level. Returns ``None`` when there is no finite data.
+    """
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return None
+    if finite.size > sample_cap:
+        stride = int(np.ceil(finite.size / sample_cap))
+        finite = finite[::stride]
+    med = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - med)))
+    p99, p99_9, p99_99, p99_999 = (
+        float(x) for x in np.percentile(finite, [99, 99.9, 99.99, 99.999])
+    )
+    return {
+        "mean": med,
+        "sigma": 1.4826 * mad,
+        "tail": {
+            "p99": p99,
+            "p99_9": p99_9,
+            "p99_99": p99_99,
+            "p99_999": p99_999,
+            "max": float(finite.max()),
+        },
+        "min": float(finite.min()),
+    }
+
+
+def compute_band_trilogy_stats(
+    band_dir, manifest: Manifest, *, sample_cap: int = TRILOGY_SAMPLE_CAP
+) -> dict | None:
+    """Decode the band's native (z=0) level and reduce it to global trilogy stats.
+
+    Uses z=0 (not a coarse level) on purpose: block-averaging lowers the measured
+    noise and softens compact peaks, biasing both ``sigma`` and the saturation
+    tail — and trilogy's color fidelity hinges on those. Strided-subsampled inside
+    ``trilogy_stats_dict`` so the reductions stay cheap. Returns ``None`` when the
+    native level has no usable finite data.
+    """
+    from pathlib import Path
+
+    native = min(manifest.levels, key=lambda lvl: lvl.z)  # z=0, full resolution
+    with fits.open(Path(band_dir) / native.filename) as hdul:
+        data = np.asarray(_image_hdu(hdul).data, dtype=np.float32)
+    return trilogy_stats_dict(data, sample_cap=sample_cap)

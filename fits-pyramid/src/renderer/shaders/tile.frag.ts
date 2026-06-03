@@ -39,14 +39,16 @@ uniform sampler2D u_tileB;
 uniform sampler2D u_colormap;
 
 uniform int u_mode;         // 0 = single-band, 1 = RGB composite
-uniform int u_stretchMode;  // 0 = linear, 1 = log, 2 = asinh
+uniform int u_stretchMode;  // 0 = linear, 1 = log, 2 = asinh, 3 = trilogy
 uniform int u_useColormap;  // single-band: 0 = grayscale, 1 = colormap LUT
 
 uniform float u_min;        // single-band display interval
 uniform float u_max;
-uniform vec3 u_minRGB;      // RGB mode per-channel interval (M4 slot)
+uniform vec3 u_minRGB;      // RGB mode per-channel interval (M4 slot); trilogy: black points x0
 uniform vec3 u_maxRGB;
 uniform float u_opacity;    // crossfade-in ramp (1 = fully settled); scales alpha
+uniform float u_trilogyK;   // trilogy softening (mode 3); solved on the host from noiselum
+uniform float u_trilogyLsat;// trilogy RGB: bias-subtracted luminance mapping to 1
 
 const float LOG_A = ${glslFloat(LOG_SOFTENING)};
 const float ASINH_A = ${glslFloat(ASINH_SOFTENING)};
@@ -55,19 +57,23 @@ in vec2 v_uv;
 out vec4 outColor;
 
 // Stretch transfer on an already-normalized [0,1] value. Mirrors stretch.ts.
-float applyStretch(float norm) {
+// k is consulted only by trilogy (mode 3); the other modes ignore it.
+float applyStretch(float norm, float k) {
   if (u_stretchMode == 1) {
     return log(LOG_A * norm + 1.0) / log(LOG_A + 1.0);
   } else if (u_stretchMode == 2) {
     return asinh(norm / ASINH_A) / asinh(1.0 / ASINH_A);
+  } else if (u_stretchMode == 3) {
+    if (k <= 0.0) return norm; // k -> 0 limit is linear (avoids 0/0)
+    return log(k * norm + 1.0) / log(k + 1.0);
   }
   return norm; // linear
 }
 
 // Normalize over [lo, hi], clamp, then stretch. Mirrors stretch.ts scaleValue.
-float scaleChannel(float v, float lo, float hi) {
+float scaleChannel(float v, float lo, float hi, float k) {
   float norm = clamp((v - lo) / (hi - lo), 0.0, 1.0);
-  return applyStretch(norm);
+  return applyStretch(norm, k);
 }
 
 void main() {
@@ -83,9 +89,27 @@ void main() {
       outColor = vec4(0.0, 0.0, 0.0, 0.0);
       return;
     }
-    float rs = rn ? 0.0 : scaleChannel(r, u_minRGB.r, u_maxRGB.r);
-    float gs = gn ? 0.0 : scaleChannel(g, u_minRGB.g, u_maxRGB.g);
-    float bs = bn ? 0.0 : scaleChannel(b, u_minRGB.b, u_maxRGB.b);
+    if (u_stretchMode == 3) {
+      // Color-preserving trilogy: bias-subtract each channel by its own black
+      // point (u_minRGB = x0), stretch the shared luminance, then rescale the
+      // triple by z/L so hue/ratios are preserved (decision: shared luminance).
+      float rb = rn ? 0.0 : max(r - u_minRGB.r, 0.0);
+      float gb = gn ? 0.0 : max(g - u_minRGB.g, 0.0);
+      float bb = bn ? 0.0 : max(b - u_minRGB.b, 0.0);
+      float L = (rb + gb + bb) / 3.0;
+      float norm = clamp(L / u_trilogyLsat, 0.0, 1.0);
+      float z = applyStretch(norm, u_trilogyK);
+      float scale = L > 0.0 ? z / L : 0.0;
+      outColor = vec4(
+        clamp(rb * scale, 0.0, 1.0),
+        clamp(gb * scale, 0.0, 1.0),
+        clamp(bb * scale, 0.0, 1.0),
+        u_opacity);
+      return;
+    }
+    float rs = rn ? 0.0 : scaleChannel(r, u_minRGB.r, u_maxRGB.r, u_trilogyK);
+    float gs = gn ? 0.0 : scaleChannel(g, u_minRGB.g, u_maxRGB.g, u_trilogyK);
+    float bs = bn ? 0.0 : scaleChannel(b, u_minRGB.b, u_maxRGB.b, u_trilogyK);
     outColor = vec4(rs, gs, bs, u_opacity);
     return;
   }
@@ -96,7 +120,7 @@ void main() {
     outColor = vec4(0.0, 0.0, 0.0, 0.0);
     return;
   }
-  float s = scaleChannel(v, u_min, u_max);
+  float s = scaleChannel(v, u_min, u_max, u_trilogyK);
   if (u_useColormap == 1) {
     // Sample the LUT along its width at the row centre; CLAMP_TO_EDGE pins the
     // [0,1] endpoints to the first/last texel.
