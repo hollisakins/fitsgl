@@ -221,7 +221,6 @@ def render_toml(plan: InitPlan, config_dir: Path) -> str:
         "[build]",
         "quantize_level = 8",
         "tile_size = 256",
-        "# processes = 0   # 0 = auto (one worker per level, capped at cpu count)",
         "",
         "[viewer]",
         'default = "single"',

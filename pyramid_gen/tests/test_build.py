@@ -108,6 +108,12 @@ def test_build_dataset_end_to_end(tmp_path):
     }
 
 
+def test_build_cli_rejects_bad_processes():
+    from pyramid_gen.cli import main
+
+    assert main(["build", "--processes", "0"]) == 2  # validated before any IO
+
+
 def test_build_single_band_default_and_rerun(tmp_path):
     _write_band(tmp_path, "img", 1)
     config = load_config(_toml(tmp_path, [("img", "img.fits")]))

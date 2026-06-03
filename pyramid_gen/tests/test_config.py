@@ -54,7 +54,7 @@ def test_parses_a_valid_rgb_config(tmp_path):
     assert cfg.title == "COSMOS"
     assert [b.name for b in cfg.bands] == ["a", "b", "c"]
     assert cfg.bands[0].input.name == "a.fits" and cfg.bands[0].input.is_absolute()
-    assert cfg.build.quantize_level == 16 and cfg.build.tile_size == 128 and cfg.build.processes == 0
+    assert cfg.build.quantize_level == 16 and cfg.build.tile_size == 128
     assert cfg.viewer.mode == "rgb"
     assert (cfg.viewer.r, cfg.viewer.g, cfg.viewer.b) == ("a", "b", "c")
     assert cfg.viewer.stretch == "asinh" and cfg.viewer.north_up is True

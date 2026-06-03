@@ -43,8 +43,6 @@ class BuildSpec:
 
     quantize_level: int = 8
     tile_size: int = 256
-    #: 0 (or omitted) means auto (one worker per level, capped at cpu count).
-    processes: int = 0
 
 
 @dataclass
@@ -156,14 +154,13 @@ def _parse_build(raw: object) -> BuildSpec:
     _require(isinstance(raw, dict), "[build] must be a table")
     assert isinstance(raw, dict)
     out = BuildSpec()
-    for key in ("quantize_level", "tile_size", "processes"):
+    for key in ("quantize_level", "tile_size"):
         if key in raw:
             v = raw[key]
             _require(isinstance(v, int) and not isinstance(v, bool), f"[build].{key} must be an integer")
             setattr(out, key, v)
     _require(out.quantize_level > 0, "[build].quantize_level must be positive")
     _require(out.tile_size > 0, "[build].tile_size must be positive")
-    _require(out.processes >= 0, "[build].processes must be >= 0 (0 = auto)")
     return out
 
 

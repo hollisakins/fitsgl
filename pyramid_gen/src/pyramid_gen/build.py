@@ -31,15 +31,20 @@ class BuildResult:
 
 
 def build_dataset(
-    config: DatasetConfig, out_root: str | Path, *, on_progress: Callable[[str], None] | None = None
+    config: DatasetConfig,
+    out_root: str | Path,
+    *,
+    processes: int | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> BuildResult:
     """Build the whole dataset described by ``config`` under ``out_root``.
 
     Produces ``out_root/<dataset.name>/`` containing one ``<band>/`` pyramid per
     band, an optional ``catalog.csv``, and ``fitsgl.json``. Re-runnable: an
     existing dataset directory is replaced atomically only after the new one is
-    fully built. ``on_progress`` (if given) is called with human-readable status
-    lines as each band + level builds; defaults to silent.
+    fully built. ``processes`` caps the per-level worker pool (None = auto, one per
+    level up to the cpu count). ``on_progress`` (if given) is called with
+    human-readable status lines as each band + level builds; defaults to silent.
     """
     log = on_progress if on_progress is not None else (lambda _msg: None)
     out_root = Path(out_root)
@@ -52,7 +57,6 @@ def build_dataset(
     tmp_dir.mkdir(parents=True)
 
     try:
-        processes = None if config.build.processes == 0 else config.build.processes
         band_levels: dict[str, int] = {}
         total = len(config.bands)
         for i, band in enumerate(config.bands, 1):

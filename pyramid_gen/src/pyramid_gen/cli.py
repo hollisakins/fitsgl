@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("dist"),
         help="Output root; the dataset is written to <out>/<dataset.name>/ (default: ./dist).",
     )
+    pb.add_argument(
+        "-p",
+        "--processes",
+        type=int,
+        default=None,
+        help="Worker processes for level building (default: auto, one per level capped at cpu count).",
+    )
 
     ps = sub.add_parser("serve", help="Serve a built dataset directory over HTTP with byte-range support.")
     ps.add_argument("dataset_dir", type=Path, help="Dataset directory to serve (e.g. dist/<name>).")
@@ -81,6 +88,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
+    if args.processes is not None and args.processes < 1:
+        print("fitsgl build: --processes must be >= 1", file=sys.stderr)
+        return 2
     try:
         config = load_config(args.config)
     except (FileNotFoundError, ValueError) as e:
@@ -88,7 +98,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        result = build_dataset(config, args.out, on_progress=lambda m: print(m, flush=True))
+        result = build_dataset(
+            config, args.out, processes=args.processes, on_progress=lambda m: print(m, flush=True)
+        )
     except StopAndAsk as e:
         print(f"fitsgl build: STOP: {e}", file=sys.stderr)
         return 3
