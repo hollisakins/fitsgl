@@ -11,8 +11,14 @@
  */
 
 // Manifest
-export { loadManifest, validateManifest, resolveLevelUrl, SUPPORTED_MANIFEST_VERSION } from './manifest.js';
-export type { Manifest, LevelInfo } from './manifest.js';
+export {
+  loadManifest,
+  validateManifest,
+  resolveLevelUrl,
+  resolveSupertile,
+  SUPPORTED_MANIFEST_VERSION,
+} from './manifest.js';
+export type { Manifest, LevelInfo, SupertileInfo, SupertileMatch } from './manifest.js';
 
 // High-level tile access (façade) + a custom-fetch hook for hosts.
 export { TilePyramid } from './fpack/tile-source.js';

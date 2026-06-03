@@ -43,6 +43,8 @@ function manifest(opts: {
     fpack_tile_count: tc,
     pixel_scale_arcsec: 0.03 * 2 ** z,
     wcs: z === 0 ? wcs : {},
+    // Single full-grid supertile (tc is [ny, nx]; tile_count is [nx, ny]).
+    supertiles: [{ filename: `b_z${z}.fits.fz`, tile_origin: [0, 0], tile_count: [tc[1], tc[0]] }],
   }));
   return {
     version: 1,

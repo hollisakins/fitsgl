@@ -443,6 +443,7 @@ describe('buildLevelGeoms', () => {
           fpack_tile_count: [2, 2],
           pixel_scale_arcsec: 0.03,
           wcs: {},
+          supertiles: [{ filename: 'm_z0.fits.fz', tile_origin: [0, 0], tile_count: [2, 2] }],
         },
         {
           z: 1,
@@ -453,6 +454,7 @@ describe('buildLevelGeoms', () => {
           fpack_tile_count: [1, 1],
           pixel_scale_arcsec: 0.06,
           wcs: {},
+          supertiles: [{ filename: 'm_z1.fits.fz', tile_origin: [0, 0], tile_count: [1, 1] }],
         },
       ],
     };

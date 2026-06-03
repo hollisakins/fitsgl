@@ -13,7 +13,7 @@
  * modes present the identical async `getTile` contract.
  */
 
-import { loadManifest, resolveLevelUrl, type Manifest } from '../manifest.js';
+import { loadManifest, resolveLevelUrl, resolveSupertile, type Manifest } from '../manifest.js';
 import { LRUCache } from '../lru.js';
 import { FpackFile, httpRangeFetch, type RangeFetcher } from './fpack-file.js';
 import { tileBlobKey, fingerprintManifest, type BlobStore } from './blob-store.js';
@@ -59,7 +59,8 @@ export class TileEngine {
   private readonly manifestUrl: string;
   private readonly manifest: Manifest;
   private readonly rangeFetch: RangeFetcher;
-  private readonly files = new Map<number, Promise<FpackFile>>();
+  /** One open `FpackFile` per supertile, keyed by its resolved URL. */
+  private readonly files = new Map<string, Promise<FpackFile>>();
   private readonly cache: LRUCache<string, Float32Array>;
   private readonly inflight = new Map<string, Promise<Float32Array>>();
   /** Persistent compressed-tile (disk) tier, or null when disabled/unavailable. */
@@ -110,19 +111,36 @@ export class TileEngine {
     return this.manifest;
   }
 
-  private fileForLevel(level: number): Promise<FpackFile> {
-    const existing = this.files.get(level);
-    if (existing !== undefined) return existing;
+  /**
+   * Resolve a global tile to the supertile file that holds it plus its
+   * supertile-local coordinates, opening (and memoizing) that `FpackFile`. For a
+   * v1 / single-supertile level this is the whole level file and local == global.
+   */
+  private async fileForTile(
+    level: number,
+    tileX: number,
+    tileY: number,
+  ): Promise<{ file: FpackFile; localX: number; localY: number }> {
     const lvl = this.manifest.levels.find((l) => l.z === level);
     if (lvl === undefined) {
-      return Promise.reject(new Error(`TileEngine: no level z=${level} in manifest`));
+      throw new Error(`TileEngine: no level z=${level} in manifest`);
     }
-    const url = resolveLevelUrl(this.manifestUrl, lvl.filename);
-    const opened = FpackFile.open(url, this.rangeFetch);
-    this.files.set(level, opened);
-    // If opening fails, drop the cached rejected promise so a retry can re-open.
-    opened.catch(() => this.files.delete(level));
-    return opened;
+    const match = resolveSupertile(lvl, tileX, tileY);
+    if (match === undefined) {
+      throw new Error(
+        `TileEngine: tile (${tileX}, ${tileY}) is out of range — no supertile of level z=${level} covers it`,
+      );
+    }
+    const url = resolveLevelUrl(this.manifestUrl, match.supertile.filename);
+    let opened = this.files.get(url);
+    if (opened === undefined) {
+      opened = FpackFile.open(url, this.rangeFetch);
+      this.files.set(url, opened);
+      // If opening fails, drop the cached rejected promise so a retry can re-open.
+      opened.catch(() => this.files.delete(url));
+    }
+    const file = await opened;
+    return { file, localX: match.localX, localY: match.localY };
   }
 
   async getTile(
@@ -140,12 +158,14 @@ export class TileEngine {
     if (pending !== undefined) return pending;
 
     const promise = (async () => {
-      const file = await this.fileForLevel(level);
+      // Resolve which supertile holds this global tile and its file-local coords;
+      // every fpack read below is in the supertile's own grid.
+      const { file, localX, localY } = await this.fileForTile(level, tileX, tileY);
       // Decode params come from the (cached) tile index; the compressed bytes come
       // from the disk tier when present, else the network. One decode path, fed by
       // {disk | network} — bit-identical either way.
-      const params = await file.tileDecodeParams(tileX, tileY);
-      const bytes = await this.compressedBytes(file, level, tileX, tileY, signal);
+      const params = await file.tileDecodeParams(localX, localY);
+      const bytes = await this.compressedBytes(file, level, tileX, tileY, localX, localY, signal);
       // Cancelled mid-fetch? Don't spend a decode-pool slot on an abandoned tile.
       signal?.throwIfAborted();
       const tile = await this.decoder.decode(bytes, params);
@@ -170,9 +190,13 @@ export class TileEngine {
     level: number,
     tileX: number,
     tileY: number,
+    localX: number,
+    localY: number,
     signal?: AbortSignal,
   ): Promise<Uint8Array> {
-    if (this.blobStore === null) return file.fetchCompressedTile(tileX, tileY, signal);
+    // The blob-cache key is the GLOBAL (level, x, y) so it is stable across
+    // supertile layouts; the fetch is in the file's LOCAL coords.
+    if (this.blobStore === null) return file.fetchCompressedTile(localX, localY, signal);
     const blobKey = tileBlobKey(this.fingerprint, level, tileX, tileY);
     try {
       const hit = await this.blobStore.get(blobKey);
@@ -180,7 +204,7 @@ export class TileEngine {
     } catch {
       // disk read failed — fall through to the network
     }
-    const fetched = await file.fetchCompressedTile(tileX, tileY, signal);
+    const fetched = await file.fetchCompressedTile(localX, localY, signal);
     // Fire-and-forget write-through; never let a cache write fail a tile load.
     this.blobStore.put(blobKey, fetched).catch(() => undefined);
     return fetched;
