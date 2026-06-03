@@ -151,17 +151,27 @@ arbitrary byte ranges as `206` from that cached copy — *provided the origin se
 cached and is served from R2 origin instead — it still works (R2→Cloudflare egress
 is free), it just isn't edge-accelerated.
 
-Consequence for a real survey: the coarse levels are tiny and cache perfectly, but
-the **full-resolution `z0` level file can exceed 512 MB** on a large mosaic, so its
-tiles would stream from R2 rather than the edge on non-Enterprise plans. This is a
-performance/cost note, not a correctness bug — and coarse-to-fine loading hides the
-latency since `z0` is the most-zoomed-in, least-aggregate-traffic level. Mitigation
-if it matters: **Cache Reserve** (a paid, R2-backed persistent upper-tier cache;
-eligibility needs `Content-Length` + a freshness TTL ≥ 10 h, both of which our
-headers satisfy). **`verify` measures this per level** — it should report
-`CF-Cache-Status: HIT` on a coarse tile; a `MISS` on `z0` flags the size limit so
-you can decide on Cache Reserve. (Object > 5 GiB also forces a multipart upload —
-§6.)
+Consequence for a real survey: coarse levels are tiny and cache perfectly, but the
+deepest levels of a large mosaic exceed 512 MB. For COSMOS-Web (~90k²), **both `z0`
+(~6 GB) and `z1` (~1.5 GB) exceed the cap** (`z≥2` ≤ ~374 MB caches fine); the
+threshold is ~26k×26k. Their tiles stream from R2 rather than the edge on
+non-Enterprise plans — still correct (R2→Cloudflare egress is free), just not
+edge-accelerated, and coarse-to-fine loading hides the latency since these are the
+deepest, least-aggregate-traffic levels.
+
+**Cache Reserve does *not* rescue this** — verified: its docs state "CDN cache
+limits still apply," so the 512 MB edge cap gates it too; and Enterprise's 5 GB
+default doesn't even cover COSMOS-Web's `z0`. No CDN-layer config (Tiered Cache,
+Cache Everything, Cache Reserve, Workers Cache API) caches a single >512 MB object.
+
+**The real fix is `supertile-design.md`** — chunk over-cap levels into ≤512 MB
+standalone `.fits.fz` supertiles, each independently edge-cacheable. That is a
+generator change; deploy itself is unaffected (its classifier already treats every
+`*.fits.fz` as a cacheable object, so a chunked level is just more objects). Until
+supertiles land, large datasets' deepest 1–2 levels origin-serve (acceptable per
+above). **`verify` measures this per level** — `CF-Cache-Status: HIT` on a coarse
+tile; a `MISS` on a deep level flags an over-cap object. (An object > 5 GiB also
+forces a multipart upload — §6.)
 
 ### 4.4 The one required setup step: a Cache Rule
 
