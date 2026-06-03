@@ -108,6 +108,14 @@ def test_build_dataset_end_to_end(tmp_path):
     }
 
 
+def test_build_with_verify_off(tmp_path):
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    result = build_dataset(config, tmp_path / "dist", verify=False)
+    assert (result.dataset_dir / "fitsgl.json").is_file()
+    assert (result.dataset_dir / "img" / "manifest.json").is_file()
+
+
 def test_build_cli_rejects_bad_processes():
     from pyramid_gen.cli import main
 

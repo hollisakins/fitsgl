@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Worker processes for level building (default: auto, one per level capped at cpu count).",
     )
+    pb.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip the per-level read-back verification (a second full decode per "
+        "level); use for very large mosaics where memory is the constraint.",
+    )
 
     ps = sub.add_parser("serve", help="Serve a built dataset directory over HTTP with byte-range support.")
     ps.add_argument("dataset_dir", type=Path, help="Dataset directory to serve (e.g. dist/<name>).")
@@ -99,7 +105,11 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
     try:
         result = build_dataset(
-            config, args.out, processes=args.processes, on_progress=lambda m: print(m, flush=True)
+            config,
+            args.out,
+            processes=args.processes,
+            verify=not args.no_verify,
+            on_progress=lambda m: print(m, flush=True),
         )
     except StopAndAsk as e:
         print(f"fitsgl build: STOP: {e}", file=sys.stderr)

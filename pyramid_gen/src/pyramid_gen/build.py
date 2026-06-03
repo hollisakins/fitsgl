@@ -35,6 +35,7 @@ def build_dataset(
     out_root: str | Path,
     *,
     processes: int | None = None,
+    verify: bool = True,
     on_progress: Callable[[str], None] | None = None,
 ) -> BuildResult:
     """Build the whole dataset described by ``config`` under ``out_root``.
@@ -43,8 +44,10 @@ def build_dataset(
     band, an optional ``catalog.csv``, and ``fitsgl.json``. Re-runnable: an
     existing dataset directory is replaced atomically only after the new one is
     fully built. ``processes`` caps the per-level worker pool (None = auto, one per
-    level up to the cpu count). ``on_progress`` (if given) is called with
-    human-readable status lines as each band + level builds; defaults to silent.
+    level up to the cpu count). ``verify`` (default True) reads each level back to
+    check the lossy round-trip; set False to skip that second full decode per level
+    on very large mosaics. ``on_progress`` (if given) is called with human-readable
+    status lines as each band + level builds; defaults to silent.
     """
     log = on_progress if on_progress is not None else (lambda _msg: None)
     out_root = Path(out_root)
@@ -67,6 +70,7 @@ def build_dataset(
                 tile_size=config.build.tile_size,
                 quantize_level=config.build.quantize_level,
                 processes=processes,
+                verify=verify,
                 on_progress=lambda m: log(f"    {m}"),
             )
             band_levels[band.name] = manifest.n_levels

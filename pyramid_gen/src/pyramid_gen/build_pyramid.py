@@ -85,9 +85,10 @@ def _downsample(data: np.ndarray, factor: int) -> np.ndarray:
     NaN (the expected RuntimeWarning is suppressed).
     """
     if factor == 1:
-        # Copy (not asarray) so the z=0 level is a writable array independent of a
-        # read-only memmap input.
-        return np.array(data, dtype=np.float32)
+        # No copy: pass the (copy-on-write memmap) native array straight through.
+        # Nothing downstream mutates it, and avoiding a full copy matters at z=0,
+        # where the array can be many GB.
+        return np.asarray(data, dtype=np.float32)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         reduced = block_reduce(data, factor, func=np.nanmean)
@@ -163,18 +164,36 @@ def _verify_roundtrip(original: np.ndarray, readback: np.ndarray, z: int) -> Non
     Every level is lossy RICE_1 q=8 (display-only). The NaN mask must round-trip
     exactly (no finite<->NaN leakage), and finite pixels must match within the
     quantization tolerance (~one noise sigma; the q=8 step is ~sigma/8).
+
+    Done in row-blocks so a multi-GB level never materializes full-image
+    boolean-index temporaries (``original[finite]`` etc.), which would multiply
+    peak memory several-fold. The tolerance is estimated from a strided subsample
+    of the data — a robust MAD estimate needs only a sample, not every pixel.
     """
-    if not np.array_equal(np.isnan(original), np.isnan(readback)):
+    if original.shape != readback.shape:
+        raise RuntimeError(f"z={z}: round-trip shape {readback.shape} != {original.shape}")
+
+    flat = np.asarray(original).reshape(-1)
+    stride = max(1, flat.size // 1_000_000)
+    atol = quant_atol(flat[::stride])
+
+    cols = original.shape[1]
+    block = max(1, 8_000_000 // max(1, cols))  # ~8M pixels per row-block
+    max_err = 0.0
+    for r0 in range(0, original.shape[0], block):
+        o = np.asarray(original[r0 : r0 + block], dtype=np.float32)
+        b = np.asarray(readback[r0 : r0 + block], dtype=np.float32)
+        o_nan = np.isnan(o)
+        if not np.array_equal(o_nan, np.isnan(b)):
+            raise RuntimeError(f"z={z}: NaN mask changed on round-trip (NaN handling broken)")
+        finite = ~o_nan
+        if finite.any():
+            err = np.abs(o[finite] - b[finite])
+            if err.size:
+                max_err = max(max_err, float(err.max()))
+    if max_err > atol:
         raise RuntimeError(
-            f"z={z}: NaN mask changed on round-trip (NaN handling broken)"
-        )
-    finite = np.isfinite(original)
-    atol = quant_atol(original)
-    if not np.allclose(original[finite], readback[finite], rtol=0.0, atol=atol):
-        max_err = float(np.max(np.abs(original[finite] - readback[finite])))
-        raise RuntimeError(
-            f"z={z}: lossy round-trip exceeded tolerance "
-            f"(max_err={max_err:.6g} > atol={atol:.6g})"
+            f"z={z}: lossy round-trip exceeded tolerance (max_err={max_err:.6g} > atol={atol:.6g})"
         )
 
 
@@ -256,6 +275,7 @@ class _LevelTask:
     quantize_level: int
     native_npy: str  # path to a .npy of the native array; workers mmap it (shared)
     header: fits.Header
+    verify: bool = True
 
 
 def _check_descriptor_overflow(bintable_header: fits.Header, z: int) -> None:
@@ -288,11 +308,12 @@ def _build_level(task: _LevelTask) -> dict:
     Every level is a display-only RICE_1 + SUBTRACTIVE_DITHER_2 tile set (q=8);
     there is no lossless level (the raw mosaic is distributed separately).
 
-    The native array is read via a read-only memory-map of the shared ``.npy``
+    The native array is read via a copy-on-write memory-map of the shared ``.npy``
     (``native_npy``), so every level worker shares one copy through the OS page
-    cache rather than receiving a pickled copy of the full mosaic.
+    cache rather than receiving a pickled copy of the full mosaic (mode ``c`` so
+    reads stay shared but the array still presents as writable to astropy).
     """
-    native = np.load(task.native_npy, mmap_mode="r")
+    native = np.load(task.native_npy, mmap_mode="c")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -313,10 +334,13 @@ def _build_level(task: _LevelTask) -> dict:
     )
     fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(task.out_path, overwrite=True)
 
-    # Read back and verify before declaring the level good.
-    with fits.open(task.out_path) as hdul:
-        readback = np.asarray(hdul[1].data)
-    _verify_roundtrip(level, readback, task.z)
+    # Read back and verify before declaring the level good. This fully re-decodes
+    # the level (a second full-size array), so it is skippable (build verify=False)
+    # for very large mosaics where memory is the constraint.
+    if task.verify:
+        with fits.open(task.out_path) as hdul:
+            readback = np.asarray(hdul[1].data)
+        _verify_roundtrip(level, readback, task.z)
 
     # Read the ACTUAL compression keyword so the manifest hint can never drift
     # from the file. ZCMPTYPE lives in the compressed bintable header; while it's
@@ -349,6 +373,7 @@ def build_pyramid(
     tile_size: int = FPACK_TILE_SIZE,
     quantize_level: int = DEFAULT_QUANTIZE_LEVEL,
     processes: int | None = None,
+    verify: bool = True,
     on_progress: Callable[[str], None] | None = None,
 ) -> Manifest:
     """Build a multi-resolution fpacked pyramid from one FITS mosaic.
@@ -365,6 +390,11 @@ def build_pyramid(
         RICE_1 quantization level applied to every level (default 8).
     processes
         Worker process count. Defaults to one per level (capped at cpu count).
+    verify
+        Read each written level back and check the lossy round-trip (NaN mask +
+        quantization tolerance). Default True; set False to skip the second full
+        decode per level on very large mosaics where memory is the constraint (the
+        cheap heap-overflow header check still runs).
     on_progress
         Optional callback invoked with human-readable progress lines (input read,
         levels building, each level as it completes). Defaults to silent.
@@ -409,6 +439,7 @@ def build_pyramid(
                 quantize_level=quantize_level,
                 native_npy=str(native_npy),
                 header=header,
+                verify=verify,
             )
             for z in range(N + 1)
         ]
@@ -416,13 +447,14 @@ def build_pyramid(
         # One process per level -- CompImageHDU writing is not thread-safe within a
         # level, and levels are fully independent, so process-per-level is the clean
         # parallel unit. Single level -> run inline to avoid Pool overhead.
+        vnote = "" if verify else " · verify off"
         if len(tasks) == 1:
-            report("building 1 level (z=0) …")
+            report("building 1 level (z=0) …" + vnote)
             level_dicts = [_build_level(tasks[0])]
             report(f"  z0 done — {level_dicts[0]['shape'][0]}×{level_dicts[0]['shape'][1]}")
         else:
             n_proc = processes or min(len(tasks), os.cpu_count() or 1)
-            report(f"building {len(tasks)} levels (z=0..{N}) on {n_proc} worker(s) …")
+            report(f"building {len(tasks)} levels (z=0..{N}) on {n_proc} worker(s) …" + vnote)
             # imap_unordered so each level reports as it finishes (the largest, z=0,
             # is last); results are collected then sorted by z below, so order holds.
             level_dicts = []
