@@ -50,3 +50,35 @@ def write_catalog_csv(catalog: pd.DataFrame, path: str | Path) -> Path:
         f.write(f"# fitsgl-catalog v{CATALOG_VERSION}\n")
         df.to_csv(f, index=False, float_format="%.17g", na_rep="nan")
     return path
+
+
+def read_catalog_csv(path: str | Path) -> pd.DataFrame:
+    """Read a catalog CSV, skipping any leading ``# ...`` comment line(s).
+
+    Tolerates the ``# fitsgl-catalog v1`` version line this module writes, as well
+    as a bare CSV with no comment. The header row (column names) is preserved.
+    """
+    return pd.read_csv(path, comment="#")
+
+
+def ingest_catalog(src: str | Path, dest: str | Path) -> Path:
+    """Validate a producer-supplied catalog CSV and write it canonically to ``dest``.
+
+    v1 accepts a CSV already in (or near) the M3 overlay schema: it must carry an
+    ICRS ``ra``+``dec`` pair OR a pixel ``x``+``y`` pair (ra/dec is authoritative;
+    x/y is pixel placement). The file is re-emitted through :func:`write_catalog_csv`
+    so the output is canonical (version line, known-column order, synthesized ``id``).
+    Raises ``ValueError`` at build time — so a producer learns immediately, rather
+    than the browser silently dropping every unplaceable row.
+    """
+    src = Path(src)
+    if not src.is_file():
+        raise FileNotFoundError(f"catalog not found: {src}")
+    df = read_catalog_csv(src)
+    cols = {str(c).strip().lower() for c in df.columns}
+    if not ({"ra", "dec"} <= cols or {"x", "y"} <= cols):
+        raise ValueError(
+            f"catalog {src}: needs an 'ra'+'dec' or 'x'+'y' column pair to place markers "
+            f"(got columns: {sorted(df.columns)})"
+        )
+    return write_catalog_csv(df, dest)
