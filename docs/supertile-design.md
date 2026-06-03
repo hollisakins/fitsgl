@@ -295,9 +295,12 @@ COSMOS-Web tiles and lock `K`.
 
 ## 10. Open / empirical items
 
-- **Default `K`** — finalize after measuring real COSMOS-Web `.fits.fz` tile sizes
-  (the ~47 KB figure is from demo/noise data).
+- **Default `K`** — shipped at **48** (`build_pyramid.DEFAULT_SUPERTILE_BLOCKS`),
+  overridable via `[build].supertile_blocks`. 48 stays under the 512 MB cap even in
+  the worst (lossless-fallback) case and is ~100 MB on real noise data; it remains
+  *provisional* — re-tune once real COSMOS-Web tiles can be measured (the ~47 KB
+  figure is from demo/noise data), trading cold-start fetch size against object count.
 - **Whether to ever auto-subdivide** an over-budget block (SP6) vs. just erroring —
   defer until/unless real data trips it.
-- **Multi-input config ergonomics** — list of paths vs. glob vs. a per-band
-  `tiles = "…/*.fits"`; pick during implementation.
+- **Multi-input config ergonomics** — resolved: a band's `input` accepts a path, a
+  list, or a glob (`config._resolve_band_inputs`).

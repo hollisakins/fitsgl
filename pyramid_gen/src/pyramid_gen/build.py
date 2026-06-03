@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .build_pyramid import build_pyramid
+from .build_pyramid import DEFAULT_SUPERTILE_BLOCKS, build_pyramid
 from .catalog import ingest_catalog
 from .config import DatasetConfig
 from .fitsgl_config import build_fitsgl_config, default_view_dict
@@ -81,6 +81,11 @@ def build_dataset(
                 stem=band.name if multi else None,
                 tile_size=config.build.tile_size,
                 quantize_level=config.build.quantize_level,
+                supertile_blocks=(
+                    config.build.supertile_blocks
+                    if config.build.supertile_blocks is not None
+                    else DEFAULT_SUPERTILE_BLOCKS
+                ),
                 processes=processes,
                 verify=verify,
                 on_progress=lambda m: log(f"    {m}"),

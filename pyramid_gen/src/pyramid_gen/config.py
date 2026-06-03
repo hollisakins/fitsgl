@@ -78,6 +78,9 @@ class BuildSpec:
 
     quantize_level: int = 8
     tile_size: int = 256
+    #: Max render-tiles per side per supertile file. ``None`` → the builder's default
+    #: (``build_pyramid.DEFAULT_SUPERTILE_BLOCKS``); set to override.
+    supertile_blocks: int | None = None
 
 
 @dataclass
@@ -241,13 +244,17 @@ def _parse_build(raw: object) -> BuildSpec:
     _require(isinstance(raw, dict), "[build] must be a table")
     assert isinstance(raw, dict)
     out = BuildSpec()
-    for key in ("quantize_level", "tile_size"):
+    for key in ("quantize_level", "tile_size", "supertile_blocks"):
         if key in raw:
             v = raw[key]
             _require(isinstance(v, int) and not isinstance(v, bool), f"[build].{key} must be an integer")
             setattr(out, key, v)
     _require(out.quantize_level > 0, "[build].quantize_level must be positive")
     _require(out.tile_size > 0, "[build].tile_size must be positive")
+    _require(
+        out.supertile_blocks is None or out.supertile_blocks >= 1,
+        "[build].supertile_blocks must be >= 1",
+    )
     return out
 
 

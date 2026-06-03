@@ -146,6 +146,22 @@ def test_build_dataset_with_pretiled_band(tmp_path):
     assert cfg["dataset"]["bands"][0]["tiles"] == ["f277w/manifest.json"]
 
 
+def test_build_dataset_supertile_blocks_knob(tmp_path):
+    """[build].supertile_blocks flows through build_dataset and drives chunking."""
+    img, hdr, _ = generate_synthetic_mosaic(shape=(512, 512), n_sources=12, seed=5)
+    fits.PrimaryHDU(data=img, header=hdr).writeto(tmp_path / "big.fits", overwrite=True)
+    toml = tmp_path / "fitsgl.toml"
+    toml.write_text(
+        '[dataset]\nname = "demo"\n'
+        '[[dataset.bands]]\nname = "big"\ninput = "big.fits"\n'
+        "[build]\nsupertile_blocks = 1\n"
+    )
+    result = build_dataset(load_config(toml), tmp_path / "dist")
+    m = read_manifest(result.dataset_dir / "big" / "manifest.json")
+    # z=0 is a 2×2 tile grid; supertile_blocks=1 splits it into four 1×1 supertiles.
+    assert len(m.levels[0].supertiles) == 4
+
+
 def test_build_with_verify_off(tmp_path):
     _write_band(tmp_path, "img", 1)
     config = load_config(_toml(tmp_path, [("img", "img.fits")]))

@@ -117,6 +117,19 @@ def test_band_input_glob_no_match_raises(tmp_path):
         load_config(p)
 
 
+def test_build_supertile_blocks_knob(tmp_path):
+    touch(tmp_path, "a.fits")
+    base = '[dataset]\nname = "x"\n[[dataset.bands]]\nname = "a"\ninput = "a.fits"\n'
+    # Default: None -> the builder picks its own default.
+    assert load_config(write_toml(tmp_path, base)).build.supertile_blocks is None
+    # Explicit override parses.
+    cfg = load_config(write_toml(tmp_path, base + "[build]\nsupertile_blocks = 32\n"))
+    assert cfg.build.supertile_blocks == 32
+    # Must be >= 1.
+    with pytest.raises(ValueError, match="supertile_blocks"):
+        load_config(write_toml(tmp_path, base + "[build]\nsupertile_blocks = 0\n"))
+
+
 def test_band_input_list_missing_file_raises(tmp_path):
     touch(tmp_path, "t1.fits")
     p = write_toml(
