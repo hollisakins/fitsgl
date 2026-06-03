@@ -72,6 +72,14 @@ def compute_band_histogram(
     from pathlib import Path
 
     level = _choose_level(manifest, pixel_cap)
-    with fits.open(Path(band_dir) / level.filename) as hdul:
-        data = np.asarray(_image_hdu(hdul).data, dtype=np.float32)
+    # A coarse level (≤ pixel_cap) is normally one supertile, but read every supertile
+    # so the histogram is correct even if the chosen level happens to be chunked. The
+    # histogram is over pixel VALUES, so spatial layout (origins) is irrelevant — just
+    # concatenate the finite samples.
+    values: list[np.ndarray] = []
+    for st in level.supertiles:
+        with fits.open(Path(band_dir) / st.filename) as hdul:
+            arr = np.asarray(_image_hdu(hdul).data, dtype=np.float32).reshape(-1)
+        values.append(arr[np.isfinite(arr)])
+    data = values[0] if len(values) == 1 else np.concatenate(values)
     return histogram_dict(data, bins)

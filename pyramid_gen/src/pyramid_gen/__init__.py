@@ -16,7 +16,7 @@ from .build_pyramid import (
     build_pyramid,
     n_levels,
 )
-from .manifest import LevelInfo, Manifest, read_manifest, write_manifest
+from .manifest import LevelInfo, Manifest, SupertileInfo, read_manifest, write_manifest
 
 __all__ = [
     "FPACK_TILE_SIZE",
@@ -24,6 +24,7 @@ __all__ = [
     "n_levels",
     "LevelInfo",
     "Manifest",
+    "SupertileInfo",
     "read_manifest",
     "write_manifest",
 ]

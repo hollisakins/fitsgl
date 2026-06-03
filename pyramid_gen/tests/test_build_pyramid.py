@@ -8,6 +8,7 @@ from astropy.wcs import WCS
 from pyramid_gen.build_pyramid import (
     StopAndAsk,
     _downsample,
+    _supertile_blocks,
     build_pyramid,
     estimate_noise,
     n_levels,
@@ -297,6 +298,92 @@ def test_same_native_shape_bands_share_per_level_geometry(tmp_path):
     assert [lvl.fpack_tile_count for lvl in ma.levels] == [
         lvl.fpack_tile_count for lvl in mb.levels
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Supertiles (chunking) — docs/supertile-design.md slice 2
+# --------------------------------------------------------------------------- #
+def test_supertile_partition_disjoint_cover():
+    # A grid that fits in one block is the degenerate single supertile.
+    assert _supertile_blocks(3, 2, 8) == [(0, 0, 3, 2)]
+    # A 5×3 grid at k=2 partitions into disjoint blocks with smaller edge blocks.
+    blocks = _supertile_blocks(5, 3, 2)
+    covered: set[tuple[int, int]] = set()
+    for tx0, ty0, snx, sny in blocks:
+        for ty in range(ty0, ty0 + sny):
+            for tx in range(tx0, tx0 + snx):
+                assert (tx, ty) not in covered  # disjoint
+                covered.add((tx, ty))
+    assert covered == {(tx, ty) for ty in range(3) for tx in range(5)}  # full cover
+    assert (4, 0, 1, 2) in blocks  # right edge: 1 wide, 2 tall
+    assert (0, 2, 2, 1) in blocks  # bottom edge: 2 wide, 1 tall
+
+
+def test_default_single_supertile_per_level(pyramid):
+    """With the default block size a small mosaic emits one supertile per level,
+    byte-compatible with the old layout (filename == the single supertile)."""
+    for lvl in pyramid["manifest"].levels:
+        assert len(lvl.supertiles) == 1
+        st = lvl.supertiles[0]
+        assert st.filename == lvl.filename
+        assert st.tile_origin == [0, 0]
+        # tile_count is [n_tiles_x, n_tiles_y] = reversed fpack_tile_count [ny, nx].
+        assert st.tile_count == [lvl.fpack_tile_count[1], lvl.fpack_tile_count[0]]
+
+
+def test_chunked_level_reassembles_within_tolerance(tmp_path):
+    """A forcibly chunked z=0 partitions disjointly and reassembles to the source
+    (within the q=8 tolerance), with the NaN mask preserved across supertiles."""
+    image, header, _ = generate_synthetic_mosaic(seed=7)  # default 1024×1024
+    src = tmp_path / "m.fits"
+    fits.PrimaryHDU(data=image, header=header).writeto(src, overwrite=True)
+    outdir = tmp_path / "out"
+    m = build_pyramid(src, output_dir=outdir, supertile_blocks=2)
+
+    z0 = m.levels[0]
+    assert len(z0.supertiles) == 4  # 4×4 tile grid / 2×2 blocks
+    covered: set[tuple[int, int]] = set()
+    recon = np.full((1024, 1024), np.nan, dtype=np.float32)
+    for st in z0.supertiles:
+        tx0, ty0 = st.tile_origin
+        snx, sny = st.tile_count
+        assert st.filename == f"m_z0_{tx0}_{ty0}.fits.fz"
+        assert (outdir / st.filename).exists()
+        for ty in range(ty0, ty0 + sny):
+            for tx in range(tx0, tx0 + snx):
+                assert (tx, ty) not in covered
+                covered.add((tx, ty))
+        with fits.open(outdir / st.filename) as hdul:
+            sub = np.asarray(hdul[1].data, dtype=np.float32)
+        recon[ty0 * 256 : ty0 * 256 + sub.shape[0], tx0 * 256 : tx0 * 256 + sub.shape[1]] = sub
+    assert covered == {(tx, ty) for ty in range(4) for tx in range(4)}
+
+    # The level's TOTAL grid metadata is unchanged by chunking.
+    assert z0.fpack_tile_count == [4, 4]
+    assert z0.shape == [1024, 1024]
+    # Reassembled supertiles reproduce the source within the q=8 tolerance, NaNs intact.
+    assert np.array_equal(np.isnan(image), np.isnan(recon))
+    finite = np.isfinite(image) & np.isfinite(recon)
+    sigma = estimate_noise(image)
+    assert np.allclose(image[finite], recon[finite], rtol=0.0, atol=sigma / 4.0)
+
+
+def test_size_budget_over_limit_raises(tmp_path):
+    """A supertile exceeding the byte budget is a build error naming the knob."""
+    # 256×256 → a single level (z=0), so this runs inline (no worker pool).
+    image, header, _ = generate_synthetic_mosaic(shape=(256, 256), seed=11)
+    src = tmp_path / "m.fits"
+    fits.PrimaryHDU(data=image, header=header).writeto(src, overwrite=True)
+    with pytest.raises(RuntimeError, match="supertile_blocks"):
+        build_pyramid(src, output_dir=tmp_path / "out", size_budget_bytes=1)
+
+
+def test_supertile_blocks_must_be_positive(tmp_path):
+    image, header, _ = generate_synthetic_mosaic(shape=(256, 256), seed=12)
+    src = tmp_path / "m.fits"
+    fits.PrimaryHDU(data=image, header=header).writeto(src, overwrite=True)
+    with pytest.raises(ValueError, match="supertile_blocks"):
+        build_pyramid(src, output_dir=tmp_path / "out", supertile_blocks=0)
 
 
 def test_off_by_one_native_shape_diverges_per_level(tmp_path):

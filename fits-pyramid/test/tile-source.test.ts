@@ -11,6 +11,11 @@ import {
   readFixtureFloat32,
   sliceTile,
   firstFloatMismatch,
+  CHUNKED_MANIFEST_URL,
+  chunkedManifestFetch,
+  chunkedRangeFetcher,
+  readChunkedFloat32,
+  firstUlpMismatch,
 } from './helpers.js';
 
 const native = readFixtureFloat32('native.bin');
@@ -59,6 +64,51 @@ describe('TilePyramid (inline engine)', () => {
       }
     }
     expect(firstFloatMismatch(recon, native, 0)).toBe(-1);
+    p.destroy();
+  });
+});
+
+describe('TilePyramid — chunked level (v2 supertiles, real cross-language fixture)', () => {
+  // The chunked fixture is built by the Python pipeline with supertile_blocks=1, so
+  // z=0 (a 2×2 tile grid) is split across four single-tile .fits.fz files. This is
+  // the end-to-end proof that the client resolves a global tile to the right
+  // supertile + local coords AND decodes a real emitter-produced supertile.
+  function chunkedOptions() {
+    return {
+      useWorker: false as const,
+      fetchImpl: chunkedManifestFetch(),
+      rangeFetch: chunkedRangeFetcher().fetch,
+      blobStore: null,
+    };
+  }
+
+  it('parses the v2 manifest: z=0 is four supertiles, z=1 one', async () => {
+    const p = await TilePyramid.load(CHUNKED_MANIFEST_URL, chunkedOptions());
+    const m = p.getManifest();
+    expect(m.version).toBe(2);
+    expect(m.levels[0]!.supertiles.length).toBe(4);
+    expect(m.levels[1]!.supertiles.length).toBe(1);
+    expect(m.levels[0]!.fpack_tile_count).toEqual([2, 2]); // total grid intact
+    p.destroy();
+  });
+
+  it('routes global tile (1,1) to its supertile and decodes it bit-for-bit vs astropy', async () => {
+    const rf = chunkedRangeFetcher();
+    const p = await TilePyramid.load(CHUNKED_MANIFEST_URL, { ...chunkedOptions(), rangeFetch: rf.fetch });
+    // Global tile (1,1) lives in the supertile at tile_origin [1,1], local (0,0).
+    const tile = await p.getTile(0, 1, 1);
+    const expected = readChunkedFloat32('z0_1_1_decoded.bin'); // astropy's q8 decode
+    // RICE+SUBTRACTIVE_DITHER_2 matches astropy to ≤1 ULP (the FMA tolerance).
+    expect(firstUlpMismatch(tile, expected, 1)).toBe(-1);
+    // It fetched from the (1,1) supertile file, not another supertile.
+    expect(rf.calls.some((c) => c.name === 'synthetic_z0_1_1.fits.fz')).toBe(true);
+    expect(rf.calls.some((c) => c.name === 'synthetic_z0_0_0.fits.fz')).toBe(false);
+    p.destroy();
+  });
+
+  it('an out-of-grid tile rejects (no supertile covers it)', async () => {
+    const p = await TilePyramid.load(CHUNKED_MANIFEST_URL, chunkedOptions());
+    await expect(p.getTile(0, 5, 5)).rejects.toThrow(/out of range/i);
     p.destroy();
   });
 });

@@ -13,13 +13,30 @@ import type { RangeFetcher } from '../src/index.js';
 import type { WorkerLike, WorkerScopeLike } from '../src/fpack/worker-protocol.js';
 import type { BlobStore } from '../src/fpack/blob-store.js';
 
-const FIX_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'pyramid2b');
+const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+const FIX_DIR = join(FIXTURES, 'pyramid2b');
+const CHUNKED_FIX_DIR = join(FIXTURES, 'chunked');
 
 export const MANIFEST_URL = 'https://fixtures.test/pyramid2b/manifest.json';
+/** A real v2 (supertiles) pyramid whose z=0 level is split across four files. */
+export const CHUNKED_MANIFEST_URL = 'https://fixtures.test/chunked/manifest.json';
+
+function readBytesFrom(dir: string, name: string): Uint8Array {
+  const buf = readFileSync(join(dir, name));
+  return new Uint8Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+}
 
 export function readFixtureBytes(name: string): Uint8Array {
-  const buf = readFileSync(join(FIX_DIR, name));
-  return new Uint8Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+  return readBytesFrom(FIX_DIR, name);
+}
+
+export function readChunkedBytes(name: string): Uint8Array {
+  return readBytesFrom(CHUNKED_FIX_DIR, name);
+}
+
+export function readChunkedFloat32(name: string): Float32Array {
+  const bytes = readChunkedBytes(name);
+  return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
 }
 
 export function readFixtureFloat32(name: string): Float32Array {
@@ -159,6 +176,37 @@ export function fixtureRangeFetcher(): { fetch: RangeFetcher; calls: Array<{ nam
 /** A fetch impl that returns the committed manifest.json for any URL. */
 export function manifestFetch(): typeof fetch {
   const bytes = readFixtureBytes('manifest.json');
+  return (async () =>
+    new Response(bytes as unknown as BodyInit, {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch;
+}
+
+/** A RangeFetcher served from the committed CHUNKED fixture, keyed by filename. */
+export function chunkedRangeFetcher(): {
+  fetch: RangeFetcher;
+  calls: Array<{ name: string; start: number; end: number }>;
+} {
+  const cache = new Map<string, Uint8Array>();
+  const calls: Array<{ name: string; start: number; end: number }> = [];
+  const fetch: RangeFetcher = async (url, start, end) => {
+    const name = url.split('/').pop()!;
+    calls.push({ name, start, end });
+    let buf = cache.get(name);
+    if (buf === undefined) {
+      buf = readChunkedBytes(name);
+      cache.set(name, buf);
+    }
+    if (start >= buf.length) return new Uint8Array(0);
+    return buf.subarray(start, Math.min(end + 1, buf.length));
+  };
+  return { fetch, calls };
+}
+
+/** A fetch impl returning the chunked fixture's v2 manifest.json for any URL. */
+export function chunkedManifestFetch(): typeof fetch {
+  const bytes = readChunkedBytes('manifest.json');
   return (async () =>
     new Response(bytes as unknown as BodyInit, {
       status: 200,

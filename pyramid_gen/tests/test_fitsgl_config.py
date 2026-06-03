@@ -10,7 +10,7 @@ from pyramid_gen.fitsgl_config import (
     build_fitsgl_config,
     default_view_dict,
 )
-from pyramid_gen.manifest import LevelInfo, Manifest, write_manifest
+from pyramid_gen.manifest import LevelInfo, Manifest, SupertileInfo, write_manifest
 
 
 def _wcs(crval0: float = 150.0) -> dict:
@@ -38,6 +38,7 @@ def _manifest(name: str, crval0: float = 150.0, scale: float = 0.03) -> Manifest
         fpack_tile_count=[1, 1],
         pixel_scale_arcsec=scale,
         wcs=_wcs(crval0),
+        supertiles=[SupertileInfo(filename=f"{name}_z0.fits.fz", tile_origin=[0, 0], tile_count=[1, 1])],
     )
     return Manifest(source_file=f"{name}.fits", native_shape=[128, 128], n_levels=0, levels=[lvl])
 

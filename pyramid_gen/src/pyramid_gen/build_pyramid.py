@@ -31,10 +31,22 @@ from astropy.nddata import block_reduce
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 
-from .manifest import LevelInfo, Manifest, write_manifest
+from .manifest import LevelInfo, Manifest, SupertileInfo, write_manifest
 
 #: fpack-internal tile size; the unit of HTTP byte ranges the browser requests.
 FPACK_TILE_SIZE = 256
+
+#: A level is partitioned into supertiles of at most this many render-tiles per side
+#: (a standalone ``.fits.fz`` each). Chosen so even worst-case (lossless-fallback,
+#: ~160 KB/tile) supertiles stay under the 512 MB CDN edge-cache limit; on real
+#: noise-dominated data (~47 KB/tile) files are ~100 MB. Tunable; to be locked
+#: empirically against real COSMOS-Web tiles (docs/supertile-design.md §8).
+DEFAULT_SUPERTILE_BLOCKS = 48
+
+#: Hard ceiling per emitted ``.fits.fz``: Cloudflare's max cacheable object size on
+#: Free/Pro/Business plans. A supertile over this is a build error (reduce the block
+#: size) rather than a silently-uncacheable file. See docs/supertile-design.md.
+EDGE_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 
 #: Lossy quantization level applied to every RICE_1 level. q=8 preserves source
 #: photometry to ~0.03% on real (noise-dominated) data while compressing ~5-6x;
@@ -127,6 +139,23 @@ def _tile_count(shape: tuple[int, int], tile_size: int) -> list[int]:
     """[n_tiles_y, n_tiles_x] for a given image shape and tile size."""
     h, w = shape
     return [math.ceil(h / tile_size), math.ceil(w / tile_size)]
+
+
+def _supertile_blocks(n_tiles_x: int, n_tiles_y: int, k: int) -> list[tuple[int, int, int, int]]:
+    """Partition an ``n_tiles_x × n_tiles_y`` render-tile grid into ``k×k``-tile blocks.
+
+    Returns ``(tx0, ty0, snx, sny)`` rectangles in row-major block order — a disjoint
+    cover of the whole grid; edge blocks are smaller. A grid that already fits in one
+    block (both dims ≤ k) yields a single ``(0, 0, n_tiles_x, n_tiles_y)`` — the
+    degenerate, un-chunked level.
+    """
+    blocks: list[tuple[int, int, int, int]] = []
+    for ty0 in range(0, n_tiles_y, k):
+        sny = min(k, n_tiles_y - ty0)
+        for tx0 in range(0, n_tiles_x, k):
+            snx = min(k, n_tiles_x - tx0)
+            blocks.append((tx0, ty0, snx, sny))
+    return blocks
 
 
 # --------------------------------------------------------------------------- #
@@ -269,10 +298,12 @@ def _read_input(input_path: Path) -> tuple[np.ndarray, fits.Header]:
 class _LevelTask:
     z: int
     factor: int
-    out_path: str
-    filename: str
+    out_dir: str  # the band's output directory; the worker names its supertile files
+    stem: str  # input stem, for the supertile filenames
     tile_size: int
     quantize_level: int
+    supertile_blocks: int  # max render-tiles per side per supertile (K)
+    size_budget: int  # hard per-file ceiling in bytes (EDGE_CACHE_LIMIT_BYTES)
     native_npy: str  # path to a .npy of the native array; workers mmap it (shared)
     header: fits.Header
     verify: bool = True
@@ -302,16 +333,52 @@ def _check_descriptor_overflow(bintable_header: fits.Header, z: int) -> None:
         )
 
 
-def _build_level(task: _LevelTask) -> dict:
-    """Build, write, and verify a single pyramid level. Returns a LevelInfo dict.
+def _write_supertile(
+    sub: np.ndarray, header: fits.Header, out_path: str, task: _LevelTask
+) -> str:
+    """Write one supertile ``.fits.fz``, verify it, and return its actual ZCMPTYPE.
 
-    Every level is a display-only RICE_1 + SUBTRACTIVE_DITHER_2 tile set (q=8);
-    there is no lossless level (the raw mosaic is distributed separately).
+    Same display-only RICE_1 + SUBTRACTIVE_DITHER_2 (q=8) encoding as a whole level;
+    a supertile is just a sub-rectangle written as its own self-contained file.
+    """
+    hdu = fits.CompImageHDU(
+        data=sub,
+        header=header,
+        compression_type="RICE_1",
+        tile_shape=(task.tile_size, task.tile_size),
+        quantize_level=task.quantize_level,
+        quantize_method=SUBTRACTIVE_DITHER_2,
+        dither_seed=DITHER_SEED_CHECKSUM,
+    )
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(out_path, overwrite=True)
+
+    # Read back and verify the lossy round-trip before declaring it good (a second
+    # decode of this supertile); skippable (verify=False) when memory is tight.
+    if task.verify:
+        with fits.open(out_path) as hdul:
+            readback = np.asarray(hdul[1].data)
+        _verify_roundtrip(sub, readback, task.z)
+
+    # Read the ACTUAL compression keyword so the manifest hint can never drift from
+    # the file, and assert the heap descriptors did not silently overflow.
+    with fits.open(out_path, disable_image_compression=True) as hdul:
+        bintable_header = hdul[1].header
+        zcmptype = str(bintable_header["ZCMPTYPE"])
+        _check_descriptor_overflow(bintable_header, task.z)
+    return zcmptype
+
+
+def _build_level(task: _LevelTask) -> dict:
+    """Build, write, and verify one pyramid level as one or more supertiles.
+
+    The level is partitioned into ``K×K``-render-tile supertiles (``K`` =
+    ``task.supertile_blocks``); each is written as a standalone ``.fits.fz`` and its
+    placement (origin + tile count) recorded. A level that fits in one block is the
+    common, un-chunked case (a single ``{stem}_z{z}.fits.fz``, byte-identical to the
+    pre-supertile layout). Returns a LevelInfo dict.
 
     The native array is read via a copy-on-write memory-map of the shared ``.npy``
-    (``native_npy``), so every level worker shares one copy through the OS page
-    cache rather than receiving a pickled copy of the full mosaic (mode ``c`` so
-    reads stay shared but the array still presents as writable to astropy).
+    (mode ``c``), so every level worker shares one copy through the OS page cache.
     """
     native = np.load(task.native_npy, mmap_mode="c")
 
@@ -323,42 +390,57 @@ def _build_level(task: _LevelTask) -> dict:
     level_wcs = _scale_wcs(native_wcs, task.factor)
     level_header = level_wcs.to_header(relax=True)
 
-    hdu = fits.CompImageHDU(
-        data=level,
-        header=level_header,
-        compression_type="RICE_1",
-        tile_shape=(task.tile_size, task.tile_size),
-        quantize_level=task.quantize_level,
-        quantize_method=SUBTRACTIVE_DITHER_2,
-        dither_seed=DITHER_SEED_CHECKSUM,
-    )
-    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(task.out_path, overwrite=True)
+    ts = task.tile_size
+    h, w = int(level.shape[0]), int(level.shape[1])
+    n_ty, n_tx = _tile_count((h, w), ts)
+    blocks = _supertile_blocks(n_tx, n_ty, task.supertile_blocks)
+    single = len(blocks) == 1
 
-    # Read back and verify before declaring the level good. This fully re-decodes
-    # the level (a second full-size array), so it is skippable (build verify=False)
-    # for very large mosaics where memory is the constraint.
-    if task.verify:
-        with fits.open(task.out_path) as hdul:
-            readback = np.asarray(hdul[1].data)
-        _verify_roundtrip(level, readback, task.z)
+    supertiles: list[SupertileInfo] = []
+    zcmptype = ""
+    for (tx0, ty0, snx, sny) in blocks:
+        x0, y0 = tx0 * ts, ty0 * ts
+        x1, y1 = min((tx0 + snx) * ts, w), min((ty0 + sny) * ts, h)
+        # ascontiguousarray is a no-op for the full-grid (single) case — so an
+        # un-chunked level stays byte-identical to the old one-file-per-level output.
+        sub = np.ascontiguousarray(level[y0:y1, x0:x1])
 
-    # Read the ACTUAL compression keyword so the manifest hint can never drift
-    # from the file. ZCMPTYPE lives in the compressed bintable header; while it's
-    # open, assert the heap descriptors did not silently overflow.
-    with fits.open(task.out_path, disable_image_compression=True) as hdul:
-        bintable_header = hdul[1].header
-        zcmptype = str(bintable_header["ZCMPTYPE"])
-        _check_descriptor_overflow(bintable_header, task.z)
+        if single:
+            filename = f"{task.stem}_z{task.z}.fits.fz"
+            sub_header = level_header
+        else:
+            filename = f"{task.stem}_z{task.z}_{tx0}_{ty0}.fits.fz"
+            # Self-describing cutout: shift CRPIX to the crop origin so the file's own
+            # WCS is correct (CRPIX is 1-based; subtract the 0-based crop origin).
+            w_sub = level_wcs.deepcopy()
+            w_sub.wcs.crpix = level_wcs.wcs.crpix - np.array([x0, y0], dtype=float)
+            sub_header = w_sub.to_header(relax=True)
+
+        out_path = os.path.join(task.out_dir, filename)
+        zcmptype = _write_supertile(sub, sub_header, out_path, task)
+
+        size = os.path.getsize(out_path)
+        if size > task.size_budget:
+            raise RuntimeError(
+                f"z={task.z}: supertile {filename} is {size} bytes, over the "
+                f"{task.size_budget}-byte budget — reduce supertile_blocks "
+                f"(currently {task.supertile_blocks}) so each file stays under the "
+                f"CDN object-size limit."
+            )
+        supertiles.append(
+            SupertileInfo(filename=filename, tile_origin=[tx0, ty0], tile_count=[snx, sny])
+        )
 
     level_info = LevelInfo(
         z=task.z,
-        filename=task.filename,
+        filename=supertiles[0].filename,
         compression=zcmptype,
         lossless=False,
-        shape=[int(level.shape[0]), int(level.shape[1])],
-        fpack_tile_count=_tile_count(level.shape, task.tile_size),
+        shape=[h, w],
+        fpack_tile_count=[n_ty, n_tx],
         pixel_scale_arcsec=_pixel_scale_arcsec(level_wcs),
         wcs={k: level_header[k] for k in level_header},
+        supertiles=supertiles,
     )
     return level_info.to_dict()
 
@@ -372,6 +454,8 @@ def build_pyramid(
     *,
     tile_size: int = FPACK_TILE_SIZE,
     quantize_level: int = DEFAULT_QUANTIZE_LEVEL,
+    supertile_blocks: int = DEFAULT_SUPERTILE_BLOCKS,
+    size_budget_bytes: int = EDGE_CACHE_LIMIT_BYTES,
     processes: int | None = None,
     verify: bool = True,
     on_progress: Callable[[str], None] | None = None,
@@ -388,6 +472,14 @@ def build_pyramid(
         fpack-internal tile size (default 256).
     quantize_level
         RICE_1 quantization level applied to every level (default 8).
+    supertile_blocks
+        Max render-tiles per side per supertile file (``K``, default 48). A level
+        whose tile grid exceeds ``K`` in either dim is split into ``K×K``-tile
+        supertiles so each ``.fits.fz`` stays edge-cacheable; smaller levels emit a
+        single file (byte-identical to the old layout). See docs/supertile-design.md.
+    size_budget_bytes
+        Hard per-file ceiling (default 512 MB). A supertile over this raises rather
+        than shipping a silently-uncacheable file; lower ``supertile_blocks`` if hit.
     processes
         Worker process count. Defaults to one per level (capped at cpu count).
     verify
@@ -404,6 +496,8 @@ def build_pyramid(
     Manifest
         The written manifest, also serialized to ``output_dir/manifest.json``.
     """
+    if supertile_blocks < 1:
+        raise ValueError(f"supertile_blocks must be >= 1 (got {supertile_blocks})")
     input_path = Path(input_path)
     report = on_progress if on_progress is not None else (lambda _msg: None)
     report(f"reading {input_path.name} …")
@@ -433,10 +527,12 @@ def build_pyramid(
             _LevelTask(
                 z=z,
                 factor=2**z,
-                out_path=str(output_dir / f"{stem}_z{z}.fits.fz"),
-                filename=f"{stem}_z{z}.fits.fz",
+                out_dir=str(output_dir),
+                stem=stem,
                 tile_size=tile_size,
                 quantize_level=quantize_level,
+                supertile_blocks=supertile_blocks,
+                size_budget=size_budget_bytes,
                 native_npy=str(native_npy),
                 header=header,
                 verify=verify,

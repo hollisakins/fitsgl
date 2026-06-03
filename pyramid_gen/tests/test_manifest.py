@@ -6,6 +6,7 @@ from pyramid_gen.manifest import (
     MANIFEST_VERSION,
     LevelInfo,
     Manifest,
+    SupertileInfo,
     read_manifest,
     write_manifest,
 )
@@ -27,6 +28,9 @@ def _example_manifest():
                 fpack_tile_count=[4, 4],
                 pixel_scale_arcsec=0.03,
                 wcs={"CTYPE1": "RA---TAN", "CRPIX1": 512.5},
+                supertiles=[
+                    SupertileInfo(filename="mosaic_z0.fits.fz", tile_origin=[0, 0], tile_count=[4, 4])
+                ],
             ),
             LevelInfo(
                 z=1,
@@ -37,6 +41,9 @@ def _example_manifest():
                 fpack_tile_count=[2, 2],
                 pixel_scale_arcsec=0.06,
                 wcs={"CTYPE1": "RA---TAN", "CRPIX1": 256.25},
+                supertiles=[
+                    SupertileInfo(filename="mosaic_z1.fits.fz", tile_origin=[0, 0], tile_count=[2, 2])
+                ],
             ),
         ],
     )
@@ -60,9 +67,32 @@ def test_to_dict_schema():
         "fpack_tile_count",
         "pixel_scale_arcsec",
         "wcs",
+        "supertiles",
     }
     assert lvl0["compression"] == "GZIP_2"
     assert lvl0["lossless"] is True
+    assert lvl0["supertiles"] == [
+        {"filename": "mosaic_z0.fits.fz", "tile_origin": [0, 0], "tile_count": [4, 4]}
+    ]
+
+
+def test_from_dict_v1_shim_synthesizes_one_supertile():
+    """A legacy v1 level (no `supertiles`) reads back as one full-grid supertile."""
+    v1 = {
+        "z": 0,
+        "filename": "m_z0.fits.fz",
+        "compression": "RICE_1",
+        "lossless": False,
+        "shape": [1024, 768],
+        "fpack_tile_count": [3, 4],  # [n_tiles_y, n_tiles_x]
+        "pixel_scale_arcsec": 0.03,
+        "wcs": {},
+    }
+    lvl = LevelInfo.from_dict(v1)
+    # tile_count is [n_tiles_x, n_tiles_y] = [4, 3]
+    assert lvl.supertiles == [
+        SupertileInfo(filename="m_z0.fits.fz", tile_origin=[0, 0], tile_count=[4, 3])
+    ]
 
 
 def test_roundtrip_dict():

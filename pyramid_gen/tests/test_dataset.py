@@ -14,7 +14,7 @@ from pyramid_gen.dataset import (
     grid_hash,
     read_dataset,
 )
-from pyramid_gen.manifest import LevelInfo, Manifest, write_manifest
+from pyramid_gen.manifest import LevelInfo, Manifest, SupertileInfo, write_manifest
 
 # A reference TAN WCS in the PC+CDELT form the pipeline emits (no CD keys).
 _SCALE = 8.333e-6
@@ -65,6 +65,7 @@ def _fake_manifest(wcs=None, shape=None, stem="band") -> Manifest:
         fpack_tile_count=[2, 2],
         pixel_scale_arcsec=0.03,
         wcs=wcs,
+        supertiles=[SupertileInfo(filename=f"{stem}_z0.fits.fz", tile_origin=[0, 0], tile_count=[2, 2])],
     )
     return Manifest(source_file=f"{stem}.fits", native_shape=shape, n_levels=0, levels=[z0])
 

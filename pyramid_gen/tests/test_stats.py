@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from pyramid_gen.manifest import LevelInfo, Manifest
+from pyramid_gen.manifest import LevelInfo, Manifest, SupertileInfo
 from pyramid_gen.stats import HISTOGRAM_BINS, _choose_level, histogram_dict
 
 
@@ -16,6 +16,7 @@ def _lvl(z: int, rows: int, cols: int) -> LevelInfo:
         fpack_tile_count=[1, 1],
         pixel_scale_arcsec=0.03 * 2**z,
         wcs={},
+        supertiles=[SupertileInfo(filename=f"x_z{z}.fits.fz", tile_origin=[0, 0], tile_count=[1, 1])],
     )
 
 

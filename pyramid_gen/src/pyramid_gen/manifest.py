@@ -13,7 +13,35 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-MANIFEST_VERSION = 1
+# v2 adds per-level `supertiles[]` (a level chunked under the CDN object-size limit,
+# or parsed from a pre-tiled input mosaic — see docs/supertile-design.md). A level
+# read without `supertiles` (legacy v1) is shimmed to one full-grid supertile, and a
+# single-supertile level is the degenerate, common case.
+MANIFEST_VERSION = 2
+
+
+@dataclass
+class SupertileInfo:
+    """One standalone ``.fits.fz`` holding a contiguous rectangle of a level's tiles."""
+
+    filename: str
+    tile_origin: list[int]  # [tile_x0, tile_y0] — local (0,0) tile in the level grid
+    tile_count: list[int]  # [n_tiles_x, n_tiles_y] — this supertile's own tile grid
+
+    def to_dict(self) -> dict:
+        return {
+            "filename": self.filename,
+            "tile_origin": list(self.tile_origin),
+            "tile_count": list(self.tile_count),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SupertileInfo":
+        return cls(
+            filename=d["filename"],
+            tile_origin=list(d["tile_origin"]),
+            tile_count=list(d["tile_count"]),
+        )
 
 
 @dataclass
@@ -21,28 +49,40 @@ class LevelInfo:
     """Metadata for a single pyramid level."""
 
     z: int
-    filename: str
+    filename: str  # the level's single file (v1) / first supertile's file
     compression: str  # "GZIP_2" or "RICE_1" -- client hint, verify via ZCMPTYPE
     lossless: bool
     shape: list[int]  # [H, W]
-    fpack_tile_count: list[int]  # [n_tiles_y, n_tiles_x]
+    fpack_tile_count: list[int]  # [n_tiles_y, n_tiles_x] — the level's TOTAL grid
     pixel_scale_arcsec: float
     wcs: dict  # FITS WCS header as a flat {keyword: value} dict
+    supertiles: list[SupertileInfo]  # disjoint files paving the level grid (≥1)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "LevelInfo":
+        fpack_tile_count = list(d["fpack_tile_count"])
+        raw = d.get("supertiles")
+        if raw is None:
+            # v1 shim: one supertile covering the whole grid ([ny, nx] -> [nx, ny]).
+            n_ty, n_tx = fpack_tile_count
+            supertiles = [
+                SupertileInfo(filename=d["filename"], tile_origin=[0, 0], tile_count=[n_tx, n_ty])
+            ]
+        else:
+            supertiles = [SupertileInfo.from_dict(s) for s in raw]
         return cls(
             z=d["z"],
             filename=d["filename"],
             compression=d["compression"],
             lossless=d["lossless"],
             shape=list(d["shape"]),
-            fpack_tile_count=list(d["fpack_tile_count"]),
+            fpack_tile_count=fpack_tile_count,
             pixel_scale_arcsec=d["pixel_scale_arcsec"],
             wcs=dict(d["wcs"]),
+            supertiles=supertiles,
         )
 
 
