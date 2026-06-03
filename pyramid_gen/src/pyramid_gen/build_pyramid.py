@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
@@ -139,6 +139,15 @@ def _tile_count(shape: tuple[int, int], tile_size: int) -> list[int]:
     """[n_tiles_y, n_tiles_x] for a given image shape and tile size."""
     h, w = shape
     return [math.ceil(h / tile_size), math.ceil(w / tile_size)]
+
+
+def _common_stem(paths: list[Path]) -> str:
+    """A filename stem for the output: the single input's stem, or the common
+    prefix of multiple tiles' stems (trailing separators trimmed)."""
+    if len(paths) == 1:
+        return paths[0].stem
+    prefix = os.path.commonprefix([p.stem for p in paths]).rstrip("_-. ")
+    return prefix or "mosaic"
 
 
 def _supertile_blocks(n_tiles_x: int, n_tiles_y: int, k: int) -> list[tuple[int, int, int, int]]:
@@ -449,9 +458,10 @@ def _build_level(task: _LevelTask) -> dict:
 # Orchestration
 # --------------------------------------------------------------------------- #
 def build_pyramid(
-    input_path: str | Path,
+    input_path: str | Path | Sequence[str | Path],
     output_dir: str | Path | None = None,
     *,
+    stem: str | None = None,
     tile_size: int = FPACK_TILE_SIZE,
     quantize_level: int = DEFAULT_QUANTIZE_LEVEL,
     supertile_blocks: int = DEFAULT_SUPERTILE_BLOCKS,
@@ -465,9 +475,15 @@ def build_pyramid(
     Parameters
     ----------
     input_path
-        Path to the source FITS mosaic.
+        Path to the source FITS mosaic, OR a list of pre-tiled FITS that share one
+        pixel grid (same CTYPE/CRVAL/scale, integer-offset CRPIX). Multiple tiles are
+        placed onto one virtual native grid (no resampling) before tiling; see
+        ``placed_tiles.assemble_placed_tiles``.
     output_dir
-        Output directory. Defaults to ``<input_stem>_pyramid/`` beside the input.
+        Output directory. Defaults to ``<stem>_pyramid/`` beside the (first) input.
+    stem
+        Filename stem for the level/supertile files (``{stem}_z{z}…``). Defaults to
+        the single input's stem, or the common prefix of multiple tiles' stems.
     tile_size
         fpack-internal tile size (default 256).
     quantize_level
@@ -498,20 +514,17 @@ def build_pyramid(
     """
     if supertile_blocks < 1:
         raise ValueError(f"supertile_blocks must be >= 1 (got {supertile_blocks})")
-    input_path = Path(input_path)
+    raw_inputs = input_path if isinstance(input_path, (list, tuple)) else [input_path]
+    input_paths = [Path(p) for p in raw_inputs]
+    if not input_paths:
+        raise ValueError("build_pyramid: no input given")
     report = on_progress if on_progress is not None else (lambda _msg: None)
-    report(f"reading {input_path.name} …")
-    data, header = _read_input(input_path)
-    native_h, native_w = int(data.shape[0]), int(data.shape[1])
-    report(f"read {native_h}×{native_w} mosaic")
 
-    stem = input_path.stem
+    stem = stem or _common_stem(input_paths)
     if output_dir is None:
-        output_dir = input_path.parent / f"{stem}_pyramid"
+        output_dir = input_paths[0].parent / f"{stem}_pyramid"
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    N = n_levels((native_h, native_w), tile_size)
 
     # Stage the native array as a .npy that every level worker memory-maps
     # (read-only) instead of receiving a pickled copy. Under the 'spawn' start
@@ -519,8 +532,25 @@ def build_pyramid(
     # peak memory and is what makes a large build thrash; the page-cache-backed
     # mmap shares ONE copy. Freed from the parent here, then unlinked when done.
     native_npy = output_dir / "_native.npy"
-    np.save(native_npy, data)
-    del data
+    if len(input_paths) == 1:
+        report(f"reading {input_paths[0].name} …")
+        data, header = _read_input(input_paths[0])
+        native_h, native_w = int(data.shape[0]), int(data.shape[1])
+        np.save(native_npy, data)
+        del data
+        source_file = input_paths[0].name
+    else:
+        # Pre-tiled input: place the tiles onto one virtual native grid first, then
+        # tile it exactly like a single mosaic. (Lazy import breaks the import cycle.)
+        from .placed_tiles import assemble_placed_tiles
+
+        header, (native_h, native_w) = assemble_placed_tiles(
+            input_paths, native_npy, on_progress=report
+        )
+        source_file = f"{stem} ({len(input_paths)} tiles)"
+    report(f"read {native_h}×{native_w} mosaic")
+
+    N = n_levels((native_h, native_w), tile_size)
 
     try:
         tasks = [
@@ -566,7 +596,7 @@ def build_pyramid(
         levels.sort(key=lambda lvl: lvl.z)
 
         manifest = Manifest(
-            source_file=input_path.name,
+            source_file=source_file,
             native_shape=[native_h, native_w],
             fpack_tile_size=tile_size,
             n_levels=N,
