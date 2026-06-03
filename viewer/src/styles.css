@@ -1,0 +1,33 @@
+/* Minimal global reset only. <FitsExplorer> injects its own control-panel CSS at
+   runtime, so this file owns just the viewport fill + the load/error overlay.
+   #root MUST be height:100% or the explorer's height:100% root collapses to 0px. */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font: 13px/1.4 system-ui, -apple-system, sans-serif;
+  background: #0b0b0e;
+  color: #ddd;
+}
+
+.overlay {
+  display: grid;
+  place-items: center;
+  height: 100vh;
+  color: #aaa;
+  text-align: center;
+  white-space: pre-line;
+}
+
+.overlay.error {
+  color: #ff8a8a;
+  padding: 24px;
+}

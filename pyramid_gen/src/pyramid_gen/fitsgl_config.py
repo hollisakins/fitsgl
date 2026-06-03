@@ -89,7 +89,7 @@ def default_view_dict(
 
 
 def build_fitsgl_config(
-    bands: list[tuple[str, str | Path]],
+    bands: list[tuple[str, str, str | Path]],
     output_path: str | Path,
     *,
     name: str,
@@ -99,19 +99,20 @@ def build_fitsgl_config(
 ) -> dict:
     """Assemble + write ``fitsgl.json`` from already-built band pyramids.
 
-    ``bands`` are ``(name, manifest_path)`` pairs (the pyramids must exist; this
-    only reads their manifests). Band tile URLs are written RELATIVE to the
-    output file's directory. Returns the config dict (also serialized to
+    ``bands`` are ``(name, label, manifest_path)`` triples — ``name`` is the
+    URL/dir-safe slug, ``label`` the human display string (the pyramids must
+    exist; this only reads their manifests). Band tile URLs are written RELATIVE
+    to the output file's directory. Returns the config dict (also serialized to
     ``output_path``).
     """
     output_path = Path(output_path)
     out_dir = output_path.parent
-    band_names = [n for n, _ in bands]
-    manifests = [read_manifest(Path(p)) for _, p in bands]
+    band_names = [n for n, _, _ in bands]
+    manifests = [read_manifest(Path(p)) for _, _, p in bands]
     groups = assign_grid_groups(manifests, band_names)
 
     band_entries: list[dict] = []
-    for (bname, mpath), manifest, group in zip(bands, manifests, groups):
+    for (bname, blabel, mpath), manifest, group in zip(bands, manifests, groups):
         z0 = _z0(manifest, bname)
         ps = z0.pixel_scale_arcsec
         grid: dict = {"group": group}
@@ -122,7 +123,7 @@ def build_fitsgl_config(
                 "name": bname,
                 "tiles": [_relative_posix(Path(mpath), out_dir)],
                 "grid": grid,
-                "label": bname,
+                "label": blabel,
             }
         )
 

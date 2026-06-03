@@ -5,3 +5,8 @@ __pycache__/
 build/
 dist/
 .DS_Store
+
+# The vendored SSG viewer bundle is a committed build artifact — keep it tracked
+# even if a broader ignore rule is added above later.
+!pyramid_gen/src/pyramid_gen/_viewer/
+!pyramid_gen/src/pyramid_gen/_viewer/**

@@ -122,6 +122,44 @@ def test_build_cli_rejects_bad_processes():
     assert main(["build", "--processes", "0"]) == 2  # validated before any IO
 
 
+def test_build_slugs_band_name_keeps_label(tmp_path):
+    import warnings as w
+
+    _write_band(tmp_path, "f277w", 1)  # writes f277w.fits; the band NAME is set separately
+    toml = _toml(tmp_path, [("NIRCam F277W", "f277w.fits")])
+    with w.catch_warnings():
+        w.simplefilter("ignore")  # the not-URL-safe slug warning is expected here
+        result = build_dataset(load_config(toml), tmp_path / "dist")
+
+    ds = result.dataset_dir
+    assert (ds / "NIRCam_F277W" / "manifest.json").is_file()  # on-disk dir is the slug
+    cfg = json.loads((ds / "fitsgl.json").read_text())
+    b = cfg["dataset"]["bands"][0]
+    assert b["name"] == "NIRCam_F277W" and b["label"] == "NIRCam F277W"
+    assert b["tiles"] == ["NIRCam_F277W/manifest.json"]
+    assert cfg["defaultView"] == {"mode": "single", "band": "NIRCam_F277W"}
+
+
+def test_build_emits_site_by_default(tmp_path):
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    result = build_dataset(config, tmp_path / "dist")
+    ds = result.dataset_dir
+    assert result.site_written is True
+    assert (ds / "index.html").is_file()  # self-contained deployable site
+    assert (ds / "assets").is_dir()
+
+
+def test_build_no_site(tmp_path):
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    result = build_dataset(config, tmp_path / "dist", with_site=False)
+    ds = result.dataset_dir
+    assert result.site_written is False
+    assert not (ds / "index.html").exists()
+    assert (ds / "fitsgl.json").is_file()  # data + config still emitted
+
+
 def test_build_single_band_default_and_rerun(tmp_path):
     _write_band(tmp_path, "img", 1)
     config = load_config(_toml(tmp_path, [("img", "img.fits")]))

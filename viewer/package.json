@@ -1,0 +1,29 @@
+{
+  "name": "fitsgl-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The bundled FitsGL viewer: a self-contained static page that mounts fits-pyramid/react <FitsExplorer> against ./fitsgl.json. Built by `npm run build-vendor` and vendored into pyramid_gen/_viewer/ so `fitsgl build` can emit a deployable static site.",
+  "scripts": {
+    "build-lib": "npm --prefix ../fits-pyramid run build",
+    "predev": "npm run build-lib",
+    "dev": "vite",
+    "prebuild": "npm run build-lib",
+    "build": "vite build",
+    "build-vendor": "npm run build && node scripts/write-build-info.mjs",
+    "preview": "vite preview",
+    "pretypecheck": "npm run build-lib",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

@@ -23,11 +23,28 @@ from pathlib import Path
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 _CHUNK = 64 * 1024
 
-_CONTENT_TYPES = {".json": "application/json", ".csv": "text/csv", ".html": "text/html"}
+#: Static MIME types. Beyond the dataset's data/metadata this must cover the
+#: bundled viewer's assets — notably ``.js``: a ``<script type="module">`` is
+#: BLOCKED by browsers unless the script is served with a JavaScript MIME type.
+_CONTENT_TYPES = {
+    ".json": "application/json",
+    ".csv": "text/csv",
+    ".html": "text/html",
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css",
+    ".map": "application/json",
+    ".svg": "image/svg+xml",
+    ".wasm": "application/wasm",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ico": "image/x-icon",
+    ".txt": "text/plain",
+}
 
 
 def content_type_for(name: str) -> str:
-    """MIME type by extension, matching the demo middleware's mapping."""
+    """MIME type by extension (the tile ``.fits.fz`` and unknowns are octet-stream)."""
     low = name.lower()
     if low.endswith(".fits.fz"):
         return "application/octet-stream"
@@ -83,6 +100,23 @@ class FitsglRangeHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._serve(write_body=False)
 
+    def do_OPTIONS(self) -> None:
+        # CORS preflight: browsers preflight a cross-origin ranged fetch (the `Range`
+        # header isn't "simple"), so an external viewer can consume a served dataset.
+        self.send_response(204)
+        self.send_header("Allow", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Range, If-None-Match")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def end_headers(self) -> None:
+        # Inject permissive CORS on every response so a viewer hosted elsewhere can
+        # fetch the dataset (and read the range/validation headers it needs).
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, ETag, Content-Length")
+        super().end_headers()
+
     def log_message(self, *args: object) -> None:  # keep the console clean
         pass
 
@@ -105,6 +139,12 @@ class FitsglRangeHandler(http.server.BaseHTTPRequestHandler):
         if real != real_root and not real.startswith(real_root + os.sep):
             return (None, (403, "Forbidden"))
         if not os.path.isfile(real):
+            # A directory ('/' or a subdir) serves its index.html (the SSG entry),
+            # re-validating containment of the resolved index file.
+            if os.path.isdir(real):
+                index = os.path.realpath(os.path.join(real, "index.html"))
+                if (index == real_root or index.startswith(real_root + os.sep)) and os.path.isfile(index):
+                    return (Path(index), None)
             return (None, (404, "Not found"))
         return (Path(real), None)
 

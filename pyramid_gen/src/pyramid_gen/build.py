@@ -19,6 +19,7 @@ from .build_pyramid import build_pyramid
 from .catalog import ingest_catalog
 from .config import DatasetConfig
 from .fitsgl_config import build_fitsgl_config, default_view_dict
+from .site import copy_viewer_into
 
 
 @dataclass
@@ -28,6 +29,7 @@ class BuildResult:
     dataset_dir: Path
     config_path: Path
     band_levels: dict[str, int]  # band name -> number of pyramid levels
+    site_written: bool = False  # whether the SSG viewer (index.html + assets) was copied in
 
 
 def build_dataset(
@@ -36,12 +38,15 @@ def build_dataset(
     *,
     processes: int | None = None,
     verify: bool = True,
+    with_site: bool = True,
     on_progress: Callable[[str], None] | None = None,
 ) -> BuildResult:
     """Build the whole dataset described by ``config`` under ``out_root``.
 
     Produces ``out_root/<dataset.name>/`` containing one ``<band>/`` pyramid per
-    band, an optional ``catalog.csv``, and ``fitsgl.json``. Re-runnable: an
+    band, an optional ``catalog.csv``, ``fitsgl.json``, and (unless
+    ``with_site=False``) the bundled SSG viewer (``index.html`` + ``assets/``) so
+    the directory is a self-contained, deployable static site. Re-runnable: an
     existing dataset directory is replaced atomically only after the new one is
     fully built. ``processes`` caps the per-level worker pool (None = auto, one per
     level up to the cpu count). ``verify`` (default True) reads each level back to
@@ -95,7 +100,7 @@ def build_dataset(
             north_up=view.north_up,
         )
         log("writing fitsgl.json")
-        bands = [(b.name, tmp_dir / b.name / "manifest.json") for b in config.bands]
+        bands = [(b.name, b.label, tmp_dir / b.name / "manifest.json") for b in config.bands]
         config_path_tmp = tmp_dir / "fitsgl.json"
         build_fitsgl_config(
             bands,
@@ -105,6 +110,10 @@ def build_dataset(
             default_view=dv,
             catalog_url=catalog_url,
         )
+
+        if with_site:
+            log("writing viewer (index.html + assets)")
+            copy_viewer_into(tmp_dir)
     except BaseException:
         # Don't leave a partial temp dir behind on any failure/interrupt.
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -119,4 +128,5 @@ def build_dataset(
         dataset_dir=dataset_dir,
         config_path=dataset_dir / "fitsgl.json",
         band_levels=band_levels,
+        site_written=with_site,
     )

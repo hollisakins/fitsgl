@@ -21,14 +21,12 @@ from pathlib import Path, PurePath
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from .config import RESERVED_BAND_NAMES
+from .config import sanitize_band_name
 from .dataset import grid_hash
 
 #: Globs scanned (non-recursive). `.fits.fz` is intentionally excluded — it is a
 #: build *output*, not an input.
 FITS_GLOBS = ("*.fits", "*.fit", "*.fits.gz")
-
-_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 @dataclass
@@ -81,23 +79,6 @@ def _strip_fits_suffix(filename: str) -> str:
             name = name[: -len(base)]
             break
     return name
-
-
-def sanitize_band_name(stem: str, taken: set[str]) -> str:
-    """A TOML/dir-safe, unique band key derived from a filename stem.
-
-    Preserves case, maps non-``[A-Za-z0-9_-]`` to ``_``, dodges
-    :data:`config.RESERVED_BAND_NAMES`, and de-duplicates against ``taken``.
-    """
-    base = _UNSAFE.sub("_", stem) or "band"
-    if base in RESERVED_BAND_NAMES:
-        base = f"{base}_1"
-    candidate = base
-    i = 2
-    while candidate in taken:
-        candidate = f"{base}_{i}"
-        i += 1
-    return candidate
 
 
 def read_header_only(path: Path) -> tuple[fits.Header, list[int]]:
@@ -213,6 +194,12 @@ def render_toml(plan: InitPlan, config_dir: Path) -> str:
         lines += [
             "[[dataset.bands]]",
             f"name = {_toml_str(band.name)}",
+        ]
+        stem = _strip_fits_suffix(band.path.name)
+        if stem != band.name:
+            # The slug was sanitized from the filename; surface the original as a label.
+            lines.append(f"label = {_toml_str(stem)}")
+        lines += [
             f"input = {_toml_str(_rel_posix(band.path, config_dir))}",
             "",
         ]

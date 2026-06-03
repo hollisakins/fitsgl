@@ -79,6 +79,97 @@ def test_minimal_single_band_uses_defaults(tmp_path):
     assert cfg.catalog is None and cfg.title is None
 
 
+def test_slugs_unsafe_band_name_and_keeps_label(tmp_path):
+    touch(tmp_path, "img.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "NIRCam F277W"
+        input = "img.fits"
+        """,
+    )
+    with pytest.warns(UserWarning, match="not URL-safe"):
+        cfg = load_config(p)
+    assert cfg.bands[0].name == "NIRCam_F277W"  # slug used for dir/URL
+    assert cfg.bands[0].label == "NIRCam F277W"  # original kept as display label
+
+
+def test_explicit_label_silences_slug_warning(tmp_path):
+    import warnings as w
+
+    touch(tmp_path, "img.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "F277W"
+        label = "NIRCam F277W"
+        input = "img.fits"
+        """,
+    )
+    with w.catch_warnings(record=True) as rec:
+        w.simplefilter("always")
+        cfg = load_config(p)
+    assert cfg.bands[0].name == "F277W" and cfg.bands[0].label == "NIRCam F277W"
+    assert not any("not URL-safe" in str(r.message) for r in rec)  # explicit label silences it
+
+
+def test_colliding_slugs_rejected(tmp_path):
+    touch(tmp_path, "a.fits")
+    touch(tmp_path, "b.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "a b"
+        input = "a.fits"
+        [[dataset.bands]]
+        name = "a/b"
+        input = "b.fits"
+        """,
+    )
+    with pytest.warns(UserWarning):
+        with pytest.raises(ValueError, match="collides"):
+            load_config(p)
+
+
+def test_viewer_refs_resolve_to_slug(tmp_path):
+    for n in ("a", "b", "c"):
+        touch(tmp_path, f"{n}.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "NIRCam F150W"
+        input = "a.fits"
+        [[dataset.bands]]
+        name = "NIRCam F277W"
+        input = "b.fits"
+        [[dataset.bands]]
+        name = "NIRCam F444W"
+        input = "c.fits"
+        [viewer]
+        default = "rgb"
+        r = "NIRCam F444W"
+        g = "NIRCam F277W"
+        b = "NIRCam F150W"
+        """,
+    )
+    with pytest.warns(UserWarning):
+        cfg = load_config(p)
+    # [viewer] refs (typed as the original names) resolve to the slugs used downstream.
+    assert (cfg.viewer.r, cfg.viewer.g, cfg.viewer.b) == ("NIRCam_F444W", "NIRCam_F277W", "NIRCam_F150W")
+
+
 def test_catalog_path_resolved_and_checked(tmp_path):
     touch(tmp_path, "a.fits")
     touch(tmp_path, "sources.csv")

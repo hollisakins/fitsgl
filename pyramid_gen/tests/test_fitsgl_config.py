@@ -42,11 +42,11 @@ def _manifest(name: str, crval0: float = 150.0, scale: float = 0.03) -> Manifest
     return Manifest(source_file=f"{name}.fits", native_shape=[128, 128], n_levels=0, levels=[lvl])
 
 
-def _band(tmp_path, name: str, crval0: float = 150.0, scale: float = 0.03):
+def _band(tmp_path, name: str, crval0: float = 150.0, scale: float = 0.03, label: str | None = None):
     d = tmp_path / name
     d.mkdir()
     write_manifest(d / "manifest.json", _manifest(name, crval0, scale))
-    return (name, d / "manifest.json")
+    return (name, label if label is not None else name, d / "manifest.json")
 
 
 def test_emits_valid_wire_format(tmp_path):
@@ -59,6 +59,7 @@ def test_emits_valid_wire_format(tmp_path):
     assert cfg["dataset"]["name"] == "set" and cfg["dataset"]["title"] == "My Set"
     assert cfg["dataset"]["catalog"] == {"url": "catalog.csv"}
     assert [b["name"] for b in cfg["dataset"]["bands"]] == ["a", "b", "c"]
+    assert [b["label"] for b in cfg["dataset"]["bands"]] == ["a", "b", "c"]
     assert cfg["dataset"]["bands"][0]["tiles"] == ["a/manifest.json"]
     assert cfg["dataset"]["bands"][0]["grid"] == {"group": 0, "pixelScaleArcsec": 0.03}
     assert {b["grid"]["group"] for b in cfg["dataset"]["bands"]} == {0}  # co-gridded
@@ -72,6 +73,15 @@ def test_emits_valid_wire_format(tmp_path):
     }
     # The file round-trips and uses camelCase wire keys.
     assert json.loads(out.read_text()) == cfg
+
+
+def test_emits_human_label_distinct_from_slug_name(tmp_path):
+    bands = [_band(tmp_path, "nircam_f277w", label="NIRCam F277W")]
+    out = tmp_path / "fitsgl.json"
+    dv = default_view_dict(mode="single", band="nircam_f277w")
+    cfg = build_fitsgl_config(bands, out, name="set", default_view=dv)
+    b = cfg["dataset"]["bands"][0]
+    assert b["name"] == "nircam_f277w" and b["label"] == "NIRCam F277W"
 
 
 def test_assigns_grid_groups_by_grid_hash(tmp_path):

@@ -13,6 +13,8 @@ live view state, and ``[viewer]`` only sets the initial state.
 
 from __future__ import annotations
 
+import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,15 +28,48 @@ STRETCH_MODES = ("linear", "log", "asinh")
 
 #: Band names that would collide with a top-level output file/dir in the dataset
 #: directory, so they are refused (a band becomes a subdirectory named for it).
-RESERVED_BAND_NAMES = frozenset({"dataset", "catalog", "fitsgl", "index", "deploy", "embed"})
+#: ``index``/``assets`` are the bundled SSG viewer's files; ``fitsgl`` is ``fitsgl.json``.
+RESERVED_BAND_NAMES = frozenset({"dataset", "catalog", "fitsgl", "index", "assets", "deploy", "embed"})
+
+#: Characters not allowed in a band's on-disk/URL slug (everything else -> ``_``).
+_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def slugify_band_name(name: str) -> str:
+    """A URL- and directory-safe slug for ``name`` (non-``[A-Za-z0-9_-]`` -> ``_``).
+
+    Case-preserving and 1:1 (no reserved-dodge, no dedup); :func:`load_config`
+    validates the result against :data:`RESERVED_BAND_NAMES` and uniqueness itself,
+    so a reserved/colliding slug surfaces as a pointed error, not a silent rename.
+    """
+    return _UNSAFE.sub("_", name) or "band"
+
+
+def sanitize_band_name(stem: str, taken: set[str]) -> str:
+    """A TOML/dir-safe, unique band key derived from a filename stem (for ``init``).
+
+    :func:`slugify_band_name` plus a reserved-name dodge and de-duplication against
+    ``taken`` — lenient auto-fixing suited to scaffolding from filenames, where a
+    pointed error would be unhelpful.
+    """
+    base = slugify_band_name(stem)
+    if base in RESERVED_BAND_NAMES:
+        base = f"{base}_1"
+    candidate = base
+    i = 2
+    while candidate in taken:
+        candidate = f"{base}_{i}"
+        i += 1
+    return candidate
 
 
 @dataclass
 class BandSpec:
-    """One band: a stable key + the mosaic to build a pyramid from."""
+    """One band: a stable URL/dir-safe key, a human label, and the source mosaic."""
 
-    name: str
+    name: str  # slug — used for the on-disk subdir, tile URLs, and defaultView refs
     input: Path  # resolved relative to the toml file's directory
+    label: str  # human-readable display name (defaults to the original toml name)
 
 
 @dataclass
@@ -108,22 +143,41 @@ def load_config(path: str | Path) -> DatasetConfig:
     _require(isinstance(raw_bands, list) and len(raw_bands) > 0, "[dataset] needs at least one [[dataset.bands]]")
     assert isinstance(raw_bands, list)
     bands: list[BandSpec] = []
-    seen: set[str] = set()
+    seen_raw: set[str] = set()
+    seen_slugs: set[str] = set()
+    alias: dict[str, str] = {}  # original name OR slug -> slug, for [viewer] ref resolution
     for i, rb in enumerate(raw_bands):
         _require(isinstance(rb, dict), f"[[dataset.bands]] entry {i} is not a table")
         bname = _as_str(rb, "name", f"band {i} name")
-        _require(bname not in seen, f"duplicate band name {bname!r}")
+        _require(bname not in seen_raw, f"duplicate band name {bname!r}")
+        seen_raw.add(bname)
+        slug = slugify_band_name(bname)
         _require(
-            bname not in RESERVED_BAND_NAMES,
+            slug not in RESERVED_BAND_NAMES,
             f"band name {bname!r} is reserved (would collide with an output file); "
             f"reserved: {sorted(RESERVED_BAND_NAMES)}",
         )
-        seen.add(bname)
+        _require(slug not in seen_slugs, f"band name {bname!r} slugs to {slug!r}, which collides with another band")
+        seen_slugs.add(slug)
+        rlabel = rb.get("label")
+        _require(
+            rlabel is None or (isinstance(rlabel, str) and rlabel != ""),
+            f"band {bname!r} label must be a non-empty string",
+        )
+        if slug != bname and rlabel is None:
+            warnings.warn(
+                f"fitsgl.toml: band name {bname!r} is not URL-safe; using {slug!r} for the "
+                f"directory/tile URLs and {bname!r} as the display label (set an explicit "
+                "`label` to silence this)",
+                stacklevel=2,
+            )
         inp = _as_str(rb, "input", f"band {bname!r} input")
         inp_path = (config_dir / inp).resolve()
         if not inp_path.is_file():
             raise FileNotFoundError(f"fitsgl.toml: band {bname!r} input not found: {inp_path}")
-        bands.append(BandSpec(name=bname, input=inp_path))
+        bands.append(BandSpec(name=slug, input=inp_path, label=rlabel if rlabel is not None else bname))
+        alias[bname] = slug
+        alias[slug] = slug
 
     catalog_path: Path | None = None
     cat = ds.get("catalog")
@@ -135,7 +189,7 @@ def load_config(path: str | Path) -> DatasetConfig:
             raise FileNotFoundError(f"fitsgl.toml: [dataset].catalog not found: {catalog_path}")
 
     build = _parse_build(raw.get("build"))
-    viewer = _parse_viewer(raw.get("viewer"), seen)
+    viewer = _parse_viewer(raw.get("viewer"), alias)
 
     return DatasetConfig(
         name=name,
@@ -164,7 +218,7 @@ def _parse_build(raw: object) -> BuildSpec:
     return out
 
 
-def _parse_viewer(raw: object, band_names: set[str]) -> ViewerSpec:
+def _parse_viewer(raw: object, band_alias: dict[str, str]) -> ViewerSpec:
     if raw is None:
         # No [viewer]: default to single-band on the first band (resolved by the emitter).
         return ViewerSpec(mode="single")
@@ -180,8 +234,8 @@ def _parse_viewer(raw: object, band_names: set[str]) -> ViewerSpec:
             return None
         _require(isinstance(v, str), f"[viewer].{key} must be a band name string")
         assert isinstance(v, str)
-        _require(v in band_names, f"[viewer].{key} references unknown band {v!r}")
-        return v
+        _require(v in band_alias, f"[viewer].{key} references unknown band {v!r}")
+        return band_alias[v]  # resolve to the slug so it matches the band dirs/defaultView
 
     if mode == "rgb":
         for key in ("r", "g", "b"):

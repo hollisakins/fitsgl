@@ -52,6 +52,8 @@ def test_content_type_for():
     assert content_type_for("manifest.json") == "application/json"
     assert content_type_for("catalog.csv") == "text/csv"
     assert content_type_for("index.html") == "text/html"
+    assert content_type_for("index-abc123.js") == "text/javascript"  # module scripts need a JS MIME
+    assert content_type_for("index-abc123.css") == "text/css"
     assert content_type_for("mystery.bin") == "application/octet-stream"
 
 
@@ -66,6 +68,7 @@ def server(tmp_path):
     root.mkdir()
     (root / "tile.fits.fz").write_bytes(TILE)
     (root / "fitsgl.json").write_text('{"schemaVersion": 1}\n')
+    (root / "index.html").write_text("<!doctype html><title>FitsGL</title>")
     handler = type("Bound", (FitsglRangeHandler,), {"served_root": root.resolve()})
     httpd = _ThreadingHTTPServer(("127.0.0.1", 0), handler)
     port = httpd.server_address[1]
@@ -115,6 +118,31 @@ def test_unranged_metadata_is_200(server):
     assert headers["Content-Type"] == "application/json"
     assert headers["Content-Length"] == str(len(body))
     assert b'"schemaVersion": 1' in body
+
+
+def test_root_serves_index_html(server):
+    port, _ = server
+    status, headers, body = _request(port, "GET", "/")
+    assert status == 200
+    assert headers["Content-Type"] == "text/html"
+    assert b"FitsGL" in body
+
+
+def test_cors_headers_on_every_response(server):
+    port, _ = server
+    _, headers, _ = _request(port, "GET", "/tile.fits.fz")
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert "Content-Range" in headers["Access-Control-Expose-Headers"]
+
+
+def test_options_preflight_is_204(server):
+    port, _ = server
+    status, headers, body = _request(port, "OPTIONS", "/tile.fits.fz")
+    assert status == 204
+    assert "GET" in headers["Access-Control-Allow-Methods"]
+    assert "Range" in headers["Access-Control-Allow-Headers"]
+    assert headers["Access-Control-Allow-Origin"] == "*"
+    assert body == b""
 
 
 def test_unsatisfiable_range_is_416(server):

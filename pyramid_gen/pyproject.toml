@@ -24,5 +24,11 @@ fitsgl = "pyramid_gen.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Ship the vendored SSG viewer bundle (built by ../viewer, committed to the repo)
+# so `pip install` carries it and `fitsgl build` can emit a self-contained site
+# without node at build time.
+[tool.setuptools.package-data]
+pyramid_gen = ["_viewer/**/*", "_viewer/.build-info.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

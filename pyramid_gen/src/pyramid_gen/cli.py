@@ -56,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the per-level read-back verification (a second full decode per "
         "level); use for very large mosaics where memory is the constraint.",
     )
+    pb.add_argument(
+        "--no-site",
+        action="store_true",
+        help="Skip emitting the bundled viewer (index.html + assets); write data + "
+        "fitsgl.json only.",
+    )
 
     ps = sub.add_parser("serve", help="Serve a built dataset directory over HTTP with byte-range support.")
     ps.add_argument("dataset_dir", type=Path, help="Dataset directory to serve (e.g. dist/<name>).")
@@ -109,6 +115,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             args.out,
             processes=args.processes,
             verify=not args.no_verify,
+            with_site=not args.no_site,
             on_progress=lambda m: print(m, flush=True),
         )
     except StopAndAsk as e:
@@ -132,6 +139,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
     catalog = " + catalog.csv" if config.catalog is not None else ""
     print(f"  {n_bands} band(s), default view: {default}, stretch {view.stretch or 'asinh*'}{catalog}")
     print(f"  config: {result.config_path}")
+    if result.site_written:
+        print(f"  viewer: open {result.dataset_dir / 'index.html'} (or run `fitsgl serve {result.dataset_dir}`)")
     return 0
 
 

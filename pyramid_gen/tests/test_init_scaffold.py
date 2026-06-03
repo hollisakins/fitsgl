@@ -84,6 +84,23 @@ def test_render_toml_round_trips_through_load_config(tmp_path):
     assert "Grid groups" in toml_text
 
 
+def test_render_toml_emits_label_for_sanitized_name(tmp_path):
+    import warnings as w
+
+    _write_band(tmp_path / "f150w.v1.fits", seed=1)  # the '.' in the stem gets sanitized
+    plan = scan_directory(tmp_path)
+    toml_text = render_toml(plan, tmp_path)
+    assert 'name = "f150w_v1"' in toml_text and 'label = "f150w.v1"' in toml_text
+
+    toml_path = tmp_path / "fitsgl.toml"
+    toml_path.write_text(toml_text)
+    with w.catch_warnings(record=True) as rec:
+        w.simplefilter("always")
+        cfg = load_config(toml_path)
+    assert cfg.bands[0].name == "f150w_v1" and cfg.bands[0].label == "f150w.v1"
+    assert not any("not URL-safe" in str(r.message) for r in rec)  # the emitted label silences it
+
+
 def test_write_scaffold_refuses_overwrite_without_force(tmp_path):
     _write_band(tmp_path / "a.fits", seed=1)
     plan = scan_directory(tmp_path)

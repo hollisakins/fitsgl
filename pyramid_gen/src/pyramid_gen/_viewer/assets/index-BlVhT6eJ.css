@@ -1,0 +1,1 @@
+*{box-sizing:border-box}html,body,#root{margin:0;height:100%}body{font:13px/1.4 system-ui,-apple-system,sans-serif;background:#0b0b0e;color:#ddd}.overlay{display:grid;place-items:center;height:100vh;color:#aaa;text-align:center;white-space:pre-line}.overlay.error{color:#ff8a8a;padding:24px}
