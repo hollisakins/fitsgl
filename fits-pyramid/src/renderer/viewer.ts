@@ -59,6 +59,7 @@ import {
   coarserFallback,
   commonResidentLevel,
   fallbackUV,
+  finerFallback,
   ringTiles,
   targetLevel,
   tileKey,
@@ -82,6 +83,14 @@ const DEFAULT_TEXTURE_BUDGET = 200;
  * from disk); the rest upload over the next frames, masked by coarse-to-fine.
  */
 const MAX_UPLOADS_PER_FRAME = 8;
+/**
+ * Crossfade-in duration (ms) for a tile's first appearance at its own level.
+ * The newly-resident tile ramps alpha 0→1 over this window while its fallback
+ * (the just-left finer level on zoom-out, or a coarse ancestor) shows through
+ * underneath — so a level switch dissolves in rather than popping. Kept short so
+ * it reads as a settle, not an animation. 0 disables the fade (pure fallback).
+ */
+const DEFAULT_CROSSFADE_MS = 150;
 /** Prefetch ring width in tiles beyond the viewport edge (P5). */
 const PREFETCH_MARGIN = 1;
 /** Quiet period after the last camera move before the ring is prefetched (ms). */
@@ -176,6 +185,11 @@ export interface FitsViewerOptions {
    */
   hiDpiLevels?: boolean;
   /**
+   * Crossfade-in duration (ms) for a tile appearing at its own level over its
+   * fallback, smoothing zoom-level switches. Default 150; set 0 to disable.
+   */
+  crossfadeMs?: number;
+  /**
    * Called at the end of every drawn frame with read-only viewer state. Use it
    * to drive a telemetry HUD or a visible-data action. Avoid *unconditionally*
    * mutating the viewer from here: a mutation schedules another frame, which
@@ -249,6 +263,12 @@ export class FitsViewer {
   private readonly nativeH: number;
   private readonly onFrame?: (info: ViewerFrameInfo) => void;
   private readonly hiDpiLevels: boolean;
+  /** Crossfade-in duration (ms); 0 disables the fade. See DEFAULT_CROSSFADE_MS. */
+  private readonly crossfadeMs: number;
+  /** Wall-clock ms captured at the top of the current frame (drives crossfades). */
+  private frameNow = 0;
+  /** Set when a tile faded in this frame; keeps the loop alive until fades end. */
+  private fadeActive = false;
   /** devicePixelRatio of the backing store; kept in sync by syncCanvasSize. */
   private dpr = 1;
 
@@ -268,6 +288,7 @@ export class FitsViewer {
   private readonly uStretchMode: WebGLUniformLocation | null;
   private readonly uUseColormap: WebGLUniformLocation | null;
   private readonly uColormap: WebGLUniformLocation | null;
+  private readonly uOpacity: WebGLUniformLocation | null;
 
   private stretchMin = 0;
   private stretchMax = 1;
@@ -354,6 +375,7 @@ export class FitsViewer {
     this.onFrame = options.onFrame;
     this.onCursor = options.onCursor;
     this.hiDpiLevels = options.hiDpiLevels ?? false;
+    this.crossfadeMs = Math.max(0, options.crossfadeMs ?? DEFAULT_CROSSFADE_MS);
 
     // North-up: parse the z=0 WCS (world pixels are native = z=0 pixels) and
     // precompute the orientation at the image centre once — it is a fixed rigid
@@ -396,6 +418,7 @@ export class FitsViewer {
     this.uStretchMode = gl.getUniformLocation(this.program, 'u_stretchMode');
     this.uUseColormap = gl.getUniformLocation(this.program, 'u_useColormap');
     this.uColormap = gl.getUniformLocation(this.program, 'u_colormap');
+    this.uOpacity = gl.getUniformLocation(this.program, 'u_opacity');
 
     this.camera = new Camera(Math.max(1, canvas.width), Math.max(1, canvas.height));
     // In RGB mode every band must share the construction grid (identical shape +
@@ -981,14 +1004,21 @@ export class FitsViewer {
   private draw(): void {
     const gl = this.gl;
     this.frameCounter++;
+    this.frameNow = performance.now();
+    // Reset each frame; the tile passes set it when a tile is mid-crossfade so the
+    // loop keeps drawing until the fade completes (see end of draw()).
+    this.fadeActive = false;
     // One frame clock per band; advance all so each manager's LRU stays in step
     // (a desync would let a band evict tiles its siblings still need to composite).
     for (const m of this.bandManagers) m.frame = this.frameCounter;
 
     // Drain a bounded number of pending GPU uploads per band before drawing, so a
     // burst of decoded tiles can't stall the frame; uploaded tiles draw this frame.
+    // The upload timestamp stamps each tile's crossfade-in start.
     let queuedUploads = 0;
-    for (const m of this.bandManagers) queuedUploads += m.flushUploads(MAX_UPLOADS_PER_FRAME);
+    for (const m of this.bandManagers) {
+      queuedUploads += m.flushUploads(MAX_UPLOADS_PER_FRAME, this.frameNow);
+    }
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -1080,8 +1110,9 @@ export class FitsViewer {
     }
 
     // Uploads still queued past this frame's budget: keep drawing to drain them.
-    // Coarse-to-fine covers the not-yet-uploaded tiles until they land.
-    if (queuedUploads > 0) this.requestRender();
+    // Coarse-to-fine covers the not-yet-uploaded tiles until they land. A tile
+    // mid-crossfade also needs the next frame to advance its alpha ramp.
+    if (queuedUploads > 0 || this.fadeActive) this.requestRender();
   }
 
   /**
@@ -1118,24 +1149,78 @@ export class FitsViewer {
       const rect = tileWorldRect(geom, t.tileX, t.tileY);
       const entry = mgr.acquire(level, t.tileX, t.tileY);
       if (entry !== undefined) {
-        this.drawTile(orient, rect, entry.texture, 0, 0, 1, 1);
+        const op = this.fadeOpacity(entry.uploadedAt);
+        // While the tile crossfades in, draw its fallback underneath so it
+        // dissolves in over real context (the finer detail it covers on a
+        // zoom-out, or a coarse ancestor) rather than over the cleared frame.
+        if (op < 1) this.drawSingleBandFallback(orient, mgr, level, t.tileX, t.tileY, rect);
+        this.drawTile(orient, rect, entry.texture, 0, 0, 1, 1, op);
         continue;
       }
-      // Not resident yet: request it, and fill from the best coarser ancestor.
+      // Not resident yet: request it, and fill from the best resident neighbour —
+      // a finer level if we just zoomed out, else a coarse ancestor (A: D + A).
       mgr.request(level, t.tileX, t.tileY);
-      const fb = coarserFallback(level, t.tileX, t.tileY, this.maxLevel, (l, x, y) =>
-        mgr.has(l, x, y),
-      );
-      if (fb !== null) {
-        const fbEntry = mgr.acquire(fb.level, fb.tileX, fb.tileY);
-        const fbGeom = this.geoms.get(fb.level);
-        if (fbEntry !== undefined && fbGeom !== undefined) {
-          const ancestor = tileWorldRect(fbGeom, fb.tileX, fb.tileY);
-          const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
-          this.drawTile(orient, rect, fbEntry.texture, u0, v0, u1, v1);
+      this.drawSingleBandFallback(orient, mgr, level, t.tileX, t.tileY, rect);
+    }
+  }
+
+  /**
+   * Draw the best resident stand-in for a single-band tile that is missing or
+   * still crossfading in, as two opaque layers (coarse-to-fine, painter's order):
+   *
+   *  1. BASE — the finest resident COARSE ancestor, upscaled to fill the tile.
+   *     The pinned coarsest tile is the floor, so this never leaves a hole.
+   *  2. OVERLAY — any resident descendants at the nearest FINER level (the detail
+   *     the user just left on a zoom-out), drawn crisp at their own world rects on
+   *     top of the base. Coverage may be partial: sharp where the finer level
+   *     loaded, coarse base showing through the gaps.
+   *
+   * `acquire` marks every consulted tile visible so the fallback levels are not
+   * evicted out from under it the next frame (which would re-open the flash).
+   */
+  private drawSingleBandFallback(
+    orient: Mat2,
+    mgr: TileManager,
+    level: number,
+    tileX: number,
+    tileY: number,
+    rect: WorldRect,
+  ): void {
+    const fb = coarserFallback(level, tileX, tileY, this.maxLevel, (l, x, y) => mgr.has(l, x, y));
+    if (fb !== null) {
+      const fbEntry = mgr.acquire(fb.level, fb.tileX, fb.tileY);
+      const fbGeom = this.geoms.get(fb.level);
+      if (fbEntry !== undefined && fbGeom !== undefined) {
+        const ancestor = tileWorldRect(fbGeom, fb.tileX, fb.tileY);
+        const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
+        this.drawTile(orient, rect, fbEntry.texture, u0, v0, u1, v1, 1);
+      }
+    }
+    const finer = finerFallback(level, tileX, tileY, (l, x, y) => mgr.has(l, x, y));
+    if (finer !== null) {
+      const fGeom = this.geoms.get(finer.level);
+      if (fGeom !== undefined) {
+        for (const ft of finer.tiles) {
+          const fe = mgr.acquire(ft.level, ft.tileX, ft.tileY);
+          if (fe === undefined) continue; // raced an eviction; skip this sub-tile
+          const fRect = tileWorldRect(fGeom, ft.tileX, ft.tileY);
+          this.drawTile(orient, fRect, fe.texture, 0, 0, 1, 1, 1);
         }
       }
     }
+  }
+
+  /**
+   * Crossfade-in alpha in [0,1] for a tile uploaded at `uploadedAt` (wall-clock
+   * ms). Returns 1 immediately when the fade is disabled or already complete;
+   * while ramping it flags `fadeActive` so the loop schedules the next frame.
+   */
+  private fadeOpacity(uploadedAt: number): number {
+    if (this.crossfadeMs <= 0) return 1;
+    const op = (this.frameNow - uploadedAt) / this.crossfadeMs;
+    if (op >= 1) return 1;
+    this.fadeActive = true;
+    return op > 0 ? op : 0;
   }
 
   /**
@@ -1173,30 +1258,92 @@ export class FitsViewer {
       mr.request(level, t.tileX, t.tileY);
       mg.request(level, t.tileX, t.tileY);
       mb.request(level, t.tileX, t.tileY);
-      // Finest level resident in ALL three bands. acquire() (not has()) marks
-      // each band's consulted tile visible this frame, so a band that is ahead
-      // cannot evict an ancestor its laggard siblings still need (cross-band
-      // eviction oscillation). Call all three unconditionally (no &&
-      // short-circuit) so every resident tile at the level is marked.
-      const common = commonResidentLevel(level, t.tileX, t.tileY, this.maxLevel, (l, x, y) => {
+      // Target tile resident in ALL three bands? acquire() (not has()) marks each
+      // band's consulted tile visible this frame, so a band that is ahead cannot
+      // evict a tile its laggard siblings still need (cross-band eviction
+      // oscillation). Call all three unconditionally (no && short-circuit).
+      const er = mr.acquire(level, t.tileX, t.tileY);
+      const eg = mg.acquire(level, t.tileX, t.tileY);
+      const eb = mb.acquire(level, t.tileX, t.tileY);
+      if (er !== undefined && eg !== undefined && eb !== undefined) {
+        // Fade from the newest of the three uploads (when it became drawable).
+        const op = this.fadeOpacity(Math.max(er.uploadedAt, eg.uploadedAt, eb.uploadedAt));
+        if (op < 1) this.drawRgbFallback(orient, level, t.tileX, t.tileY, rect, mr, mg, mb);
+        this.drawTileRGB(orient, rect, er.texture, eg.texture, eb.texture, 0, 0, 1, 1, op);
+        continue;
+      }
+      // Target not common to all three yet: best resident neighbour (a finer
+      // level common to every band, else a coarse common ancestor). Draws nothing
+      // if no common level is resident (common-level-hold).
+      this.drawRgbFallback(orient, level, t.tileX, t.tileY, rect, mr, mg, mb);
+    }
+  }
+
+  /**
+   * Draw the best resident RGB stand-in for a composite tile missing at the
+   * target level (or crossfading in), as two layers (coarse base + finer overlay)
+   * exactly like `drawSingleBandFallback`. The shader exposes a single shared UV,
+   * so all three channels must sample one COMMON source level + sub-rect per draw:
+   * the base is the finest COARSE level common to all three, the overlay is the
+   * resident descendants common to all three at the nearest finer level. The
+   * target level is excluded from the base (fromLevel `level + 1`) — its
+   * all-resident case is the caller's, and a fade base must differ from the
+   * target. `acquire` marks consulted tiles visible (cross-band eviction guard).
+   */
+  private drawRgbFallback(
+    orient: Mat2,
+    level: number,
+    tileX: number,
+    tileY: number,
+    rect: WorldRect,
+    mr: TileManager,
+    mg: TileManager,
+    mb: TileManager,
+  ): void {
+    // Coarse base: finest level strictly above the target common to all bands.
+    const common = commonResidentLevel(
+      level,
+      tileX,
+      tileY,
+      this.maxLevel,
+      (l, x, y) => {
         const hr = mr.acquire(l, x, y) !== undefined;
         const hg = mg.acquire(l, x, y) !== undefined;
         const hb = mb.acquire(l, x, y) !== undefined;
         return hr && hg && hb;
-      });
-      if (common === null) continue; // common-level-hold: nothing to draw yet
+      },
+      level + 1,
+    );
+    if (common !== null) {
       const er = mr.acquire(common.level, common.tileX, common.tileY);
       const eg = mg.acquire(common.level, common.tileX, common.tileY);
       const eb = mb.acquire(common.level, common.tileX, common.tileY);
       const fbGeom = this.geoms.get(common.level);
-      if (er === undefined || eg === undefined || eb === undefined || fbGeom === undefined) {
-        continue;
+      if (er !== undefined && eg !== undefined && eb !== undefined && fbGeom !== undefined) {
+        const ancestor = tileWorldRect(fbGeom, common.tileX, common.tileY);
+        const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
+        this.drawTileRGB(orient, rect, er.texture, eg.texture, eb.texture, u0, v0, u1, v1, 1);
       }
-      // One shared UV for all three channels (same grid ⟹ same sub-rect); when
-      // common.level === level the ancestor is the tile itself ⟹ UV (0,0,1,1).
-      const ancestor = tileWorldRect(fbGeom, common.tileX, common.tileY);
-      const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
-      this.drawTileRGB(orient, rect, er.texture, eg.texture, eb.texture, u0, v0, u1, v1);
+    }
+    // Finer overlay: resident descendants common to all three bands (partial OK).
+    const finer = finerFallback(
+      level,
+      tileX,
+      tileY,
+      (l, x, y) => mr.has(l, x, y) && mg.has(l, x, y) && mb.has(l, x, y),
+    );
+    if (finer !== null) {
+      const fGeom = this.geoms.get(finer.level);
+      if (fGeom !== undefined) {
+        for (const ft of finer.tiles) {
+          const tr = mr.acquire(ft.level, ft.tileX, ft.tileY);
+          const tg = mg.acquire(ft.level, ft.tileX, ft.tileY);
+          const tb = mb.acquire(ft.level, ft.tileX, ft.tileY);
+          if (tr === undefined || tg === undefined || tb === undefined) continue;
+          const fRect = tileWorldRect(fGeom, ft.tileX, ft.tileY);
+          this.drawTileRGB(orient, fRect, tr.texture, tg.texture, tb.texture, 0, 0, 1, 1, 1);
+        }
+      }
     }
   }
 
@@ -1214,6 +1361,7 @@ export class FitsViewer {
     v0: number,
     u1: number,
     v1: number,
+    opacity: number,
   ): void {
     const gl = this.gl;
     const p00 = this.worldToNdc(orient, rect.x0, rect.y0);
@@ -1225,6 +1373,7 @@ export class FitsViewer {
     gl.uniform2f(this.uP01, p01.x, p01.y);
     gl.uniform2f(this.uP11, p11.x, p11.y);
     gl.uniform4f(this.uUV, u0, v0, u1, v1);
+    gl.uniform1f(this.uOpacity, opacity);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
@@ -1246,6 +1395,7 @@ export class FitsViewer {
     v0: number,
     u1: number,
     v1: number,
+    opacity: number,
   ): void {
     const gl = this.gl;
     const p00 = this.worldToNdc(orient, rect.x0, rect.y0);
@@ -1257,6 +1407,7 @@ export class FitsViewer {
     gl.uniform2f(this.uP01, p01.x, p01.y);
     gl.uniform2f(this.uP11, p11.x, p11.y);
     gl.uniform4f(this.uUV, u0, v0, u1, v1);
+    gl.uniform1f(this.uOpacity, opacity);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texR);
     gl.activeTexture(gl.TEXTURE2);

@@ -6,6 +6,7 @@ import {
   ringTiles,
   coarserFallback,
   commonResidentLevel,
+  finerFallback,
   selectEvictions,
   buildLevelGeoms,
   tileWorldRect,
@@ -209,6 +210,68 @@ describe('coarserFallback', () => {
   });
 });
 
+describe('finerFallback (zoom-out, overlays resident finer detail)', () => {
+  it('returns all four descendants when the nearest finer block is fully resident', () => {
+    // Target (1,2,1); its four z=0 descendants are (4,2),(5,2),(4,3),(5,3).
+    const loaded = new Set([
+      tileKey(0, 4, 2),
+      tileKey(0, 5, 2),
+      tileKey(0, 4, 3),
+      tileKey(0, 5, 3),
+    ]);
+    const fb = finerFallback(1, 2, 1, (l, x, y) => loaded.has(tileKey(l, x, y)));
+    expect(fb?.level).toBe(0);
+    expect(fb?.tiles).toEqual([
+      { level: 0, tileX: 4, tileY: 2 },
+      { level: 0, tileX: 5, tileY: 2 },
+      { level: 0, tileX: 4, tileY: 3 },
+      { level: 0, tileX: 5, tileY: 3 },
+    ]);
+  });
+
+  it('returns the PARTIAL resident subset (the key zoom-out / periphery case)', () => {
+    // Only three of the four z=0 descendants of (1,2,1) are resident — the caller
+    // draws a coarse base under these and overlays them where they exist.
+    const loaded = new Set([tileKey(0, 4, 2), tileKey(0, 5, 2), tileKey(0, 4, 3)]);
+    const fb = finerFallback(1, 2, 1, (l, x, y) => loaded.has(tileKey(l, x, y)));
+    expect(fb?.level).toBe(0);
+    expect(fb?.tiles).toEqual([
+      { level: 0, tileX: 4, tileY: 2 },
+      { level: 0, tileX: 5, tileY: 2 },
+      { level: 0, tileX: 4, tileY: 3 },
+    ]);
+  });
+
+  it('prefers the NEAREST finer level with any resident detail (fewest, sharpest)', () => {
+    // Target (2,1,0). z=1 block {(2,0),(3,0),(2,1),(3,1)} is resident, and so is
+    // z=0 — but z=1 is nearer the target, so it wins (4 tiles, not 16).
+    const loaded = new Set<string>();
+    for (let x = 2; x <= 3; x++) for (let y = 0; y <= 1; y++) loaded.add(tileKey(1, x, y));
+    for (let x = 4; x <= 7; x++) for (let y = 0; y <= 3; y++) loaded.add(tileKey(0, x, y));
+    const fb = finerFallback(2, 1, 0, (l, x, y) => loaded.has(tileKey(l, x, y)));
+    expect(fb?.level).toBe(1);
+    expect(fb?.tiles).toHaveLength(4);
+  });
+
+  it('falls through to a finer-still level when the nearer one has nothing resident', () => {
+    // z=1 empty; the resident z=0 patch (a far-finer remnant, e.g. the native view
+    // before a fast zoom-out) is surfaced instead of nothing.
+    const loaded = new Set<string>();
+    for (let x = 4; x <= 7; x++) for (let y = 0; y <= 3; y++) loaded.add(tileKey(0, x, y));
+    const fb = finerFallback(2, 1, 0, (l, x, y) => loaded.has(tileKey(l, x, y)));
+    expect(fb?.level).toBe(0);
+    expect(fb?.tiles).toHaveLength(16);
+  });
+
+  it('returns null when nothing finer is resident', () => {
+    expect(finerFallback(1, 2, 1, () => false)).toBeNull();
+  });
+
+  it('returns null at the finest level (z=0 has no descendants)', () => {
+    expect(finerFallback(0, 5, 3, () => true)).toBeNull();
+  });
+});
+
 describe('commonResidentLevel (RGB composite, M4)', () => {
   const maxLevel = 4;
 
@@ -267,6 +330,21 @@ describe('commonResidentLevel (RGB composite, M4)', () => {
       [1, 2, 1],
       [2, 1, 0],
     ]);
+  });
+
+  it('fromLevel=level+1 skips the target level (crossfade-base case)', () => {
+    // The target (0,5,3) IS resident in all bands, but with fromLevel=1 the search
+    // starts strictly coarser and returns the z=1 ancestor instead of the tile.
+    const resident = new Set([tileKey(0, 5, 3), tileKey(1, 2, 1)]);
+    const found = commonResidentLevel(
+      0,
+      5,
+      3,
+      maxLevel,
+      (l, x, y) => resident.has(tileKey(l, x, y)),
+      1,
+    );
+    expect(found).toEqual({ level: 1, tileX: 2, tileY: 1 });
   });
 });
 

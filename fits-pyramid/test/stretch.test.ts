@@ -161,8 +161,10 @@ describe('TILE_FRAG shader — structure + constant injection', () => {
     // The all-NaN branch emits a FULLY TRANSPARENT pixel, right after the predicate.
     const transparent = TILE_FRAG.indexOf('vec4(0.0, 0.0, 0.0, 0.0)', allNan);
     expect(transparent).toBeGreaterThan(allNan);
-    // The composited (not-all-NaN) path writes opaque RGB (alpha 1) and follows it.
-    const composite = TILE_FRAG.indexOf('vec4(rs, gs, bs, 1.0)');
+    // The composited (not-all-NaN) path writes RGB at the crossfade-in alpha
+    // (u_opacity, == 1 once settled) — still distinct from the all-NaN branch's
+    // hard 0.0, so the opaque/transparent D8 split is preserved.
+    const composite = TILE_FRAG.indexOf('vec4(rs, gs, bs, u_opacity)');
     expect(composite).toBeGreaterThan(transparent);
   });
 

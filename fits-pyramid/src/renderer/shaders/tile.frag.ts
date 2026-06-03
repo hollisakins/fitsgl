@@ -46,6 +46,7 @@ uniform float u_min;        // single-band display interval
 uniform float u_max;
 uniform vec3 u_minRGB;      // RGB mode per-channel interval (M4 slot)
 uniform vec3 u_maxRGB;
+uniform float u_opacity;    // crossfade-in ramp (1 = fully settled); scales alpha
 
 const float LOG_A = ${glslFloat(LOG_SOFTENING)};
 const float ASINH_A = ${glslFloat(ASINH_SOFTENING)};
@@ -85,7 +86,7 @@ void main() {
     float rs = rn ? 0.0 : scaleChannel(r, u_minRGB.r, u_maxRGB.r);
     float gs = gn ? 0.0 : scaleChannel(g, u_minRGB.g, u_maxRGB.g);
     float bs = bn ? 0.0 : scaleChannel(b, u_minRGB.b, u_maxRGB.b);
-    outColor = vec4(rs, gs, bs, 1.0);
+    outColor = vec4(rs, gs, bs, u_opacity);
     return;
   }
 
@@ -99,9 +100,9 @@ void main() {
   if (u_useColormap == 1) {
     // Sample the LUT along its width at the row centre; CLAMP_TO_EDGE pins the
     // [0,1] endpoints to the first/last texel.
-    outColor = vec4(texture(u_colormap, vec2(s, 0.5)).rgb, 1.0);
+    outColor = vec4(texture(u_colormap, vec2(s, 0.5)).rgb, u_opacity);
   } else {
-    outColor = vec4(s, s, s, 1.0);
+    outColor = vec4(s, s, s, u_opacity);
   }
 }
 `;

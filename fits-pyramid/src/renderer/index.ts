@@ -50,6 +50,7 @@ export {
   visibleTiles,
   coarserFallback,
   commonResidentLevel,
+  finerFallback,
   selectEvictions,
   buildLevelGeoms,
   tileWorldRect,
@@ -58,4 +59,10 @@ export {
   tileKey,
   TILE_SIZE,
 } from './tile-manager.js';
-export type { TileCoord, WorldRect, LevelGeom, EvictionEntry } from './tile-manager.js';
+export type {
+  TileCoord,
+  WorldRect,
+  LevelGeom,
+  EvictionEntry,
+  FinerCoverage,
+} from './tile-manager.js';

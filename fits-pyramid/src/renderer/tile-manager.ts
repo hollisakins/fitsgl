@@ -210,11 +210,14 @@ export function coarserFallback(
  * must be sampled from the same source level + sub-rectangle in one draw call;
  * registration is guaranteed only when the three bands draw from a COMMON level.
  * Unlike `coarserFallback` (which starts at `level + 1` because the single-band
- * path checks the target level itself separately), this INCLUDES `cl = level` —
- * the common, fully-loaded steady state — then walks up one level at a time
- * (each step halves the tile index). `hasAll(level, tileX, tileY)` must report
- * whether *every* band has that tile resident. Returns the common level and its
- * ancestor tile index, or null if no level up to `maxLevel` is common to all.
+ * path checks the target level itself separately), this INCLUDES `cl = level` by
+ * default — the common, fully-loaded steady state — then walks up one level at a
+ * time (each step halves the tile index). Pass `fromLevel = level + 1` to start
+ * strictly coarser (used when the target level is already handled, e.g. as a
+ * crossfade base that must differ from the target). `hasAll(level, tileX, tileY)`
+ * must report whether *every* band has that tile resident. Returns the common
+ * level and its ancestor tile index, or null if no level up to `maxLevel` is
+ * common to all.
  */
 export function commonResidentLevel(
   level: number,
@@ -222,12 +225,62 @@ export function commonResidentLevel(
   tileY: number,
   maxLevel: number,
   hasAll: (level: number, tileX: number, tileY: number) => boolean,
+  fromLevel: number = level,
 ): TileCoord | null {
-  for (let cl = level; cl <= maxLevel; cl++) {
+  for (let cl = fromLevel; cl <= maxLevel; cl++) {
     const k = cl - level;
     const ctx = Math.floor(tileX / 2 ** k);
     const cty = Math.floor(tileY / 2 ** k);
     if (hasAll(cl, ctx, cty)) return { level: cl, tileX: ctx, tileY: cty };
+  }
+  return null;
+}
+
+/** A finer level plus the descendant tiles of a target that are resident there. */
+export interface FinerCoverage {
+  level: number;
+  /** Resident descendant tiles at `level` — a SUBSET of the 2ᵏ×2ᵏ block (partial). */
+  tiles: TileCoord[];
+}
+
+/**
+ * Finer-level fallback (the zoom-OUT counterpart of `coarserFallback`). When a
+ * target tile is not yet resident, the FINER level the user just left is often
+ * still GPU-resident and covers the same world area at higher resolution — far
+ * better than upscaling a coarse ancestor. Walks DOWN from `level - 1` toward 0
+ * and returns the NEAREST finer level that has ANY resident descendant of the
+ * target, together with the subset of its 2ᵏ×2ᵏ descendant block that is resident.
+ *
+ * Coverage is deliberately PARTIAL: the caller draws a coarse ancestor as a base
+ * first (always hole-free, thanks to the pinned coarsest tile) and then overlays
+ * these finer tiles on top, so the screen shows sharp detail wherever the finer
+ * level loaded and falls back to coarse only in the real gaps. Requiring *full*
+ * coverage instead is brittle — at the viewport periphery and during fast or
+ * multi-level zoom-outs the finer block is rarely complete, which would drop the
+ * whole tile to a coarse upscale (the "big blocks" flash) AND leave the finer
+ * tiles un-acquired, so they evict out from under the next frame. The caller must
+ * `acquire` the returned tiles (mark them visible) to keep the level resident.
+ * Reuses no fetches: it only consults what is already resident.
+ */
+export function finerFallback(
+  level: number,
+  tileX: number,
+  tileY: number,
+  isLoaded: (level: number, tileX: number, tileY: number) => boolean,
+): FinerCoverage | null {
+  for (let fl = level - 1; fl >= 0; fl--) {
+    const n = 2 ** (level - fl);
+    const bx = tileX * n;
+    const by = tileY * n;
+    const tiles: TileCoord[] = [];
+    for (let dy = 0; dy < n; dy++) {
+      for (let dx = 0; dx < n; dx++) {
+        const x = bx + dx;
+        const y = by + dy;
+        if (isLoaded(fl, x, y)) tiles.push({ level: fl, tileX: x, tileY: y });
+      }
+    }
+    if (tiles.length > 0) return { level: fl, tiles };
   }
   return null;
 }
@@ -294,6 +347,8 @@ interface TileTexture {
   width: number;
   height: number;
   lastVisibleFrame: number;
+  /** Wall-clock ms when the tile was uploaded — drives the crossfade-in ramp. */
+  uploadedAt: number;
 }
 
 /**
@@ -411,7 +466,7 @@ export class TileManager {
    * frame) and return the number still queued. The viewer calls this once per
    * frame; when the return is > 0 it schedules another frame to drain the rest.
    */
-  flushUploads(budget: number): number {
+  flushUploads(budget: number, now = 0): number {
     if (this.destroyed) return 0;
     let uploaded = 0;
     while (uploaded < budget && this.pendingUploads.length > 0) {
@@ -423,6 +478,7 @@ export class TileManager {
         width: u.width,
         height: u.height,
         lastVisibleFrame: this.frame,
+        uploadedAt: now,
       });
       uploaded++;
     }
