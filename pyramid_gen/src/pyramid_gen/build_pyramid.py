@@ -85,7 +85,9 @@ def _downsample(data: np.ndarray, factor: int) -> np.ndarray:
     NaN (the expected RuntimeWarning is suppressed).
     """
     if factor == 1:
-        return np.asarray(data, dtype=np.float32)
+        # Copy (not asarray) so the z=0 level is a writable array independent of a
+        # read-only memmap input.
+        return np.array(data, dtype=np.float32)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         reduced = block_reduce(data, factor, func=np.nanmean)
@@ -252,7 +254,7 @@ class _LevelTask:
     filename: str
     tile_size: int
     quantize_level: int
-    data: np.ndarray
+    native_npy: str  # path to a .npy of the native array; workers mmap it (shared)
     header: fits.Header
 
 
@@ -285,12 +287,18 @@ def _build_level(task: _LevelTask) -> dict:
 
     Every level is a display-only RICE_1 + SUBTRACTIVE_DITHER_2 tile set (q=8);
     there is no lossless level (the raw mosaic is distributed separately).
+
+    The native array is read via a read-only memory-map of the shared ``.npy``
+    (``native_npy``), so every level worker shares one copy through the OS page
+    cache rather than receiving a pickled copy of the full mosaic.
     """
+    native = np.load(task.native_npy, mmap_mode="r")
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         native_wcs = WCS(task.header)
 
-    level = _downsample(task.data, task.factor)
+    level = _downsample(native, task.factor)
     level_wcs = _scale_wcs(native_wcs, task.factor)
     level_header = level_wcs.to_header(relax=True)
 
@@ -370,7 +378,8 @@ def build_pyramid(
     report = on_progress if on_progress is not None else (lambda _msg: None)
     report(f"reading {input_path.name} …")
     data, header = _read_input(input_path)
-    report(f"read {data.shape[0]}×{data.shape[1]} mosaic")
+    native_h, native_w = int(data.shape[0]), int(data.shape[1])
+    report(f"read {native_h}×{native_w} mosaic")
 
     stem = input_path.stem
     if output_dir is None:
@@ -378,54 +387,64 @@ def build_pyramid(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    N = n_levels(data.shape, tile_size)
+    N = n_levels((native_h, native_w), tile_size)
 
-    tasks = []
-    for z in range(N + 1):
-        filename = f"{stem}_z{z}.fits.fz"
-        tasks.append(
+    # Stage the native array as a .npy that every level worker memory-maps
+    # (read-only) instead of receiving a pickled copy. Under the 'spawn' start
+    # method, pickling the full mosaic per level is O(levels × mosaic) of IPC +
+    # peak memory and is what makes a large build thrash; the page-cache-backed
+    # mmap shares ONE copy. Freed from the parent here, then unlinked when done.
+    native_npy = output_dir / "_native.npy"
+    np.save(native_npy, data)
+    del data
+
+    try:
+        tasks = [
             _LevelTask(
                 z=z,
                 factor=2**z,
-                out_path=str(output_dir / filename),
-                filename=filename,
+                out_path=str(output_dir / f"{stem}_z{z}.fits.fz"),
+                filename=f"{stem}_z{z}.fits.fz",
                 tile_size=tile_size,
                 quantize_level=quantize_level,
-                data=data,
+                native_npy=str(native_npy),
                 header=header,
             )
+            for z in range(N + 1)
+        ]
+
+        # One process per level -- CompImageHDU writing is not thread-safe within a
+        # level, and levels are fully independent, so process-per-level is the clean
+        # parallel unit. Single level -> run inline to avoid Pool overhead.
+        if len(tasks) == 1:
+            report("building 1 level (z=0) …")
+            level_dicts = [_build_level(tasks[0])]
+            report(f"  z0 done — {level_dicts[0]['shape'][0]}×{level_dicts[0]['shape'][1]}")
+        else:
+            n_proc = processes or min(len(tasks), os.cpu_count() or 1)
+            report(f"building {len(tasks)} levels (z=0..{N}) on {n_proc} worker(s) …")
+            # imap_unordered so each level reports as it finishes (the largest, z=0,
+            # is last); results are collected then sorted by z below, so order holds.
+            level_dicts = []
+            with Pool(processes=n_proc) as pool:
+                for d in pool.imap_unordered(_build_level, tasks):
+                    level_dicts.append(d)
+                    report(
+                        f"  z{d['z']} done — {d['shape'][0]}×{d['shape'][1]} "
+                        f"({len(level_dicts)}/{len(tasks)})"
+                    )
+
+        levels = [LevelInfo.from_dict(d) for d in level_dicts]
+        levels.sort(key=lambda lvl: lvl.z)
+
+        manifest = Manifest(
+            source_file=input_path.name,
+            native_shape=[native_h, native_w],
+            fpack_tile_size=tile_size,
+            n_levels=N,
+            levels=levels,
         )
-
-    # One process per level -- CompImageHDU writing is not thread-safe within a
-    # level, and levels are fully independent, so process-per-level is the clean
-    # parallel unit. Single level -> run inline to avoid Pool overhead.
-    if len(tasks) == 1:
-        report("building 1 level (z=0) …")
-        level_dicts = [_build_level(tasks[0])]
-        report(f"  z0 done — {level_dicts[0]['shape'][0]}×{level_dicts[0]['shape'][1]}")
-    else:
-        n_proc = processes or min(len(tasks), os.cpu_count() or 1)
-        report(f"building {len(tasks)} levels (z=0..{N}) on {n_proc} worker(s) …")
-        # imap_unordered so each level reports as it finishes (the largest, z=0, is
-        # last); results are collected then sorted by z below, so order is preserved.
-        level_dicts = []
-        with Pool(processes=n_proc) as pool:
-            for d in pool.imap_unordered(_build_level, tasks):
-                level_dicts.append(d)
-                report(
-                    f"  z{d['z']} done — {d['shape'][0]}×{d['shape'][1]} "
-                    f"({len(level_dicts)}/{len(tasks)})"
-                )
-
-    levels = [LevelInfo.from_dict(d) for d in level_dicts]
-    levels.sort(key=lambda lvl: lvl.z)
-
-    manifest = Manifest(
-        source_file=input_path.name,
-        native_shape=[int(data.shape[0]), int(data.shape[1])],
-        fpack_tile_size=tile_size,
-        n_levels=N,
-        levels=levels,
-    )
-    write_manifest(output_dir / "manifest.json", manifest)
+        write_manifest(output_dir / "manifest.json", manifest)
+    finally:
+        native_npy.unlink(missing_ok=True)
     return manifest
