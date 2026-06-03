@@ -232,16 +232,27 @@ config and the built dataset at `<out>/<dataset.name>/`. Flow:
 ### 5.2 `fitsgl verify <url>`
 
 Standalone contract checker (also run by `deploy`). Against a deployed base URL:
-fetch `fitsgl.json`; pick a band → its `manifest.json` → a level file → a
-`Range: bytes=0-1023` request asserting **`206`** (correctness — fails); HEAD the
-`.js` asset and the `.fits.fz` asserting MIME types (correctness — fails); with
-`--origin <site>` assert the CORS preflight. Then **fetch a tile twice on both a
-coarse level and `z0`**, checking `CF-Cache-Status` on the second fetch (perf —
-warns): a coarse `MISS` means the §4.4 Cache Rule is missing/misconfigured (warn
-with the exact rule to add); a `MISS` only on `z0` means it exceeds the 512 MB edge
-limit (§4.3) → suggest Cache Reserve. Being a Python CLI, `verify` reads every
-response header directly — unaffected by the browser CORS rules that constrain an
-in-page debug HUD, so it is the authoritative HIT-vs-silent-bypass check.
+fetch `fitsgl.json`; pick a band → its `manifest.json` → a supertile file → a
+`Range: bytes=0-1023` request asserting **`206`** (correctness — fails; a `200`
+prints the "host ignores Range, blank viewer" diagnosis). It asserts the tile's
+`application/octet-stream` and the viewer's `.js` MIME (correctness — fails; the
+`.js` check is skipped on a data-only deploy with no `index.html`). With `--origin
+<site>` it asserts the CORS preflight returns a matching `Allow-Origin` **and**
+permits the `Range` request header (without it the browser blocks the embedder's
+ranged GET). It does **not** follow redirects: a 3xx on the dataset URL is reported,
+not silently chased, so a custom-domain → `r2.dev` misconfig (uncached, §9) surfaces.
+
+Then the perf checks (warn-only): it HEADs **every supertile** of the coarse level
+and `z0` and warns on any object over the 512 MB cap (naming the largest, with the
+"lower `[build].supertile_blocks`" fix — *not* Cache Reserve, which §4.3 shows does
+not help); and it fetches a tile twice on each, reading `CF-Cache-Status` on the
+second — a coarse `MISS` prints the §4.4 Cache Rule recipe, and a `MISS` on `z0`
+**only when the coarse level cached** is blamed on the size cap (if both miss, the
+missing Cache Rule is the cause, reported on both lines). No `CF-Cache-Status` at all
+⇒ the origin isn't behind Cloudflare → the edge checks `skip`. `--strict` promotes
+warnings to failures (CI). Being a Python CLI, `verify` reads every response header
+directly — unaffected by the browser CORS rules that constrain an in-page debug HUD,
+so it is the authoritative HIT-vs-silent-bypass check.
 
 ### 5.3 `[deploy]` config + credentials
 

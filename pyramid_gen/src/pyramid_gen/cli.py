@@ -1,8 +1,10 @@
 """``fitsgl`` — the producer CLI.
 
-Subcommands drive the journey from FITS mosaics to a deployable dataset. The
-first (and currently only) command is ``build``: one ``fitsgl.toml`` in, one
-self-contained dataset directory out. ``init``/``serve``/``deploy`` are planned.
+Subcommands drive the journey from FITS mosaics to a deployable dataset:
+``init`` (scaffold a ``fitsgl.toml``), ``build`` (one toml → one self-contained
+dataset directory), ``serve`` (preview it locally with Range support), and
+``verify`` (assert a deployed URL satisfies the host contract). ``deploy`` (the R2
+push) is the remaining unbuilt command.
 
 ``python -m pyramid_gen`` remains the low-level single-pyramid primitive.
 """
@@ -18,6 +20,7 @@ from .build_pyramid import StopAndAsk
 from .config import load_config
 from .init_scaffold import scan_directory, write_scaffold
 from .serve import serve
+from .verify import format_report, verify_deployment
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,6 +77,19 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("serve", help="Serve a built dataset directory over HTTP with byte-range support.")
     ps.add_argument("dataset_dir", type=Path, help="Dataset directory to serve (e.g. dist/<name>).")
     ps.add_argument("-p", "--port", type=int, default=8000, help="Port (default 8000; 0 = pick a free port).")
+
+    pv = sub.add_parser("verify", help="Check a deployed dataset URL against the host contract (Range/MIME/CORS).")
+    pv.add_argument("url", help="Base URL of the deployed dataset (where fitsgl.json lives).")
+    pv.add_argument(
+        "--origin",
+        default=None,
+        help="Also assert the cross-origin CORS preflight for an embedder at this site (e.g. https://campfire.example).",
+    )
+    pv.add_argument(
+        "--strict",
+        action="store_true",
+        help="Promote warnings (cold edge cache, oversized objects) to failures — for CI.",
+    )
     return p
 
 
@@ -162,6 +178,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_verify(args: argparse.Namespace) -> int:
+    try:
+        report = verify_deployment(args.url, origin=args.origin)
+    except (ValueError, OSError) as e:
+        print(f"fitsgl verify: {e}", file=sys.stderr)
+        return 2
+    print(format_report(report, strict=args.strict), flush=True)
+    return report.exit_code(strict=args.strict)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "init":
@@ -170,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_build(args)
     if args.command == "serve":
         return _cmd_serve(args)
+    if args.command == "verify":
+        return _cmd_verify(args)
     return 1
 
 
