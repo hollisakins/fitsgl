@@ -158,27 +158,36 @@ describe('TILE_FRAG shader — structure + constant injection', () => {
     for (const u of ['u_tileG', 'u_tileB', 'u_minRGB', 'u_maxRGB']) {
       expect(TILE_FRAG).toContain(u);
     }
-    // D8: all-NaN -> transparent, AND each channel independently falls back to 0.
+    // D8: all-NaN -> opaque background (u_bg), AND each channel independently
+    // falls back to 0.
     expect(TILE_FRAG).toContain('rn && gn && bn');
     expect(TILE_FRAG).toContain('rn ? 0.0 :');
     expect(TILE_FRAG).toContain('gn ? 0.0 :');
     expect(TILE_FRAG).toContain('bn ? 0.0 :');
   });
 
-  it('pins the load-bearing D8 outputs (transparent alpha vs opaque black; composited alpha 1)', () => {
+  it('pins the load-bearing no-data outputs (opaque background at FULL alpha, not u_opacity)', () => {
     // Without a headless WebGL2 we cannot execute the shader, so pin the exact
-    // OUTPUTS — not just the predicates — so an opaque-black regression
-    // (vec4(...,1.0) instead of vec4(...,0.0)) for an all-NaN pixel is caught.
+    // OUTPUTS — not just the predicates. No-data (all-NaN) must emit the OPAQUE
+    // background `u_bg` at full alpha so it OCCLUDES the coarse fallback drawn
+    // beneath it (otherwise a coarser level's nanmean-grown edge bleeds through
+    // the finer NaN — the zoom-out edge flash). Two regressions to catch:
+    //   1. reverting to a transparent pixel (vec4(...,0.0)) — reopens the bleed;
+    //   2. emitting it at vec4(u_bg, u_opacity) — bleeds back mid-crossfade.
+    expect(TILE_FRAG).toContain('uniform vec3 u_bg');
+    expect(TILE_FRAG).not.toContain('vec4(0.0, 0.0, 0.0, 0.0)');
     const allNan = TILE_FRAG.indexOf('rn && gn && bn');
     expect(allNan).toBeGreaterThan(-1);
-    // The all-NaN branch emits a FULLY TRANSPARENT pixel, right after the predicate.
-    const transparent = TILE_FRAG.indexOf('vec4(0.0, 0.0, 0.0, 0.0)', allNan);
-    expect(transparent).toBeGreaterThan(allNan);
+    // The all-NaN branch emits opaque background at FULL alpha, right after it.
+    const bgOut = TILE_FRAG.indexOf('vec4(u_bg, 1.0)', allNan);
+    expect(bgOut).toBeGreaterThan(allNan);
     // The composited (not-all-NaN) path writes RGB at the crossfade-in alpha
-    // (u_opacity, == 1 once settled) — still distinct from the all-NaN branch's
-    // hard 0.0, so the opaque/transparent D8 split is preserved.
+    // (u_opacity, == 1 once settled) — distinct from the no-data branch's full
+    // alpha, so the occluding-no-data contract is preserved.
     const composite = TILE_FRAG.indexOf('vec4(rs, gs, bs, u_opacity)');
-    expect(composite).toBeGreaterThan(transparent);
+    expect(composite).toBeGreaterThan(bgOut);
+    // Single-band no-data takes the same opaque-background path (a second u_bg out).
+    expect(TILE_FRAG.indexOf('vec4(u_bg, 1.0)', composite)).toBeGreaterThan(composite);
   });
 
   it('targets GLSL ES 3.00 with highp (required for R32F range)', () => {

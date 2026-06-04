@@ -107,6 +107,13 @@ const PREFETCH_MARGIN = 1;
 const PREFETCH_IDLE_MS = 150;
 /** Wheel sensitivity: zoom factor per deltaY unit (exponential). */
 const WHEEL_ZOOM_RATE = 0.0015;
+/**
+ * Opaque background colour (RGB). The canvas clears to this and the shader emits
+ * it for NaN/no-data pixels, so no-data reads identically whether it falls on the
+ * cleared frame or over a fallback tile — and occludes the latter (see u_bg in
+ * tile.frag). Keep in sync with the clearColor call.
+ */
+const BG_COLOR: readonly [number, number, number] = [0, 0, 0];
 
 /**
  * Read-only viewer state reported once per drawn frame. The viewer renders on
@@ -301,6 +308,7 @@ export class FitsViewer {
   private readonly uOpacity: WebGLUniformLocation | null;
   private readonly uTrilogyK: WebGLUniformLocation | null;
   private readonly uTrilogyLsat: WebGLUniformLocation | null;
+  private readonly uBg: WebGLUniformLocation | null;
 
   private stretchMin = 0;
   private stretchMax = 1;
@@ -439,6 +447,7 @@ export class FitsViewer {
     this.uOpacity = gl.getUniformLocation(this.program, 'u_opacity');
     this.uTrilogyK = gl.getUniformLocation(this.program, 'u_trilogyK');
     this.uTrilogyLsat = gl.getUniformLocation(this.program, 'u_trilogyLsat');
+    this.uBg = gl.getUniformLocation(this.program, 'u_bg');
 
     this.camera = new Camera(Math.max(1, canvas.width), Math.max(1, canvas.height));
     // In RGB mode every band must share the construction grid (identical shape +
@@ -469,7 +478,7 @@ export class FitsViewer {
       markerTooltip: options.markerTooltip,
     };
 
-    gl.clearColor(0, 0, 0, 1);
+    gl.clearColor(BG_COLOR[0], BG_COLOR[1], BG_COLOR[2], 1);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
@@ -1101,6 +1110,8 @@ export class FitsViewer {
     // Trilogy softening + luminance saturation (mode 3); inert for other modes.
     gl.uniform1f(this.uTrilogyK, this.trilogyK);
     gl.uniform1f(this.uTrilogyLsat, this.trilogyLsat);
+    // No-data colour: NaN pixels emit this so they occlude the fallback beneath.
+    gl.uniform3f(this.uBg, BG_COLOR[0], BG_COLOR[1], BG_COLOR[2]);
 
     const orient = this.currentOrientation();
     // Under rotation the viewport maps to a rotated world rectangle; intersect
@@ -1142,6 +1153,28 @@ export class FitsViewer {
         }
       }
       for (const m of this.bandManagers) m.cancelExcept(level, retain);
+
+      // Option A: keep the next-coarser PARENT level warm so a zoom-out lands on
+      // already-resident tiles — and so any still-missing target tile falls back
+      // on a one-step-coarser ancestor — instead of snapping to the pinned
+      // whole-image overview (the coarse "blocky flash"). Prefetch the parent
+      // tiles over the viewport while idle (like the ring, so it never competes
+      // with visible fetches mid-gesture) and re-acquire any resident ones every
+      // frame so they survive idle/budget eviction while the user lingers here.
+      // `cancelExcept` only aborts fetches at the target level, so these parent
+      // fetches are never cancelled. Skipped at the coarsest level (no parent).
+      if (level < this.maxLevel) {
+        const parentLevel = level + 1;
+        const parentGeom = this.geoms.get(parentLevel);
+        if (parentGeom !== undefined) {
+          for (const t of visibleTiles(parentGeom, bounds)) {
+            for (const m of this.bandManagers) {
+              if (this.cameraIdle) m.request(parentLevel, t.tileX, t.tileY);
+              m.acquire(parentLevel, t.tileX, t.tileY);
+            }
+          }
+        }
+      }
     }
 
     // Pin the coarsest whole-image tile (per band) as the last-resort coarse-to-

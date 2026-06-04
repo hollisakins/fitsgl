@@ -11,8 +11,14 @@
  * min/max normalization, the (optional non-linear) stretch, and the grey/LUT
  * mapping on the fly, so changing stretch or colormap never refetches data.
  * NaN pixels (blank/edge padding, preserved bit-exact through the decode path)
- * are emitted transparent. In RGB mode a NaN contributes 0 to its channel and a
- * pixel is transparent only when all three channels are NaN (decision D8).
+ * are emitted as the OPAQUE background colour `u_bg`, not transparent. The
+ * settled look is identical (the canvas clears to that same colour), but an
+ * opaque no-data pixel OCCLUDES whatever coarse fallback tile was painted beneath
+ * it this frame instead of revealing it — so a coarser level's nanmean-grown edge
+ * can no longer bleed through the finer level's NaN holes (the zoom-out edge
+ * flash). Full alpha is deliberate: it must occlude even mid-crossfade, when the
+ * tile on top is otherwise drawn at `u_opacity < 1`. In RGB mode a NaN contributes
+ * 0 to its channel and the pixel is background only when all three are NaN (D8).
  *
  * `highp float` is required: R32F samples span the full float range and `mediump`
  * would collapse large pixel values. The asinh/log softening constants are
@@ -49,6 +55,7 @@ uniform vec3 u_maxRGB;
 uniform float u_opacity;    // crossfade-in ramp (1 = fully settled); scales alpha
 uniform float u_trilogyK;   // trilogy softening (mode 3); solved on the host from noiselum
 uniform float u_trilogyLsat;// trilogy RGB: bias-subtracted luminance mapping to 1
+uniform vec3 u_bg;          // opaque background colour; NaN/no-data pixels emit this
 
 const float LOG_A = ${glslFloat(LOG_SOFTENING)};
 const float ASINH_A = ${glslFloat(ASINH_SOFTENING)};
@@ -86,7 +93,10 @@ void main() {
     bool gn = isnan(g);
     bool bn = isnan(b);
     if (rn && gn && bn) {
-      outColor = vec4(0.0, 0.0, 0.0, 0.0);
+      // No data in any channel: opaque background, so it occludes the fallback
+      // beneath rather than letting a coarse ancestor bleed through (full alpha,
+      // not u_opacity, so it holds even mid-crossfade).
+      outColor = vec4(u_bg, 1.0);
       return;
     }
     if (u_stretchMode == 3) {
@@ -114,10 +124,11 @@ void main() {
     return;
   }
 
-  // Single-band. NaN (blank/edge padding) is fully transparent.
+  // Single-band. NaN (blank/edge padding) is opaque background — occludes the
+  // fallback beneath instead of revealing it (full alpha, not u_opacity).
   float v = texture(u_tile, v_uv).r;
   if (isnan(v)) {
-    outColor = vec4(0.0, 0.0, 0.0, 0.0);
+    outColor = vec4(u_bg, 1.0);
     return;
   }
   float s = scaleChannel(v, u_min, u_max, u_trilogyK);
