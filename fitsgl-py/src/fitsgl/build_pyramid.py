@@ -188,12 +188,15 @@ def quant_atol(data: np.ndarray) -> float:
     """Absolute tolerance for a q=8 RICE round-trip.
 
     The quantization step is ~noise_sigma/8, so the per-pixel error (including the
-    subtractive-dither residual) stays well under noise_sigma. We use one
-    noise_sigma as a safe upper bound that still flags gross corruption (which
-    would be many sigma). A small floor handles degenerate noiseless inputs.
+    subtractive-dither residual) stays well under noise_sigma. We bound at two
+    noise_sigma: astropy drives the q=8 step from its own noise estimator, which
+    can run hotter than this robust MAD estimate (gradients/sources inflate it),
+    so a legitimate worst-case dither residual can sit just over one MAD-sigma.
+    2x absorbs that mismatch while still flagging gross corruption (many sigma).
+    A small floor handles degenerate noiseless inputs.
     """
     sigma = estimate_noise(data)
-    return max(sigma, 1e-6)
+    return max(sigma, 1e-6) * 2.0
 
 
 def _verify_roundtrip(original: np.ndarray, readback: np.ndarray, z: int) -> None:
