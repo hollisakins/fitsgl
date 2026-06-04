@@ -165,6 +165,7 @@ def test_parses_full_deploy_block(tmp_path):
         prefix = "cosmos"
         viewer_origin = "https://campfire.example"
         tile_max_age = 86400
+        concurrency = 16
         """,
     )
     d = load_config(p).deploy
@@ -172,7 +173,7 @@ def test_parses_full_deploy_block(tmp_path):
     assert (d.bucket, d.endpoint) == ("cosmos-web", "https://acct.r2.cloudflarestorage.com")
     assert d.public_url == "https://data.example.org/cosmos-web"
     assert (d.zone_id, d.prefix, d.viewer_origin) == ("zone123", "cosmos", "https://campfire.example")
-    assert d.tile_max_age == 86400 and d.target == "r2"
+    assert d.tile_max_age == 86400 and d.concurrency == 16 and d.target == "r2"
 
 
 def test_deploy_absent_is_none(tmp_path):
@@ -189,6 +190,7 @@ def test_deploy_minimal_uses_defaults(tmp_path):
     assert d is not None
     assert d.zone_id is None and d.prefix == "" and d.viewer_origin == "*"
     assert d.tile_max_age == 604800 and d.swr_grace == 2592000  # defaults; swr_grace not a TOML knob
+    assert d.concurrency == 8  # default parallel upload streams
 
 
 def test_deploy_validation_errors(tmp_path):
@@ -204,6 +206,8 @@ def test_deploy_validation_errors(tmp_path):
         load('target = "s3"\nbucket = "b"\nendpoint = "https://e"\npublic_url = "https://u"\n')
     with pytest.raises(ValueError, match="tile_max_age"):  # must be positive
         load('bucket = "b"\nendpoint = "https://e"\npublic_url = "https://u"\ntile_max_age = 0\n')
+    with pytest.raises(ValueError, match="concurrency"):  # must be positive
+        load('bucket = "b"\nendpoint = "https://e"\npublic_url = "https://u"\nconcurrency = 0\n')
 
 
 def test_minimal_single_band_uses_defaults(tmp_path):

@@ -248,6 +248,7 @@ def render_toml(plan: InitPlan, config_dir: Path) -> str:
         '# prefix = ""                # optional key prefix within the bucket',
         '# viewer_origin = "*"        # CORS Allow-Origin for cross-site embedding',
         "# tile_max_age = 604800      # seconds the edge serves a tile before revalidating (default 7d)",
+        "# concurrency = 8            # parallel upload streams to R2 (default 8; --concurrency overrides)",
     ]
     return "\n".join(lines) + "\n"
 

@@ -23,7 +23,11 @@ try:  # tomllib is stdlib on 3.11+; tomli is the backport for 3.10.
 except ModuleNotFoundError:  # pragma: no cover - exercised only on 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
-from .deploy_plan import DEFAULT_SWR_GRACE, DEFAULT_TILE_MAX_AGE  # CDN cache-window defaults (lightweight, no astropy)
+from .deploy_plan import (  # CDN cache-window + upload defaults (lightweight, no astropy)
+    DEFAULT_SWR_GRACE,
+    DEFAULT_TILE_MAX_AGE,
+    DEFAULT_UPLOAD_CONCURRENCY,
+)
 
 #: Known transfer curves (kept in lockstep with the TS ``StretchMode``).
 STRETCH_MODES = ("linear", "log", "asinh")
@@ -119,6 +123,7 @@ class DeployConfig:
     viewer_origin: str = "*"  # CORS Allow-Origin (DP8)
     tile_max_age: int = DEFAULT_TILE_MAX_AGE
     swr_grace: int = DEFAULT_SWR_GRACE
+    concurrency: int = DEFAULT_UPLOAD_CONCURRENCY  # parallel upload streams; CLI --concurrency overrides
     target: str = "r2"  # only "r2" in v1
 
 
@@ -271,7 +276,7 @@ def _parse_deploy(raw: object) -> DeployConfig | None:
 
     Validates identifiers only (no secrets). ``bucket``/``endpoint``/``public_url``
     are required; ``zone_id``/``prefix``/``viewer_origin`` optional strings;
-    ``tile_max_age`` an optional positive int; ``target`` must be ``"r2"``.
+    ``tile_max_age``/``concurrency`` optional positive ints; ``target`` must be ``"r2"``.
     """
     if raw is None:
         return None
@@ -302,6 +307,11 @@ def _parse_deploy(raw: object) -> DeployConfig | None:
         v = raw["tile_max_age"]
         _require(isinstance(v, int) and not isinstance(v, bool) and v > 0, "[deploy].tile_max_age must be a positive integer")
         out.tile_max_age = v
+
+    if "concurrency" in raw:
+        v = raw["concurrency"]
+        _require(isinstance(v, int) and not isinstance(v, bool) and v > 0, "[deploy].concurrency must be a positive integer")
+        out.concurrency = v
 
     return out
 

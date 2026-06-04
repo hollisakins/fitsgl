@@ -30,6 +30,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
@@ -38,8 +39,10 @@ from .config import DeployConfig  # re-exported below; config.py owns the parsed
 from .deploy_plan import (
     CLASS_POINTER,
     CLASS_TILE,
+    DEFAULT_UPLOAD_CONCURRENCY,
     DEPLOY_MANIFEST_NAME,
     DeployDiff,
+    DeployFile,
     DeployManifest,
     build_deploy_manifest,
     cache_control_for,
@@ -158,6 +161,53 @@ def _merge_site_ledger(remote: DeployManifest | None, local_site: DeployManifest
 # ----------------------------------------------------------- the orchestration
 
 
+def _upload_files(
+    target: DeployTarget,
+    files: list[DeployFile],
+    *,
+    dataset_dir: Path,
+    prefix: str,
+    max_workers: int,
+    log: Callable[[str], None],
+) -> list[str]:
+    """PUT every file in ``files`` to ``target``, up to ``max_workers`` in flight.
+
+    A barrier: returns only once *all* of ``files`` are up — callers lean on that to
+    keep tiles strictly ahead of the pointers that reference them. The cost is one
+    PutObject per file: the ledger diff already pruned unchanged files and nothing
+    here HEADs or lists, so widening the stream buys speed at no extra R2 operations.
+
+    On the first failure, stops launching pending uploads and re-raises, so a partial
+    failure never reaches the success ledger. Returns the uploaded paths in ``files``
+    order — independent of completion order, so the DeployResult stays deterministic.
+    """
+    def _put(f: DeployFile) -> None:
+        log(f"upload {f.path} ({f.cls}, {f.size / (1024 * 1024):.2f} MB)")
+        target.put_file(
+            object_key(prefix, f.path),
+            dataset_dir / f.path,
+            content_type=f.content_type,
+            cache_control=f.cache_control,
+        )
+
+    if not files:
+        return []
+    workers = max(1, min(max_workers, len(files)))
+    if workers == 1:  # keep the simple, fully-ordered path when there's nothing to parallelize
+        for f in files:
+            _put(f)
+        return [f.path for f in files]
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fitsgl-upload") as ex:
+        futures = [ex.submit(_put, f) for f in files]
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+        for fut in futures:
+            fut.cancel()  # no-op on the running/finished ones; drops the not-yet-started
+        for fut in done:
+            fut.result()  # re-raise the first failure (the cancel above stops the rest)
+    return [f.path for f in files]
+
+
 def deploy_dataset(
     dataset_dir: str | Path,
     config: DeployConfig,
@@ -167,6 +217,7 @@ def deploy_dataset(
     dry_run: bool = False,
     run_verify: bool = True,
     site_only: bool = False,
+    max_workers: int = DEFAULT_UPLOAD_CONCURRENCY,
     verify_fn: Callable[[str], VerifyReport] | None = None,
     confirm: Callable[[DeployDiff], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
@@ -179,9 +230,11 @@ def deploy_dataset(
     files (``index.html`` + ``assets/``) — hashing only those, and merging their
     entries into the prior ledger so the data files' entries are preserved.
     ``confirm`` (if given) is called with the computed diff before any writes; return
-    ``False`` to abort. ``run_verify`` runs the post-deploy contract check
-    (``verify_fn`` overrides the checker — tests inject a fake to avoid real
-    network). ``on_progress`` is called with human-readable status lines.
+    ``False`` to abort. ``max_workers`` is how many files upload at once (a barrier
+    separates the tile group from the pointer/asset group, so a higher value never
+    races a manifest ahead of its tiles). ``run_verify`` runs the post-deploy
+    contract check (``verify_fn`` overrides the checker — tests inject a fake to avoid
+    real network). ``on_progress`` is called with human-readable status lines.
     """
     log = on_progress if on_progress is not None else (lambda _msg: None)
     dataset_dir = Path(dataset_dir)
@@ -217,17 +270,16 @@ def deploy_dataset(
 
     result = DeployResult(diff=diff, dry_run=False)
 
-    # 3. Upload the delta — tiles before pointers/assets, so a freshly-visible
-    #    (no-cache) manifest never references a tile that isn't up yet.
-    for f in sorted(diff.upload, key=lambda d: 0 if d.cls == CLASS_TILE else 1):
-        log(f"upload {f.path} ({f.cls}, {f.size / (1024 * 1024):.2f} MB)")
-        target.put_file(
-            object_key(config.prefix, f.path),
-            dataset_dir / f.path,
-            content_type=f.content_type,
-            cache_control=f.cache_control,
+    # 3. Upload the delta — all tiles first (a barrier), then pointers/assets, so a
+    #    freshly-visible (no-cache) manifest never references a tile that isn't up yet.
+    #    Within each group, up to max_workers stream in parallel.
+    tiles = [f for f in diff.upload if f.cls == CLASS_TILE]
+    others = [f for f in diff.upload if f.cls != CLASS_TILE]
+    for group in (tiles, others):
+        result.uploaded += _upload_files(
+            target, group,
+            dataset_dir=dataset_dir, prefix=config.prefix, max_workers=max_workers, log=log,
         )
-        result.uploaded.append(f.path)
 
     # Delete orphans (e.g. supertiles renamed by a re-tile) so R2 never accumulates.
     for path in diff.delete:
@@ -301,27 +353,59 @@ class R2Target:
     extra). Not unit-tested (needs boto3 + a live bucket); the orchestration is
     tested against a fake. Calls are the verified S3-compat surface from §6."""
 
-    def __init__(self, *, bucket: str, endpoint: str, access_key: str, secret_key: str, region: str = "auto") -> None:
+    #: Upload as a single PutObject up to this size, multipart above it. R2 caps a
+    #: single PUT at 5 GiB; tiles (incl. supertile blocks, ≤~512 MB) sit well under 4
+    #: GiB, so this makes every realistic tile *one* Class-A op instead of dozens of
+    #: UploadPart calls — only a pathologically large object falls back to multipart.
+    _MULTIPART_THRESHOLD = 4 * 1024**3
+    _MULTIPART_CHUNKSIZE = 512 * 1024**2  # parts for the rare >4 GiB object
+
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        endpoint: str,
+        access_key: str,
+        secret_key: str,
+        region: str = "auto",
+        max_pool_connections: int = 10,
+    ) -> None:
         try:
             import boto3  # noqa: PLC0415 — lazy so the package imports without the extra
-            from botocore.exceptions import ClientError
+            from boto3.s3.transfer import TransferConfig  # noqa: PLC0415
+            from botocore.config import Config  # noqa: PLC0415
+            from botocore.exceptions import ClientError  # noqa: PLC0415
         except ImportError as e:  # pragma: no cover - exercised only without the extra
             raise DeployError(
                 "fitsgl deploy needs boto3 — install the extra: pip install 'fitsgl[deploy]'"
             ) from e
         self.bucket = bucket
         self._client_error = ClientError
+        # Size the connection pool to the upload concurrency so parallel PUTs don't
+        # queue on a too-small pool (botocore defaults to 10) and warn.
         self._s3 = boto3.client(
             "s3",
             endpoint_url=endpoint,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name=region,
+            config=Config(max_pool_connections=max_pool_connections),
+        )
+        self._transfer = TransferConfig(
+            multipart_threshold=self._MULTIPART_THRESHOLD,
+            multipart_chunksize=self._MULTIPART_CHUNKSIZE,
+            # We already parallelize across files, so keep per-file part concurrency
+            # modest — only the rare multipart object uses it.
+            max_concurrency=4,
         )
 
     @classmethod
-    def from_config(cls, config: DeployConfig) -> "R2Target":
-        """Build from a :class:`DeployConfig` + R2 credentials in the environment."""
+    def from_config(cls, config: DeployConfig, *, concurrency: int = DEFAULT_UPLOAD_CONCURRENCY) -> "R2Target":
+        """Build from a :class:`DeployConfig` + R2 credentials in the environment.
+
+        ``concurrency`` (the deploy's parallel-upload width) sizes the HTTP connection
+        pool so concurrent PUTs each get a connection instead of serializing on it.
+        """
         access_key = os.environ.get("R2_ACCESS_KEY_ID")
         secret_key = os.environ.get("R2_SECRET_ACCESS_KEY")
         if not access_key or not secret_key:
@@ -329,7 +413,11 @@ class R2Target:
                 "set R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in the environment "
                 "(R2 S3-compatible credentials)"
             )
-        return cls(bucket=config.bucket, endpoint=config.endpoint, access_key=access_key, secret_key=secret_key)
+        return cls(
+            bucket=config.bucket, endpoint=config.endpoint,
+            access_key=access_key, secret_key=secret_key,
+            max_pool_connections=max(10, concurrency + 4),
+        )
 
     def get_bytes(self, key: str) -> bytes | None:  # pragma: no cover - needs a live bucket
         try:
@@ -346,12 +434,14 @@ class R2Target:
             raise DeployError(f"R2 get_object {key!r} failed: {e}") from e
 
     def put_file(self, key: str, path: Path, *, content_type: str, cache_control: str) -> None:  # pragma: no cover
-        # upload_file streams from disk and switches to multipart automatically for
-        # objects over the single-PUT limit (a large z0) — boto3 does not auto-detect
-        # the content-type, so we pass it explicitly.
+        # upload_file streams from disk (never slurps the whole file into RAM) and
+        # switches to multipart only above our raised threshold — boto3 does not
+        # auto-detect the content-type, so we pass it explicitly. Safe to call from
+        # several threads at once: the botocore client is thread-safe for calls.
         self._s3.upload_file(
             str(path), self.bucket, key,
             ExtraArgs={"ContentType": content_type, "CacheControl": cache_control},
+            Config=self._transfer,
         )
 
     def put_bytes(self, key: str, data: bytes, *, content_type: str, cache_control: str) -> None:  # pragma: no cover

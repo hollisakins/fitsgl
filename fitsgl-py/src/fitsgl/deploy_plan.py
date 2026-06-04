@@ -54,6 +54,12 @@ ASSET_MAX_AGE = 31536000
 #: supertiled dataset routinely exceeds this, so :func:`chunk_purge_urls` batches.
 PURGE_URLS_PER_CALL = 100
 
+#: How many tiles ``fitsgl deploy`` uploads to R2 at once. Concurrency only changes
+#: wall-clock — the work is one PutObject per *changed* file (the ledger diff already
+#: skips unchanged ones), so a wider stream does not add R2 operations. 8 keeps a
+#: home/CI uplink saturated without exhausting the boto3 connection pool.
+DEFAULT_UPLOAD_CONCURRENCY = 8
+
 #: Read chunk for hashing — tiles are GB-scale, so never slurp a whole file.
 _HASH_CHUNK = 1024 * 1024
 
