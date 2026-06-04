@@ -20,6 +20,7 @@ from .build import build_dataset, write_site
 from .build_pyramid import StopAndAsk
 from .config import load_config
 from .deploy import CloudflarePurge, DeployError, R2Target, deploy_dataset
+from .env_file import load_env_file
 from .deploy_plan import DeployDiff
 from .init_scaffold import scan_directory, write_scaffold
 from .serve import serve
@@ -101,6 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--no-verify", action="store_true", help="Skip the post-deploy contract check against the live URL.")
     pd.add_argument("--site-only", action="store_true", help="Push only the viewer (index.html + assets/); leave the data + its ledger entries untouched.")
     pd.add_argument("--yes", action="store_true", help="Skip the upload confirmation prompt.")
+    pd.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Read R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / CLOUDFLARE_API_TOKEN from this .env "
+        "file (default: a .env next to the fitsgl.toml, if present). Real environment variables "
+        "take precedence over the file.",
+    )
     return p
 
 
@@ -234,6 +243,21 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     if not (dataset_dir / "fitsgl.json").is_file():
         print(f"fitsgl deploy: no built dataset at {dataset_dir} — run `fitsgl build` first", file=sys.stderr)
         return 2
+
+    # Load credentials from a .env (next to the fitsgl.toml by default) before the
+    # adapters read them from the environment. Real env vars win over the file; an
+    # explicitly-requested --env-file that's missing is an error, a missing default is not.
+    env_path = args.env_file if args.env_file is not None else config.config_dir / ".env"
+    if args.env_file is not None and not env_path.is_file():
+        print(f"fitsgl deploy: --env-file not found: {env_path}", file=sys.stderr)
+        return 2
+    try:
+        applied = load_env_file(env_path)
+    except OSError as e:
+        print(f"fitsgl deploy: could not read {env_path}: {e}", file=sys.stderr)
+        return 2
+    if applied:
+        print(f"loaded {', '.join(applied)} from {env_path}", flush=True)
 
     try:
         target = R2Target.from_config(config.deploy)

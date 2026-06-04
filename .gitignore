@@ -6,6 +6,11 @@ build/
 dist/
 .DS_Store
 
+# Deploy secrets — never commit (`fitsgl deploy` reads these; see docs/r2-setup.md)
+.env
+.env.*
+*.env
+
 # The vendored SSG viewer bundle is a committed build artifact — keep it tracked
 # even if a broader ignore rule is added above later.
 !fitsgl-py/src/fitsgl/_viewer/

@@ -229,10 +229,16 @@ def render_toml(plan: InitPlan, config_dir: Path) -> str:
         lines.append("# (no co-gridded group of >=3 bands found, so RGB is not offered as a default)")
 
     # Commented [deploy] stub — fill in + uncomment to enable `fitsgl deploy` to
-    # Cloudflare R2. Credentials come from the environment, never this file:
-    # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY and (for the edge purge) CLOUDFLARE_API_TOKEN.
+    # Cloudflare R2. Secrets never live in this file: `fitsgl deploy` reads them from
+    # the environment or a `.env` next to this fitsgl.toml (R2_ACCESS_KEY_ID /
+    # R2_SECRET_ACCESS_KEY and, for the edge purge, CLOUDFLARE_API_TOKEN). The secrets
+    # note below sits ABOVE `# [deploy]` so it stays a comment even when the block is
+    # uncommented wholesale (see test_deploy_stub_round_trips_when_uncommented).
     lines += [
         "",
+        "# Secrets are NOT set here — put R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY (and",
+        "# CLOUDFLARE_API_TOKEN for the edge purge) in your shell or a git-ignored .env",
+        "# next to this file. See docs/r2-setup.md.",
         "# [deploy]                 # `fitsgl deploy` target — Cloudflare R2 (see docs/deploy-design.md §5.3)",
         '# target = "r2"',
         '# bucket = "my-bucket"',

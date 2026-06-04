@@ -7,6 +7,7 @@ purge batching are tested directly.
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -549,3 +550,79 @@ def test_confirm_deploy_prompt(monkeypatch):
 
     monkeypatch.setattr("builtins.input", _raise_eof)
     assert confirm(nonnoop) is False  # non-interactive stdin → clean decline, not a crash
+
+
+# ----------------------------------------------------------------- .env loading
+
+
+def _capture_creds_target(seen):
+    """A stub R2Target whose from_config records the creds it sees in the env."""
+
+    def from_config(cls, c):
+        seen["ak"] = os.environ.get("R2_ACCESS_KEY_ID")
+        seen["sk"] = os.environ.get("R2_SECRET_ACCESS_KEY")
+        return FakeTarget()
+
+    return type("R2", (), {"from_config": classmethod(from_config)})
+
+
+def test_cli_deploy_loads_dotenv_next_to_config(tmp_path, monkeypatch, capsys):
+    import fitsgl.cli as cli
+
+    # No creds in the shell — they must come from the .env next to the fitsgl.toml.
+    monkeypatch.delenv("R2_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("R2_SECRET_ACCESS_KEY", raising=False)
+    toml, out = _project(tmp_path)
+    (tmp_path / ".env").write_text("R2_ACCESS_KEY_ID=ak\nR2_SECRET_ACCESS_KEY=sk\n")
+
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr(cli, "R2Target", _capture_creds_target(seen))
+    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+
+    rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify"])
+    assert rc == 0
+    assert seen == {"ak": "ak", "sk": "sk"}  # adapters saw the .env-supplied creds
+    assert "loaded R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY" in capsys.readouterr().out
+
+
+def test_cli_deploy_shell_env_wins_over_dotenv(tmp_path, monkeypatch):
+    import fitsgl.cli as cli
+
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "from-shell")
+    monkeypatch.delenv("R2_SECRET_ACCESS_KEY", raising=False)
+    toml, out = _project(tmp_path)
+    (tmp_path / ".env").write_text("R2_ACCESS_KEY_ID=from-file\nR2_SECRET_ACCESS_KEY=sk\n")
+
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr(cli, "R2Target", _capture_creds_target(seen))
+    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+
+    cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify"])
+    assert seen["ak"] == "from-shell"  # real env wins; the .env only filled the absent key
+    assert seen["sk"] == "sk"
+
+
+def test_cli_deploy_custom_env_file_flag(tmp_path, monkeypatch):
+    import fitsgl.cli as cli
+
+    monkeypatch.delenv("R2_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("R2_SECRET_ACCESS_KEY", raising=False)
+    toml, out = _project(tmp_path)
+    custom = tmp_path / "secrets.env"
+    custom.write_text("R2_ACCESS_KEY_ID=ak2\nR2_SECRET_ACCESS_KEY=sk2\n")
+
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr(cli, "R2Target", _capture_creds_target(seen))
+    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+
+    rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--env-file", str(custom), "--yes", "--no-verify"])
+    assert rc == 0 and seen == {"ak": "ak2", "sk": "sk2"}
+
+
+def test_cli_deploy_missing_explicit_env_file_errors(tmp_path, capsys):
+    from fitsgl.cli import main
+
+    toml, out = _project(tmp_path)
+    rc = main(["deploy", "-c", str(toml), "-o", str(out), "--env-file", str(tmp_path / "nope.env"), "--yes"])
+    assert rc == 2
+    assert "--env-file not found" in capsys.readouterr().err

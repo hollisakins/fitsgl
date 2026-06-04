@@ -26,7 +26,7 @@ this just removes the guesswork and flags the one step that's easy to miss.
 ## The setup at a glance
 
 Four one-time steps in the Cloudflare dashboard, then you fill in `[deploy]` +
-two/three environment variables and run `fitsgl deploy`:
+two/three secrets (in a `.env` file or your shell) and run `fitsgl deploy`:
 
 1. **Create the R2 bucket.**
 2. **Connect a custom domain** to it (the managed `r2.dev` URL is *not* CDN-cached).
@@ -92,8 +92,8 @@ missing (a coarse tile that returns `CF-Cache-Status: MISS` on a repeat fetch).
 
 ## 4. Create the API tokens
 
-FitsGL reads secrets from the **environment**, never from `fitsgl.toml`. You need
-two tokens, each scoped to exactly what it does:
+FitsGL reads secrets from the **environment** (or a `.env` file — see §5), never
+from `fitsgl.toml`. You need two tokens, each scoped to exactly what it does:
 
 **(a) R2 upload token** — lets `fitsgl deploy` write objects (S3-compatible).
 In the dashboard: **R2 → Manage R2 API Tokens → Create API Token**. Permission
@@ -139,9 +139,9 @@ Where each value comes from:
 | `[deploy].prefix` | optional key prefix inside the bucket | your choice; `""` to serve at the bucket/domain root |
 | `[deploy].viewer_origin` | CORS `Allow-Origin` for cross-site embedding | `"*"` for public science data; a specific site to lock it down |
 | `[deploy].tile_max_age` | how long the edge serves a tile before revalidating | your choice; longer is better for rarely-updated datasets |
-| `R2_ACCESS_KEY_ID` *(env)* | R2 S3 access key | §4a |
-| `R2_SECRET_ACCESS_KEY` *(env)* | R2 S3 secret key | §4a (shown once) |
-| `CLOUDFLARE_API_TOKEN` *(env)* | cache-purge token | §4b (omit to skip the edge purge) |
+| `R2_ACCESS_KEY_ID` *(env or .env)* | R2 S3 access key | §4a |
+| `R2_SECRET_ACCESS_KEY` *(env or .env)* | R2 S3 secret key | §4a (shown once) |
+| `CLOUDFLARE_API_TOKEN` *(env or .env)* | cache-purge token | §4b (omit to skip the edge purge) |
 
 > **`endpoint` vs `public_url`** is the usual point of confusion: `endpoint` is the
 > S3 address `fitsgl deploy` *uploads* to (`<account-id>.r2.cloudflarestorage.com`);
@@ -149,13 +149,36 @@ Where each value comes from:
 > independent — `prefix` (the bucket key prefix) and the path in `public_url` don't
 > have to match, as long as your custom-domain routing maps one to the other.
 
-Set the secrets in your shell (or a CI secret store) before deploying:
+Now give `fitsgl deploy` the three secrets. The easiest way is a **`.env` file
+next to your `fitsgl.toml`** — `fitsgl deploy` reads it automatically, so you set
+the keys once instead of re-exporting them every shell:
+
+```bash
+# .env  — sits next to fitsgl.toml; one KEY=value per line
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+CLOUDFLARE_API_TOKEN=...      # optional, enables the edge purge
+```
+
+> ⚠️ **This file holds live credentials — never commit it.** Add `.env` to your
+> `.gitignore` before you fill it in. (Quote any value that contains spaces or a
+> `#`, e.g. `CLOUDFLARE_API_TOKEN="abc#123"`.)
+
+Prefer to keep the `.env` elsewhere (e.g. one shared file outside the dataset
+dir)? Point `fitsgl deploy` at it with `--env-file path/to/secrets.env`.
+
+You don't have to use a file at all — exporting the variables in your shell (or a
+CI secret store) works exactly the same:
 
 ```bash
 export R2_ACCESS_KEY_ID=...
 export R2_SECRET_ACCESS_KEY=...
 export CLOUDFLARE_API_TOKEN=...    # optional, enables the edge purge
 ```
+
+A variable already set in the environment **takes precedence** over the same key
+in the `.env` file — so a CI secret store or a one-off `export` always wins, and a
+stale `.env` can't silently override it.
 
 Install the deploy extra (it pulls in boto3, which the base install omits) — from a
 checkout of this repo, in the `fitsgl-py/` directory:
