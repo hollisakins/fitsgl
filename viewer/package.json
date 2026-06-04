@@ -1,11 +1,11 @@
 {
-  "name": "fitsgl-viewer",
+  "name": "@fitsgl/viewer",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "The bundled FitsGL viewer: a self-contained static page that mounts fits-pyramid/react <FitsExplorer> against ./fitsgl.json. Built by `npm run build-vendor` and vendored into pyramid_gen/_viewer/ so `fitsgl build` can emit a deployable static site.",
+  "description": "The bundled FitsGL viewer: a self-contained static page that mounts @fitsgl/core/react <FitsExplorer> against ./fitsgl.json. Built by `npm run build-vendor` and vendored into fitsgl/_viewer/ so `fitsgl build` can emit a deployable static site.",
   "scripts": {
-    "build-lib": "npm --prefix ../fits-pyramid run build",
+    "build-lib": "npm --prefix ../fitsgl-core run build",
     "predev": "npm run build-lib",
     "dev": "vite",
     "prebuild": "npm run build-lib",

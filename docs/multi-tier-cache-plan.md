@@ -48,7 +48,7 @@ This plan supersedes the §1/§4/§5 recommendations in
 4. **Key scheme:** `"${fingerprint}/${level}/${x}/${y}"` for tiles,
    `"${fingerprint}/meta/${level}"` for per-level metadata. `fingerprint` is a
    stable hash of the manifest JSON (Phase 2). A later `build_id` stamped by
-   `pyramid_gen` makes it robust and does **double duty** as the Cloudflare
+   `fitsgl` makes it robust and does **double duty** as the Cloudflare
    `immutable` versioned-path segment (Phase 6). A changed pyramid → new
    fingerprint → old entries become unreachable and LRU-evict.
 
@@ -210,12 +210,12 @@ P1 split ─┼─→ P2 disk cache ─→ P4 pool+throttle ─→ P5 prefetch
 - **Cancellation:** thread `AbortSignal` `request → getTile → fetch({signal})`;
   `{type:'cancel', id}` worker message; abort tiles that leave `visibleTiles`.
   Swallow `AbortError`; small grace for pan-jitter.
-- **CF versioning:** `pyramid_gen` stamps `build_id` into the manifest →
+- **CF versioning:** `fitsgl` stamps `build_id` into the manifest →
   `immutable` versioned paths (`/pyramid/<build_id>/…`) + Cache Reserve for the
   native level; the same `build_id` becomes the disk-cache fingerprint (replaces the
   manifest-hash from P2). Add a startup Range/206 self-check.
 - **Touches:** cancellation across `tile-manager.ts`/`tile-source.ts`/`worker*.ts`/
-  `fpack-file.ts`; `pyramid_gen` manifest writer + CF config (no client change for
+  `fpack-file.ts`; `fitsgl` manifest writer + CF config (no client change for
   versioning beyond using the new fingerprint).
 
 ---
@@ -230,7 +230,7 @@ P1 split ─┼─→ P2 disk cache ─→ P4 pool+throttle ─→ P5 prefetch
 | P3 | — | `fpack/fpack-file.ts`, `fpack/tile-source.ts`, `fpack/idb-blob-store.ts` |
 | P4 | — | `fpack/tile-source.ts`, `fpack/worker-protocol.ts`, `renderer/tile-manager.ts`, `renderer/viewer.ts` |
 | P5 | — | `renderer/tile-manager.ts`, `renderer/viewer.ts` |
-| P6 | — | `tile-manager.ts`, `tile-source.ts`, `worker*.ts`, `fpack-file.ts`, `pyramid_gen/*` |
+| P6 | — | `tile-manager.ts`, `tile-source.ts`, `worker*.ts`, `fpack-file.ts`, `fitsgl-py/*` |
 
 ## Testing strategy
 - **Bit-exact gate preserved:** P1 is a pure refactor; P2/P3 only substitute the
@@ -257,7 +257,7 @@ P1 split ─┼─→ P2 disk cache ─→ P4 pool+throttle ─→ P5 prefetch
    and whether the disk tier ships **on by default** or behind a flag for the first
    release.
 3. **Fingerprint now vs. `build_id` later.** Start with a manifest-content hash
-   (no `pyramid_gen` change), add `build_id` in P6? (Recommended.)
+   (no `fitsgl` change), add `build_id` in P6? (Recommended.)
 
 ## Suggested first PR
 **P0 + P1 together**: the user-visible quick win (no more black-on-load) plus the

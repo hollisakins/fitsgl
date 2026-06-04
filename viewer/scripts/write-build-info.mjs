@@ -1,10 +1,10 @@
 // Record a fingerprint of the SOURCE the vendored viewer bundle was built from,
-// so a CI test (pyramid_gen/tests/test_viewer_vendor.py) can fail loudly when the
-// committed _viewer/ bundle drifts behind fits-pyramid / the viewer app.
+// so a CI test (fitsgl-py/tests/test_viewer_vendor.py) can fail loudly when the
+// committed _viewer/ bundle drifts behind @fitsgl/core / the viewer app.
 //
 // The hash spec below MUST stay byte-identical to the Python reimplementation in
 // test_viewer_vendor.py: same file set, same ordering, same framing.
-//   - files: everything under fits-pyramid/src and viewer/src, plus viewer/package.json
+//   - files: everything under fitsgl-core/src and viewer/src, plus viewer/package.json
 //   - excluded: any path segment starting with '.' (dotfiles like .DS_Store), and
 //     any path containing '.test.' (unit tests don't ship in the bundle)
 //   - order: relative POSIX paths, ASCII-sorted
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..', '..'); // viewer/scripts -> repo root
-const vendorDir = resolve(repoRoot, 'pyramid_gen', 'src', 'pyramid_gen', '_viewer');
+const vendorDir = resolve(repoRoot, 'fitsgl-py', 'src', 'fitsgl', '_viewer');
 
 function walk(dir) {
   const out = [];
@@ -30,7 +30,7 @@ function walk(dir) {
 
 function sourceRels() {
   const files = [
-    ...walk(resolve(repoRoot, 'fits-pyramid', 'src')),
+    ...walk(resolve(repoRoot, 'fitsgl-core', 'src')),
     ...walk(resolve(repoRoot, 'viewer', 'src')),
     resolve(repoRoot, 'viewer', 'package.json'),
   ];
@@ -51,7 +51,7 @@ function sourceHash(rels) {
   return h.digest('hex');
 }
 
-const cfgSrc = readFileSync(resolve(repoRoot, 'fits-pyramid', 'src', 'fitsgl-config.ts'), 'utf8');
+const cfgSrc = readFileSync(resolve(repoRoot, 'fitsgl-core', 'src', 'fitsgl-config.ts'), 'utf8');
 const m = cfgSrc.match(/FITSGL_SCHEMA_VERSION\s*=\s*(\d+)/);
 if (m === null) throw new Error('write-build-info: could not find FITSGL_SCHEMA_VERSION in fitsgl-config.ts');
 

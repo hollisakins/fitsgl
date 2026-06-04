@@ -7,9 +7,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
 
 // The vendored bundle the Python package ships and `fitsgl build` copies into each
-// dataset directory. Built straight into pyramid_gen so `npm run build-vendor`
+// dataset directory. Built straight into fitsgl-py so `npm run build-vendor`
 // regenerates the committed artifact in place.
-const vendorDir = resolve(repoRoot, 'pyramid_gen', 'src', 'pyramid_gen', '_viewer');
+const vendorDir = resolve(repoRoot, 'fitsgl-py', 'src', 'fitsgl', '_viewer');
 
 export default defineConfig({
   // RELATIVE asset URLs (`./assets/...`) so the built site deploys under an
@@ -23,11 +23,11 @@ export default defineConfig({
   },
   resolve: {
     // Consume the library's COMPILED output (the npm pre-build hooks keep dist/
-    // fresh): core via `fits-pyramid`, the React tier via `fits-pyramid/react`.
+    // fresh): core via `@fitsgl/core`, the React tier via `@fitsgl/core/react`.
     // Anchored regexes so the `/react` subpath isn't swallowed by the bare alias.
     alias: [
-      { find: /^fits-pyramid\/react$/, replacement: resolve(repoRoot, 'fits-pyramid', 'dist', 'react', 'index.js') },
-      { find: /^fits-pyramid$/, replacement: resolve(repoRoot, 'fits-pyramid', 'dist', 'index.js') },
+      { find: /^@fitsgl\/core\/react$/, replacement: resolve(repoRoot, 'fitsgl-core', 'dist', 'react', 'index.js') },
+      { find: /^@fitsgl\/core$/, replacement: resolve(repoRoot, 'fitsgl-core', 'dist', 'index.js') },
     ],
   },
   server: {

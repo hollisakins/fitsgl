@@ -179,7 +179,7 @@ const cfg = await loadFitsglConfig('https://cdn/cosmos-web/fitsgl.json');
 This fixes the cross-origin break: a React/CAMPFIRE host fetching the config from a
 CDN gets absolute tile/catalog URLs, not paths resolved against its own origin. An
 explicit `baseUrl` override is accepted for unusual layouts. **This is a
-`fits-pyramid` code change**, landed in Phase 0.
+`@fitsgl/core` code change**, landed in Phase 0.
 
 ---
 

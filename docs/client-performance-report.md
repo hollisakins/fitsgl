@@ -4,10 +4,10 @@
 where to invest in client interactivity (DS9-style smooth pan/zoom over gigapixel
 mosaics served from R2/Cloudflare over HTTP range requests).
 
-**Method.** Every claim is grounded in the actual TypeScript (`fits-pyramid/src`,
+**Method.** Every claim is grounded in the actual TypeScript (`fitsgl-core/src`,
 `demo/`) with `file:line` citations, cross-checked by an independent adversarial
 pass. Concurrency was **measured**, not inferred: an instrumented probe
-(`fits-pyramid/concurrency-probe.mjs`, added for this report — safe to delete)
+(`fitsgl-core/concurrency-probe.mjs`, added for this report — safe to delete)
 drives the real inline `TileEngine` over the demo pyramid and counts in-flight
 fetches; decode cost was taken from the repo's `vitest bench`. Where a conclusion
 depends on real network/transport behavior the Node probe cannot exhibit
@@ -326,7 +326,7 @@ sharing. None redundant.
 ### Current behavior
 
 - **Nothing production is implemented.** No Cloudflare/R2/wrangler/`_headers`
-  config exists (only `pyramid_gen/pyproject.toml`). All deployment guidance is
+  config exists (only `fitsgl-py/pyproject.toml`). All deployment guidance is
   prose in `notes/phase4.md` ("Production deployment (R2 + Cloudflare)"). The
   **browser cache/revalidation path is emulated** in working code, though:
   `demo/vite.config.ts` sets `Accept-Ranges`, an `ETag` from size+mtime,
@@ -369,11 +369,11 @@ happening.
 
 | Change | Impact | Effort | Tradeoffs / touches |
 |---|---|---|---|
-| **Write origin cache headers + versioned paths:** `.fits.fz` → `Cache-Control: public, max-age=31536000, immutable`, cache-bust by **path** (`/pyramid/<build-id>/<band>/…`); manifest → `no-cache` + `ETag`. Emit the build-id segment in `pyramid_gen`. | **High** — turns "maybe warms" into "reliably warms," removes revalidation round-trips and the stale-on-rebuild hazard. | Med | Each rebuild publishes a new prefix (update pointer, GC old builds); `immutable` is unforgiving on id reuse. Touches `pyramid_gen`, Cloudflare config; client unaffected. |
+| **Write origin cache headers + versioned paths:** `.fits.fz` → `Cache-Control: public, max-age=31536000, immutable`, cache-bust by **path** (`/pyramid/<build-id>/<band>/…`); manifest → `no-cache` + `ETag`. Emit the build-id segment in `fitsgl`. | **High** — turns "maybe warms" into "reliably warms," removes revalidation round-trips and the stale-on-rebuild hazard. | Med | Each rebuild publishes a new prefix (update pointer, GC old builds); `immutable` is unforgiving on id reuse. Touches `fitsgl`, Cloudflare config; client unaffected. |
 | **Cache Reserve / tiered cache for the native level**, then **verify** a tile Range returns `206` + `CF-Cache-Status: HIT` after warm-up. | High | Low-Med | Storage/op cost, plan-gated; the all-RICE z0 may not need it once it's smaller. Cloudflare config. |
 | **Edge HIT/MISS observability:** optional debug fetcher reads `CF-Cache-Status`/`Age` and surfaces via the existing `onFrame`/HUD. | Med | Low | Needs `Access-Control-Expose-Headers` on origin; keep debug-only. Touches `fpack-file.ts` (or demo wrapper). |
 | **Decide the persistent-cache stance explicitly:** either formally adopt "CDN/browser HTTP cache is the persistent byte cache" (and drop the IndexedDB target), or add a client tier as a fallback for edge bypass (§1). | Med | (a) Low / (b) High | (a) leaves no client fallback if the edge misses; (b) reintroduces what `phase4.md` calls "redundant." Docs + maybe `fpack-file.ts`. |
-| **Make Range + cacheability a self-checked contract:** SSG/startup probe asserts `206` + `Accept-Ranges` (+ HIT on a second fetch in prod). | Med | Low | One extra startup round-trip; gate to dev/CI/first-load. Touches `pyramid_gen` SSG. |
+| **Make Range + cacheability a self-checked contract:** SSG/startup probe asserts `206` + `Accept-Ranges` (+ HIT on a second fetch in prod). | Med | Low | One extra startup round-trip; gate to dev/CI/first-load. Touches `fitsgl` SSG. |
 
 ---
 
@@ -425,11 +425,11 @@ happening.
 
 ## Appendix — evidence artifacts & caveats
 
-- **Concurrency probe:** `fits-pyramid/concurrency-probe.mjs` (run `node
-  concurrency-probe.mjs` in `fits-pyramid/`). Drives the real inline `TileEngine`
+- **Concurrency probe:** `fitsgl-core/concurrency-probe.mjs` (run `node
+  concurrency-probe.mjs` in `fitsgl-core/`). Drives the real inline `TileEngine`
   with an instrumented file-backed `RangeFetcher` (25 ms simulated RTT). Safe to
   delete — it imports only built `dist/` and the demo pyramid.
-- **Decode cost:** `fits-pyramid` `npm run bench` (`test/tile-decode.bench.ts`),
+- **Decode cost:** `@fitsgl/core` `npm run bench` (`test/tile-decode.bench.ts`),
   256² fixtures.
 - **Caveats / corrections folded in from verification:**
   - Decode is one worker **per band**, so RGB has up to 3-way cross-band

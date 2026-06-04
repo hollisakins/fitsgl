@@ -15,7 +15,7 @@
     "noEmit": true,
     "baseUrl": ".",
     "paths": {
-      "fits-pyramid": ["../fits-pyramid/dist/index.d.ts"]
+      "@fitsgl/core": ["../fitsgl-core/dist/index.d.ts"]
     }
   },
   "include": ["src"]

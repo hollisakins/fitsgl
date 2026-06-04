@@ -29,7 +29,7 @@ import {
   type TilePyramid,
   type TilePyramidOptions,
   type ViewerConfig,
-} from 'fits-pyramid';
+} from '@fitsgl/core';
 import { DemoControls } from './controls.js';
 
 /**

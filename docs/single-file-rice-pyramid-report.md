@@ -38,7 +38,7 @@ already correct or are build-side parameter changes.
 ### What the code does today
 
 A tile fetch flows through three cached layers
-(`fits-pyramid/src/fpack/`):
+(`fitsgl-core/src/fpack/`):
 
 1. **One `FpackFile` per level**, memoized in `TileEngine.files`
    (`tile-source.ts:38`, opened once via `fileForLevel`, `:64-77`).
