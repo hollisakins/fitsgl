@@ -8,6 +8,7 @@ purge batching are tested directly.
 
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -247,6 +248,74 @@ def test_upload_failure_aborts_before_writing_the_ledger(tmp_path):
     with pytest.raises(RuntimeError, match="simulated upload failure"):
         deploy_dataset(root, cfg(), t, run_verify=False)
     assert DEPLOY_MANIFEST_NAME not in t.objects  # ledger NOT written → no false success
+    assert not any(op == "put_bytes" for op, _ in t.ops)
+
+
+# -------------------------------------------------------------- parallel uploads
+
+
+class ConcurrentTarget(FakeTarget):
+    """A FakeTarget that proves tile PUTs overlap: each tile upload waits on a
+    threading.Barrier, so the call returns only once ``parallel`` of them are in
+    flight at once (or the barrier times out — which a serialized upload would hit,
+    leaving ``peak`` at 1 and failing the test)."""
+
+    def __init__(self, *, parallel, **kw):
+        super().__init__(**kw)
+        self._barrier = threading.Barrier(parallel, timeout=5)
+        self._lock = threading.Lock()
+        self.inflight = 0
+        self.peak = 0
+
+    def put_file(self, key, path, *, content_type, cache_control):
+        if key.endswith(".fits.fz"):
+            try:
+                self._barrier.wait()  # block until `parallel` tile uploads are here
+            except threading.BrokenBarrierError:
+                pass
+        with self._lock:
+            self.inflight += 1
+            self.peak = max(self.peak, self.inflight)
+        try:
+            super().put_file(key, path, content_type=content_type, cache_control=cache_control)
+        finally:
+            with self._lock:
+                self.inflight -= 1
+
+
+def test_tiles_upload_in_parallel(tmp_path):
+    # make_dataset has two tiles; with max_workers >= 2 they must be in flight together.
+    root = make_dataset(tmp_path)
+    t = ConcurrentTarget(parallel=2)
+    result = deploy_dataset(root, cfg(), t, max_workers=4, run_verify=False)
+
+    assert t.peak >= 2  # both tile PUTs overlapped (would be 1 if serialized)
+    # Correctness invariants still hold under concurrency:
+    assert set(result.uploaded) == {f.path for f in build_deploy_manifest(root).files}
+    puts = [k for op, k in t.ops if op == "put_file"]
+    last_tile = max(i for i, k in enumerate(puts) if k.endswith(".fits.fz"))
+    first_nontile = min(i for i, k in enumerate(puts) if not k.endswith(".fits.fz"))
+    assert last_tile < first_nontile  # the tile/pointer barrier survives parallelism
+    assert t.ops[-1] == ("put_bytes", DEPLOY_MANIFEST_NAME)  # ledger still written last
+
+
+def test_uploaded_order_is_deterministic_regardless_of_concurrency(tmp_path):
+    # The same plan must yield the same DeployResult.uploaded whether streamed 1-at-a-
+    # time or in parallel (the result reflects files-order, not completion-order).
+    root = make_dataset(tmp_path, tiles=("f444w/img_z0.fits.fz", "f444w/img_z1.fits.fz", "f150w/img_z0.fits.fz"))
+    seq = deploy_dataset(root, cfg(), FakeTarget(), max_workers=1, run_verify=False)
+    par = deploy_dataset(root, cfg(), FakeTarget(), max_workers=8, run_verify=False)
+    assert seq.uploaded == par.uploaded
+
+
+def test_parallel_upload_failure_aborts_before_the_ledger(tmp_path):
+    # The abort-before-ledger invariant must hold with parallel streams too: one failed
+    # PUT propagates and no success ledger is written.
+    root = make_dataset(tmp_path)
+    t = FakeTarget(fail_on="img_z1.fits.fz")
+    with pytest.raises(RuntimeError, match="simulated upload failure"):
+        deploy_dataset(root, cfg(), t, max_workers=4, run_verify=False)
+    assert DEPLOY_MANIFEST_NAME not in t.objects
     assert not any(op == "put_bytes" for op, _ in t.ops)
 
 
@@ -494,11 +563,40 @@ def test_cli_deploy_full_run_with_stubbed_target(tmp_path, monkeypatch):
 
     toml, out = _project(tmp_path)
     ft = FakeTarget()
-    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c: ft)}))
+    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: ft)}))
     monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
     rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify"])
     assert rc == 0
     assert "fitsgl.json" in ft.objects and DEPLOY_MANIFEST_NAME in ft.objects  # uploaded + ledger written
+
+
+def test_cli_concurrency_flag_flows_to_target_and_orchestration(tmp_path, monkeypatch):
+    import fitsgl.cli as cli
+
+    toml, out = _project(tmp_path)
+    seen: dict[str, object] = {}
+
+    def from_config(cls, c, *, concurrency=8):
+        seen["pool_concurrency"] = concurrency
+        return FakeTarget()
+
+    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(from_config)}))
+    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    monkeypatch.setattr(
+        cli, "deploy_dataset",
+        lambda *a, **k: seen.__setitem__("max_workers", k["max_workers"]) or DeployResult(diff=DeployDiff(), dry_run=False),
+    )
+    assert cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify", "-j", "12"]) == 0
+    assert seen["max_workers"] == 12  # flag → orchestration
+    assert seen["pool_concurrency"] == 12  # flag → connection-pool sizing
+
+
+def test_cli_concurrency_must_be_positive(tmp_path, capsys):
+    import fitsgl.cli as cli
+
+    toml, out = _project(tmp_path)
+    assert cli.main(["deploy", "-c", str(toml), "-o", str(out), "--concurrency", "0"]) == 2
+    assert "concurrency must be >= 1" in capsys.readouterr().err
 
 
 def test_cli_deploy_dry_run_makes_no_writes(tmp_path, monkeypatch, capsys):
@@ -506,7 +604,7 @@ def test_cli_deploy_dry_run_makes_no_writes(tmp_path, monkeypatch, capsys):
 
     toml, out = _project(tmp_path)
     ft = FakeTarget()
-    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c: ft)}))
+    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: ft)}))
     monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
     rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--dry-run"])
     assert rc == 0
@@ -518,7 +616,7 @@ def test_cli_deploy_exits_1_on_verify_failure(tmp_path, monkeypatch):
     import fitsgl.cli as cli
 
     toml, out = _project(tmp_path)
-    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c: FakeTarget())}))
+    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: FakeTarget())}))
     monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
     bad = VerifyReport(base_url="https://u/cosmos-web")
     bad.add("Range → 206", FAIL, "host ignores Range")
@@ -558,7 +656,7 @@ def test_confirm_deploy_prompt(monkeypatch):
 def _capture_creds_target(seen):
     """A stub R2Target whose from_config records the creds it sees in the env."""
 
-    def from_config(cls, c):
+    def from_config(cls, c, **_kw):
         seen["ak"] = os.environ.get("R2_ACCESS_KEY_ID")
         seen["sk"] = os.environ.get("R2_SECRET_ACCESS_KEY")
         return FakeTarget()

@@ -204,7 +204,7 @@ index files.
 
 ```
 fitsgl deploy [-c fitsgl.toml] [-o dist] [--dry-run] [--no-verify]
-              [--site-only] [--yes]
+              [--site-only] [--yes] [-j|--concurrency N]
 ```
 
 Mirrors `build`'s config/out resolution: reads the `[deploy]` block from the
@@ -219,6 +219,16 @@ config and the built dataset at `<out>/<dataset.name>/`. Flow:
 3. **Upload** the delta to R2 (S3 PUT per object) with per-object `Content-Type`
    and `Cache-Control` (DP4): tiles → pointers/assets → orphan **deletes**; then
    apply bucket CORS (DP8). The `deploy-manifest.json` ledger is *not* written yet.
+   Tiles upload **up to `N` at a time** (`-j`/`--concurrency`, default
+   `[deploy].concurrency` = 8) — a **barrier** separates the tile group from the
+   pointer/asset group, so a wider stream never races a no-cache manifest ahead of
+   a tile it references (the §4.2 ordering still holds, just within each group).
+   Concurrency changes only wall-clock: the work is one PUT per *changed* object
+   (the ledger diff already pruned the rest) and nothing HEADs/lists, so it adds no
+   R2 operations. A single PUT covers any object ≤ 4 GiB (R2's single-PUT ceiling is
+   5 GiB; tiles incl. supertile blocks sit far under), so each is *one* Class-A op
+   rather than a multipart series — only a pathologically large object falls back to
+   multipart. On any PUT failure the deploy aborts before the ledger (next step).
 4. **Purge** the changed + deleted tile URLs from Cloudflare (DP5; after the full
    upload), **batched into ≤100-URL calls** (§8).
 5. **Write the `deploy-manifest.json` ledger last** — *after* the purge — so its new
@@ -232,6 +242,10 @@ config and the built dataset at `<out>/<dataset.name>/`. Flow:
 - `--site-only` — push + purge only `index.html`/`assets/` (the analog of `build
   --site-only`); skip tiles/pointers. Fast viewer refresh after re-vendoring.
 - `--yes` — skip the "about to upload N files / X MB to <bucket>" confirmation.
+- `-j`/`--concurrency N` — parallel upload streams to R2 (default
+  `[deploy].concurrency`, else 8). Same number of PUTs either way (only changed
+  files are sent); it trades wall-clock for open connections. The boto3 connection
+  pool is sized to `N` so the streams don't serialize on a too-small pool.
 
 ### 5.2 `fitsgl verify <url>`
 

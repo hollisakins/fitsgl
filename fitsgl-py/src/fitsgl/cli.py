@@ -103,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--site-only", action="store_true", help="Push only the viewer (index.html + assets/); leave the data + its ledger entries untouched.")
     pd.add_argument("--yes", action="store_true", help="Skip the upload confirmation prompt.")
     pd.add_argument(
+        "-j", "--concurrency", type=int, default=None,
+        help="Parallel upload streams to R2 (default: [deploy].concurrency, else 8). Same number of "
+        "uploads either way — only changed files are sent — so this just trades wall-clock for connections.",
+    )
+    pd.add_argument(
         "--env-file",
         type=Path,
         default=None,
@@ -239,6 +244,11 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.concurrency is not None and args.concurrency < 1:
+        print("fitsgl deploy: --concurrency must be >= 1", file=sys.stderr)
+        return 2
+    # CLI flag wins; otherwise the [deploy].concurrency default (8 unless set in the toml).
+    concurrency = args.concurrency if args.concurrency is not None else config.deploy.concurrency
     dataset_dir = args.out / config.name
     if not (dataset_dir / "fitsgl.json").is_file():
         print(f"fitsgl deploy: no built dataset at {dataset_dir} — run `fitsgl build` first", file=sys.stderr)
@@ -260,7 +270,7 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         print(f"loaded {', '.join(applied)} from {env_path}", flush=True)
 
     try:
-        target = R2Target.from_config(config.deploy)
+        target = R2Target.from_config(config.deploy, concurrency=concurrency)
         purger = CloudflarePurge.from_config(config.deploy)
     except DeployError as e:
         print(f"fitsgl deploy: {e}", file=sys.stderr)
@@ -281,6 +291,7 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             run_verify=not args.no_verify,
             site_only=args.site_only,
+            max_workers=concurrency,
             confirm=confirm,
             on_progress=lambda m: print(m, flush=True),
         )
