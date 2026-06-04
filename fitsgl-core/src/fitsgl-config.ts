@@ -49,6 +49,20 @@ export interface FitsglBand {
 export interface FitsglBandStats {
   /** Histogram of the band's data over a robust `[lo, hi]` domain (counts per bin). */
   histogram: { counts: number[]; lo: number; hi: number };
+  /**
+   * Global trilogy levels, measured on the native (z=0) data so they reflect the
+   * true per-pixel noise and compact-source peaks the renderer shows at full
+   * zoom. `mean`/`sigma` are the robust sky level + MAD-scaled noise; `tail`
+   * carries the bright-tail percentiles (the saturation point lives beyond the
+   * 99.9th the `histogram` domain is clipped to). Mirrors `TrilogyStats`; the
+   * host derives `x0/x1/x2/k` from these + the user knobs with no rescan. Omitted
+   * for older datasets ⇒ the viewer falls back to its live percentile stretch.
+   */
+  trilogy?: {
+    mean: number;
+    sigma: number;
+    tail: { p99: number; p99_9: number; p99_99: number; p99_999: number };
+  };
 }
 
 /** The dataset inventory — pure data, no view. */
@@ -114,7 +128,27 @@ function asBandStats(v: unknown, name: string): FitsglBandStats | undefined {
   const lo = asFiniteNum(h.lo, `band "${name}" stats.histogram.lo`);
   const hi = asFiniteNum(h.hi, `band "${name}" stats.histogram.hi`);
   if (!(hi > lo)) throw new Error(`fitsgl-config: band "${name}" stats.histogram requires hi > lo`);
-  return { histogram: { counts: (h.counts as number[]).slice(), lo, hi } };
+  const out: FitsglBandStats = { histogram: { counts: (h.counts as number[]).slice(), lo, hi } };
+  const tri = asTrilogyStats(v.trilogy, name);
+  if (tri !== undefined) out.trilogy = tri;
+  return out;
+}
+
+function asTrilogyStats(v: unknown, name: string): FitsglBandStats['trilogy'] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (!isObj(v)) throw new Error(`fitsgl-config: band "${name}" stats.trilogy must be an object`);
+  const t = v.tail;
+  if (!isObj(t)) throw new Error(`fitsgl-config: band "${name}" stats.trilogy.tail must be an object`);
+  return {
+    mean: asFiniteNum(v.mean, `band "${name}" stats.trilogy.mean`),
+    sigma: asFiniteNum(v.sigma, `band "${name}" stats.trilogy.sigma`),
+    tail: {
+      p99: asFiniteNum(t.p99, `band "${name}" stats.trilogy.tail.p99`),
+      p99_9: asFiniteNum(t.p99_9, `band "${name}" stats.trilogy.tail.p99_9`),
+      p99_99: asFiniteNum(t.p99_99, `band "${name}" stats.trilogy.tail.p99_99`),
+      p99_999: asFiniteNum(t.p99_999, `band "${name}" stats.trilogy.tail.p99_999`),
+    },
+  };
 }
 
 /**

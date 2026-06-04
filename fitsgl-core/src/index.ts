@@ -47,6 +47,17 @@ export type { RenderSource, SingleBandSource, RgbSource } from './renderer/index
 // M1 — display modes: stretch curves + bundled colormaps (single-band).
 export { STRETCH_MODES, isStretchMode } from './renderer/index.js';
 export type { StretchMode } from './renderer/index.js';
+// Trilogy stretch: pure level-determination math + precomputed-stats types.
+export {
+  trilogyCurve,
+  solveTrilogyK,
+  saturationValue,
+  trilogyLevels,
+  combineTrilogyLuminance,
+  DEFAULT_TRILOGY_PARAMS,
+  DEFAULT_TRILOGY_K,
+} from './renderer/index.js';
+export type { TrilogyStats, TrilogyParams, TrilogyLevels, TrilogyLuminance } from './renderer/index.js';
 export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './renderer/index.js';
 export type { ColormapName, ColormapLUT } from './renderer/index.js';
 

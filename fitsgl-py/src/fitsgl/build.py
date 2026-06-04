@@ -20,7 +20,7 @@ from .catalog import ingest_catalog
 from .config import DatasetConfig
 from .fitsgl_config import build_fitsgl_config, default_view_dict
 from .site import copy_viewer_into
-from .stats import compute_band_histogram
+from .stats import compute_band_histogram, compute_band_trilogy_stats
 
 
 @dataclass
@@ -93,7 +93,14 @@ def build_dataset(
             band_levels[band.name] = manifest.n_levels
             histogram = compute_band_histogram(tmp_dir / band.name, manifest)
             if histogram is not None:
-                band_stats[band.name] = {"histogram": histogram}
+                stats: dict = {"histogram": histogram}
+                # Global trilogy levels (native z=0) — color-preserving stretch with
+                # no live rescan. Independently optional: omitted ⇒ the viewer falls
+                # back to its percentile auto-stretch for that band.
+                trilogy = compute_band_trilogy_stats(tmp_dir / band.name, manifest)
+                if trilogy is not None:
+                    stats["trilogy"] = trilogy
+                band_stats[band.name] = stats
 
         catalog_url: str | None = None
         if config.catalog is not None:

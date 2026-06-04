@@ -10,6 +10,13 @@ import {
   STRETCH_MODE_IDS,
   LOG_SOFTENING,
   ASINH_SOFTENING,
+  trilogyCurve,
+  solveTrilogyK,
+  saturationValue,
+  trilogyLevels,
+  combineTrilogyLuminance,
+  DEFAULT_TRILOGY_PARAMS,
+  type TrilogyStats,
 } from '../src/renderer/stretch.js';
 import { TILE_FRAG } from '../src/renderer/shaders/tile.frag.js';
 import { TILE_VERT } from '../src/renderer/shaders/tile.vert.js';
@@ -101,11 +108,12 @@ describe('scaleValue — interval + clamp + stretch', () => {
 });
 
 describe('stretch mode metadata', () => {
-  it('ids are the linear/log/asinh branch order in the shader', () => {
-    expect(STRETCH_MODE_IDS).toEqual({ linear: 0, log: 1, asinh: 2 });
+  it('ids are the linear/log/asinh/trilogy branch order in the shader', () => {
+    expect(STRETCH_MODE_IDS).toEqual({ linear: 0, log: 1, asinh: 2, trilogy: 3 });
   });
   it('isStretchMode is a correct guard', () => {
     for (const m of STRETCH_MODES) expect(isStretchMode(m)).toBe(true);
+    expect(isStretchMode('trilogy')).toBe(true);
     expect(isStretchMode('sqrt')).toBe(false);
     expect(isStretchMode('')).toBe(false);
   });
@@ -125,12 +133,17 @@ describe('TILE_FRAG shader — structure + constant injection', () => {
     const asinh2 = TILE_FRAG.indexOf('u_stretchMode == 2');
     expect(log1).toBeGreaterThan(-1);
     expect(asinh2).toBeGreaterThan(log1);
+    const trilogy3 = TILE_FRAG.indexOf('u_stretchMode == 3');
     const logBody = TILE_FRAG.indexOf('log(LOG_A * norm + 1.0)');
     const asinhBody = TILE_FRAG.indexOf('asinh(norm / ASINH_A)');
+    const trilogyBody = TILE_FRAG.indexOf('log(k * norm + 1.0) / log(k + 1.0)');
     // branch 1 body is log (sits between `== 1` and `== 2`); branch 2 is asinh.
     expect(logBody).toBeGreaterThan(log1);
     expect(logBody).toBeLessThan(asinh2);
     expect(asinhBody).toBeGreaterThan(asinh2);
+    // branch 3 is trilogy: the data-solved softening curve, after asinh.
+    expect(trilogy3).toBeGreaterThan(asinh2);
+    expect(trilogyBody).toBeGreaterThan(trilogy3);
     // The interval+clamp matches scaleValue's `min(1, max(0, (v-lo)/(hi-lo)))`.
     expect(TILE_FRAG).toContain('clamp((v - lo) / (hi - lo), 0.0, 1.0)');
   });
@@ -196,6 +209,101 @@ describe('RGB composite — per-channel stretch is independent, the curve is sha
     expect(b).toBe(c);
     // ...and the shared asinh lifts faint signal above linear for every channel.
     expect(a).toBeGreaterThan(scaleValue(1, 0, 10, 'linear'));
+  });
+});
+
+describe('trilogy — solved-softening log curve (faithful, color-preserving)', () => {
+  it('trilogyCurve is the log shape with a free softening (log == trilogy at k=1000)', () => {
+    for (const x of [0, 0.1, 0.3, 0.5, 0.9, 1]) {
+      expect(trilogyCurve(x, LOG_SOFTENING)).toBeCloseTo(applyStretch(x, 'log'), 12);
+    }
+  });
+
+  it('trilogyCurve fixes the endpoints for any positive k', () => {
+    for (const k of [0.5, 10, 1000, 1e5]) {
+      expect(trilogyCurve(0, k)).toBe(0);
+      expect(trilogyCurve(1, k)).toBeCloseTo(1, 12);
+    }
+  });
+
+  it('solveTrilogyK places the noise level at the requested luminance', () => {
+    // The defining trilogy property: f(norm1) == noiselum at the solved k.
+    for (const [norm1, noiselum] of [
+      [0.01, 0.15],
+      [0.05, 0.3],
+      [0.001, 0.1],
+      [0.2, 0.6],
+    ] as const) {
+      const k = solveTrilogyK(norm1, noiselum);
+      expect(trilogyCurve(norm1, k)).toBeCloseTo(noiselum, 6);
+    }
+  });
+
+  it('solveTrilogyK degenerates gracefully outside the reachable band', () => {
+    // noiselum <= norm1 is unreachable upward -> linear (k=0): f(norm1)=norm1.
+    const k0 = solveTrilogyK(0.3, 0.2);
+    expect(k0).toBe(0);
+    expect(trilogyCurve(0.3, k0)).toBeCloseTo(0.3, 12);
+  });
+
+  it('saturationValue maps satpercent to the matching bright-tail percentile', () => {
+    const tail = { p99: 10, p99_9: 20, p99_99: 30, p99_999: 40 };
+    expect(saturationValue(tail, 1)).toBeCloseTo(10, 12); // p99
+    expect(saturationValue(tail, 0.1)).toBeCloseTo(20, 12); // p99.9
+    expect(saturationValue(tail, 0.01)).toBeCloseTo(30, 12); // p99.99
+    expect(saturationValue(tail, 0.001)).toBeCloseTo(40, 12); // p99.999
+    // Interpolated in log10(satpercent): 0.0316 sits halfway between p99.9 & p99.99.
+    expect(saturationValue(tail, Math.sqrt(0.1 * 0.01))).toBeCloseTo(25, 6);
+    // Clamped beyond the anchors.
+    expect(saturationValue(tail, 5)).toBeCloseTo(10, 12);
+    expect(saturationValue(tail, 1e-6)).toBeCloseTo(40, 12);
+  });
+
+  const STATS: TrilogyStats = {
+    mean: 100,
+    sigma: 5,
+    tail: { p99: 200, p99_9: 400, p99_99: 800, p99_999: 1600 },
+  };
+
+  it('trilogyLevels derives x0/x1/x2 from stats + knobs and pins the noise luminance', () => {
+    const lv = trilogyLevels(STATS, DEFAULT_TRILOGY_PARAMS);
+    expect(lv.x0).toBeCloseTo(100 - 2 * 5, 12); // mean - noisesig0*sigma
+    expect(lv.x1).toBeCloseTo(100 + 1 * 5, 12); // mean + noisesig*sigma
+    expect(lv.x2).toBeCloseTo(1600, 12); // satpercent 0.001 -> p99.999
+    const norm1 = (lv.x1 - lv.x0) / (lv.x2 - lv.x0);
+    expect(trilogyCurve(norm1, lv.k)).toBeCloseTo(DEFAULT_TRILOGY_PARAMS.noiselum, 6);
+  });
+
+  it('combineTrilogyLuminance keeps grey at the noise level mapping to noiselum', () => {
+    const lv = trilogyLevels(STATS, DEFAULT_TRILOGY_PARAMS);
+    const lum = combineTrilogyLuminance([lv, lv, lv], DEFAULT_TRILOGY_PARAMS.noiselum);
+    // Three identical channels -> luminance saturation is the channel's (x2-x0).
+    expect(lum.lsat).toBeCloseTo(lv.x2 - lv.x0, 9);
+    // A grey pixel at the noise level: L = x1 - x0, normalized over lsat -> noiselum.
+    const normL = (lv.x1 - lv.x0) / lum.lsat;
+    expect(trilogyCurve(normL, lum.k)).toBeCloseTo(DEFAULT_TRILOGY_PARAMS.noiselum, 6);
+  });
+});
+
+describe('TILE_FRAG — color-preserving trilogy RGB branch', () => {
+  it('selects the coupled luminance path only for the trilogy mode in RGB', () => {
+    // The RGB branch must special-case u_stretchMode == 3 (luminance rescale)
+    // and leave modes 0-2 on the independent per-channel path.
+    const rgb = TILE_FRAG.indexOf('u_mode == 1');
+    const trilogyRgb = TILE_FRAG.indexOf('u_stretchMode == 3', rgb);
+    expect(trilogyRgb).toBeGreaterThan(rgb);
+  });
+
+  it('bias-subtracts per channel, stretches luminance, and rescales by z/L', () => {
+    expect(TILE_FRAG).toContain('max(r - u_minRGB.r, 0.0)');
+    expect(TILE_FRAG).toContain('(rb + gb + bb) / 3.0');
+    expect(TILE_FRAG).toContain('clamp(L / u_trilogyLsat, 0.0, 1.0)');
+    expect(TILE_FRAG).toContain('applyStretch(norm, u_trilogyK)');
+    expect(TILE_FRAG).toContain('L > 0.0 ? z / L : 0.0');
+  });
+
+  it('declares the trilogy uniforms', () => {
+    for (const u of ['u_trilogyK', 'u_trilogyLsat']) expect(TILE_FRAG).toContain(u);
   });
 });
 

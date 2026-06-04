@@ -19,7 +19,17 @@ import type { WorldBounds } from './camera.js';
 import { createColormapTexture, createProgram, createUnitQuadVAO } from './gl-util.js';
 import { TILE_VERT } from './shaders/tile.vert.js';
 import { TILE_FRAG } from './shaders/tile.frag.js';
-import { STRETCH_MODE_IDS, type StretchMode } from './stretch.js';
+import {
+  STRETCH_MODE_IDS,
+  DEFAULT_TRILOGY_K,
+  DEFAULT_TRILOGY_PARAMS,
+  trilogyLevels,
+  combineTrilogyLuminance,
+  type StretchMode,
+  type TrilogyStats,
+  type TrilogyParams,
+  type TrilogyLevels,
+} from './stretch.js';
 import { resolveColormap, type ColormapLUT, type ColormapName } from './colormaps.js';
 import {
   IDENTITY_MAT2,
@@ -289,14 +299,22 @@ export class FitsViewer {
   private readonly uUseColormap: WebGLUniformLocation | null;
   private readonly uColormap: WebGLUniformLocation | null;
   private readonly uOpacity: WebGLUniformLocation | null;
+  private readonly uTrilogyK: WebGLUniformLocation | null;
+  private readonly uTrilogyLsat: WebGLUniformLocation | null;
 
   private stretchMin = 0;
   private stretchMax = 1;
   private stretchMode: StretchMode = 'linear';
   /** Per-channel display interval for RGB mode (R, G, B). The transfer curve
-   *  (`stretchMode`) is shared across channels; only min/max are independent. */
+   *  (`stretchMode`) is shared across channels; only min/max are independent.
+   *  In trilogy mode `channelMin` carries the per-channel black points (`x0`). */
   private channelMin: [number, number, number] = [0, 0, 0];
   private channelMax: [number, number, number] = [1, 1, 1];
+  /** Trilogy softening (mode 3); single-band uses its own, RGB uses the shared
+   *  luminance one. `DEFAULT_TRILOGY_K` until levels are solved. */
+  private trilogyK = DEFAULT_TRILOGY_K;
+  /** Trilogy RGB: bias-subtracted luminance that maps to output 1. */
+  private trilogyLsat = 1;
   /** Single-band colormap LUT (texture unit 1), or null for grayscale. */
   private colormapTexture: WebGLTexture | null = null;
 
@@ -419,6 +437,8 @@ export class FitsViewer {
     this.uUseColormap = gl.getUniformLocation(this.program, 'u_useColormap');
     this.uColormap = gl.getUniformLocation(this.program, 'u_colormap');
     this.uOpacity = gl.getUniformLocation(this.program, 'u_opacity');
+    this.uTrilogyK = gl.getUniformLocation(this.program, 'u_trilogyK');
+    this.uTrilogyLsat = gl.getUniformLocation(this.program, 'u_trilogyLsat');
 
     this.camera = new Camera(Math.max(1, canvas.width), Math.max(1, canvas.height));
     // In RGB mode every band must share the construction grid (identical shape +
@@ -746,6 +766,58 @@ export class FitsViewer {
   }
 
   /**
+   * Apply a faithful, color-preserving trilogy stretch from precomputed global
+   * per-band stats (`FitsglBandStats`), with no tile rescan — the producer's
+   * `mean`/`sigma`/`tail` already describe the whole image at native resolution,
+   * so the levels are stable and viewport-independent on the first paint.
+   *
+   * Single-band: pass one stats object; sets `[x0, x2]` and the solved softening.
+   * RGB: pass `[r, g, b]` stats; sets each channel's black point (`x0`) and the
+   * shared luminance saturation + softening that preserves color ratios. Does not
+   * switch mode — call `setStretchMode('trilogy')` to select the curve. Returns
+   * the per-channel levels it applied so a host can reflect them in its inputs.
+   */
+  applyTrilogy(
+    stats: TrilogyStats | readonly [TrilogyStats, TrilogyStats, TrilogyStats],
+    params: TrilogyParams = DEFAULT_TRILOGY_PARAMS,
+  ): TrilogyLevels[] {
+    if (this.mode === 'rgb') {
+      if (!Array.isArray(stats) || stats.length !== 3) {
+        throw new Error('applyTrilogy: RGB mode needs [r, g, b] stats');
+      }
+      const triple = stats as readonly [TrilogyStats, TrilogyStats, TrilogyStats];
+      const levels = triple.map((s) => trilogyLevels(s, params)) as [
+        TrilogyLevels,
+        TrilogyLevels,
+        TrilogyLevels,
+      ];
+      // Per-channel black points (x0) ride in channelMin (u_minRGB); the shared
+      // luminance stretch carries saturation + softening. channelMax (x2) is unused
+      // by the trilogy branch but is set so switching back to a per-channel mode
+      // (linear/log/asinh) renders [x0, x2] — matching the sliders — instead of a
+      // stale max left over from before trilogy.
+      for (let i = 0; i < 3; i++) {
+        this.channelMin[i] = levels[i].x0;
+        this.channelMax[i] = levels[i].x2;
+      }
+      const lum = combineTrilogyLuminance(levels, params.noiselum);
+      this.trilogyLsat = lum.lsat;
+      this.trilogyK = lum.k;
+      this.requestRender();
+      return levels;
+    }
+    if (Array.isArray(stats)) {
+      throw new Error('applyTrilogy: single-band mode needs one stats object');
+    }
+    const lv = trilogyLevels(stats as TrilogyStats, params);
+    this.stretchMin = lv.x0;
+    this.stretchMax = lv.x2;
+    this.trilogyK = lv.k;
+    this.requestRender();
+    return [lv];
+  }
+
+  /**
    * Throw unless `pyramid` shares the viewer's construction grid: identical
    * native shape + WCS (`gridsMatch`) and identical per-level geometry
    * (`geomsEqual`, which catches a same-shape pyramid built with a different
@@ -1026,6 +1098,9 @@ export class FitsViewer {
     gl.bindVertexArray(this.vao);
     // The transfer curve is shared by single-band and RGB (decision D5).
     gl.uniform1i(this.uStretchMode, STRETCH_MODE_IDS[this.stretchMode]);
+    // Trilogy softening + luminance saturation (mode 3); inert for other modes.
+    gl.uniform1f(this.uTrilogyK, this.trilogyK);
+    gl.uniform1f(this.uTrilogyLsat, this.trilogyLsat);
 
     const orient = this.currentOrientation();
     // Under rotation the viewport maps to a rotated world rectangle; intersect

@@ -215,6 +215,20 @@ def test_build_emits_band_histogram_stats(tmp_path):
     assert len(h["counts"]) == 128 and h["lo"] < h["hi"]
 
 
+def test_build_emits_band_trilogy_stats(tmp_path):
+    # The full config-driven build folds the native-level trilogy stats into
+    # band.stats.trilogy with the trimmed wire shape (no dead min / tail.max).
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    result = build_dataset(config, tmp_path / "dist", with_site=False)
+    cfg = json.loads((result.dataset_dir / "fitsgl.json").read_text())
+    tri = cfg["dataset"]["bands"][0]["stats"].get("trilogy")
+    assert tri is not None
+    assert set(tri) == {"mean", "sigma", "tail"}
+    assert set(tri["tail"]) == {"p99", "p99_9", "p99_99", "p99_999"}
+    assert tri["sigma"] > 0
+
+
 def test_build_no_site(tmp_path):
     _write_band(tmp_path, "img", 1)
     config = load_config(_toml(tmp_path, [("img", "img.fits")]))

@@ -448,6 +448,23 @@ def test_bad_stretch_mode(tmp_path):
         load_config(p)
 
 
+def test_trilogy_stretch_mode_is_accepted(tmp_path):
+    touch(tmp_path, "a.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "x"
+        [[dataset.bands]]
+        name = "a"
+        input = "a.fits"
+        [viewer]
+        stretch = "trilogy"
+        """,
+    )
+    assert load_config(p).viewer.stretch == "trilogy"
+
+
 def test_colormap_rejected_in_rgb_mode(tmp_path):
     for n in ("a", "b", "c"):
         touch(tmp_path, f"{n}.fits")
