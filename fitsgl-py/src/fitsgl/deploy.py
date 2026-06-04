@@ -363,20 +363,34 @@ class R2Target:
         self._s3.delete_object(Bucket=self.bucket, Key=key)
 
     def put_cors(self, origins: list[str], methods: list[str], headers: list[str]) -> None:  # pragma: no cover
-        self._s3.put_bucket_cors(
-            Bucket=self.bucket,
-            CORSConfiguration={
-                "CORSRules": [
-                    {
-                        "AllowedOrigins": origins,
-                        "AllowedMethods": methods,
-                        "AllowedHeaders": headers,
-                        "ExposeHeaders": _CORS_EXPOSE,
-                        "MaxAgeSeconds": 3600,
-                    }
-                ]
-            },
-        )
+        try:
+            self._s3.put_bucket_cors(
+                Bucket=self.bucket,
+                CORSConfiguration={
+                    "CORSRules": [
+                        {
+                            "AllowedOrigins": origins,
+                            "AllowedMethods": methods,
+                            "AllowedHeaders": headers,
+                            "ExposeHeaders": _CORS_EXPOSE,
+                            "MaxAgeSeconds": 3600,
+                        }
+                    ]
+                },
+            )
+        except self._client_error as e:
+            # Setting bucket CORS is a bucket-config op, not an object op — an R2
+            # "Object Read & Write" token uploads every file fine and then trips here.
+            # Translate the bare AccessDenied into the actionable fix (r2-setup.md §4a).
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "AccessDenied":
+                raise DeployError(
+                    f"R2 denied setting CORS on bucket {self.bucket!r}: the API token lacks "
+                    "bucket-config permission. Re-create it with 'Admin Read & Write' (still "
+                    "scoped to this bucket) — 'Object Read & Write' can upload files but not set "
+                    "CORS. See docs/r2-setup.md §4a. (The upload itself already succeeded.)"
+                ) from e
+            raise DeployError(f"R2 put_bucket_cors on {self.bucket!r} failed: {e}") from e
 
 
 # ----------------------------------------------------- Cloudflare purge (stdlib)

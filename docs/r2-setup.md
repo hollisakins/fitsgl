@@ -95,11 +95,20 @@ missing (a coarse tile that returns `CF-Cache-Status: MISS` on a repeat fetch).
 FitsGL reads secrets from the **environment** (or a `.env` file — see §5), never
 from `fitsgl.toml`. You need two tokens, each scoped to exactly what it does:
 
-**(a) R2 upload token** — lets `fitsgl deploy` write objects (S3-compatible).
-In the dashboard: **R2 → Manage R2 API Tokens → Create API Token**. Permission
-**Object Read & Write**, scoped to your bucket. Cloudflare shows you an **Access Key
-ID** and a **Secret Access Key** — these become `R2_ACCESS_KEY_ID` and
-`R2_SECRET_ACCESS_KEY`. (Copy the secret now; it's shown only once.)
+**(a) R2 upload token** — lets `fitsgl deploy` write objects *and set the bucket
+CORS policy* (both S3-compatible). In the dashboard: **R2 → Manage R2 API Tokens →
+Create API Token**. Permission **Admin Read & Write**, scoped to your bucket.
+Cloudflare shows you an **Access Key ID** and a **Secret Access Key** — these become
+`R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`. (Copy the secret now; it's shown only
+once.)
+
+> **Why Admin, not Object Read & Write?** R2's *Object* permission can upload and
+> delete files but cannot change *bucket configuration*. `fitsgl deploy` applies the
+> bucket's CORS policy for you (so a browser on your viewer origin may fetch tiles
+> cross-site), and CORS is a bucket-config operation — so an Object-only token
+> uploads every file fine and then fails with `AccessDenied` on the final
+> `PutBucketCors` step. **Admin Read & Write** (still scoped to the one bucket) is the
+> least privilege that covers the whole deploy.
 
 **(b) Cloudflare cache-purge token** — lets `fitsgl deploy` evict changed tiles from
 the edge after a push, so a redeploy is visible immediately. This is *optional*: skip
