@@ -20,10 +20,10 @@ Status: design only. Nothing here is implemented yet beyond the existing
 
 ## 1. Current state (what a producer can do today)
 
-One entry point exists: `python -m pyramid_gen` (`pyramid_gen/__main__.py`).
+One entry point exists: `python -m fitsgl` (`fitsgl-py/__main__.py`).
 
 ```
-python -m pyramid_gen <inputs...> [-o OUT] [--tile-size 256]
+python -m fitsgl <inputs...> [-o OUT] [--tile-size 256]
                        [--quantize-level 8] [--processes N] [--synthetic PATH]
 ```
 
@@ -64,7 +64,7 @@ in the CLI and exists only as Python helpers invoked from the demo's
 4. **No persisted view config.** Default stretch / colormap / north-up / RGB roles
    live in demo React state or in `default_rgb`. The roadmap repeatedly references
    a "site config" (§2.2, §3.4) that was never built.
-5. **Three names for one project**: `pyramid_gen` (CLI), `fits-pyramid` (lib),
+5. **Three names for one project**: `fitsgl` (CLI), `@fitsgl/core` (lib),
    "FitsGL" (brand).
 
 ---
@@ -77,7 +77,7 @@ deployment is copying that directory to any host that supports HTTP Range.
 
 This collapses *generate*, *configure*, *deploy*, and *frontend* into one object
 with one contract. The contract is `viewer-config.json` — the exact `ViewerConfig`
-type the TypeScript already consumes (`fits-pyramid/src/viewer-config.ts`). The
+type the TypeScript already consumes (`fitsgl-core/src/viewer-config.ts`). The
 producer **emits** the contract; every delivery tier **consumes** it; no tier
 restates it. This closes the roadmap's §3.5 tier-divergence risk at the data
 layer (today `demo-react`'s `discover()` reconstructs the config client-side).
@@ -88,7 +88,7 @@ layer (today `demo-react`'s `discover()` reconstructs the config client-side).
 
 | # | Area | Decision | Reasoning |
 |---|---|---|---|
-| P1 | Tool shape | **One `fitsgl` CLI with subcommands** (`init`/`build`/`serve`/`deploy`); keep `build_pyramid` as the internal per-band primitive it calls. | Unifies the brand, gives the multi-band path a home, and keeps the tested single-pyramid primitive unchanged. `python -m pyramid_gen` stays as a low-level escape hatch. |
+| P1 | Tool shape | **One `fitsgl` CLI with subcommands** (`init`/`build`/`serve`/`deploy`); keep `build_pyramid` as the internal per-band primitive it calls. | Unifies the brand, gives the multi-band path a home, and keeps the tested single-pyramid primitive unchanged. `python -m fitsgl` stays as a low-level escape hatch. |
 | P2 | Configuration | **Config file (`fitsgl.toml`) is the source of truth** for a multi-band dataset; flags are sugar for one-offs. | RGB roles + catalog + view + deploy don't fit flags; a file is reviewable, diffable, and is the long-missing "site config." |
 | P3 | Output model | **One dataset = one output directory** containing every band, the manifests, the catalog, `viewer-config.json`, and (SSG) the page + embed bundle. | Makes "deploy" a directory copy and gives the producer a single mental object. |
 | P4 | View config home | The `[view]` block in `fitsgl.toml` is serialized into **`viewer-config.json`** at build time. | One persisted place for default stretch/colormap/north-up/RGB; identical to the type all three tiers read. |
@@ -194,7 +194,7 @@ fitsgl deploy    dist/<name>/ [--target …]     # upload to R2/S3 or print rsyn
   `rsync` line; for R2/S3 it uploads and sets `Content-Type` (`.fits.fz`) +
   long-lived immutable cache headers (level files are content-stable per build).
 
-`python -m pyramid_gen` remains as the documented low-level primitive for users who
+`python -m fitsgl` remains as the documented low-level primitive for users who
 want one pyramid and nothing else.
 
 ---
@@ -250,14 +250,14 @@ Once the directory is on a Range host, both frontends read the *same* files:
   written; it `mount`s the vanilla embed against `viewer-config.json`. *Blocked on
   the bundler/embed tier (P8, roadmap §3.3).* Until then, `build` still emits
   `viewer-config.json`, and the existing `demo`/`demo-react` can point at it.
-- **"I have a React app" (e.g. CAMPFIRE) → `npm i fits-pyramid`**, then feed the
+- **"I have a React app" (e.g. CAMPFIRE) → `npm i @fitsgl/core`**, then feed the
   deployed config to the shipped component:
   ```tsx
-  import { FitsViewer } from 'fits-pyramid/react';
+  import { FitsViewer } from '@fitsgl/core/react';
   const config = await fetch('https://…/cosmos-web/viewer-config.json').then(r => r.json());
   <FitsViewer config={config} /* + imperative handle for live markers */ />
   ```
-  This tier exists today (`fits-pyramid/src/react/index.tsx`).
+  This tier exists today (`fitsgl-core/src/react/index.tsx`).
 
 Both consume the producer's emitted contract — the discipline that keeps the tiers
 from diverging (roadmap §3.5).
@@ -322,7 +322,7 @@ A cross-origin upload sets CORS. Ship a `cors.json` like:
 
 **Accuracy note.** The source report claimed the client *requires* `Content-Range`
 exposed to validate the 206. It does **not**: `httpRangeFetch`
-(`fits-pyramid/src/fpack/fpack-file.ts:41-52`) validates by `resp.status === 206`
+(`fitsgl-core/src/fpack/fpack-file.ts:41-52`) validates by `resp.status === 206`
 (rejecting 200) and reads the body directly; nothing in the TS source reads
 `Content-Range`/`ETag`/`CF-Cache-Status`. So `Allow-Origin` alone makes the core
 fetch work cross-origin. `Expose-Headers` is for **observability** (a debug HUD

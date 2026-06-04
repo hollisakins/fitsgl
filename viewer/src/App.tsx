@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react';
-import { FitsExplorer } from 'fits-pyramid/react';
+import { FitsExplorer } from '@fitsgl/core/react';
 import {
   formatDec,
   formatRA,
   loadFitsglConfig,
   type FitsglConfig,
   type ResolvedMarker,
-} from 'fits-pyramid';
+} from '@fitsgl/core';
 
 /**
  * Load the producer contract (`fitsgl.json`) sitting next to this page and hand it

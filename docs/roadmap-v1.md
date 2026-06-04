@@ -46,13 +46,13 @@ the React wrapper, an M5 detail (D12); the **M6 tiled-mosaic architecture**
 Two packages, plus a verification demo. Everything below is read from the code,
 not the phase notes; where the notes diverge from the code it is flagged.
 
-### 1.1 `pyramid_gen/` (Python)
+### 1.1 `fitsgl-py/` (Python)
 
 **Public API.** `build_pyramid(input_path, output_dir=None, *, tile_size=256,
 quantize_level=16, processes=None) -> Manifest` in `build_pyramid.py`; the
 `Manifest`/`LevelInfo` dataclasses and `read_manifest`/`write_manifest` in
 `manifest.py`; `generate_synthetic_mosaic(...) -> (image, header, catalog)` in
-`synthetic.py`; a CLI in `__main__.py` (`python -m pyramid_gen`, flags `-o`,
+`synthetic.py`; a CLI in `__main__.py` (`python -m fitsgl`, flags `-o`,
 `--tile-size`, `--quantize-level`, `--processes`, `--synthetic`).
 
 **Key abstractions.** `_LevelTask` (a picklable per-level work unit) run through
@@ -81,7 +81,7 @@ The notes (`notes/phase1.md`) accurately describe the code, including the two
 deliberate deviations from the original brief (q=0 for lossless GZIP_2; the
 half-pixel CRPIX correction).
 
-### 1.2 `fits-pyramid/` (TypeScript)
+### 1.2 `fitsgl-core/` (TypeScript)
 
 **Public API** (`src/index.ts`, the single entry point): `riceDecompress`,
 `BitReader`; `loadManifest`, `validateManifest`, `resolveLevelUrl`, types
@@ -148,13 +148,13 @@ image is rotated to North-up within <0.1°, (2) a known star's pixel projects to
 its catalog RA/Dec within sub-pixel tolerance, (3) the readout matches astropy's
 `pixel_to_world` at several cursor positions.
 
-**What changes architecturally.** New module `fits-pyramid/src/wcs/` (a TAN
+**What changes architecturally.** New module `fitsgl-core/src/wcs/` (a TAN
 forward/inverse projection + CD-matrix pixel↔world, ICRS only) — there is no
 coordinate code today. Per D2, the `Camera` is **unchanged**; the North-up
 rotation is composed into the world→screen transform in `viewer.drawTile`, and
 the vertex shader's `u_rect` is generalized from an axis-aligned rectangle to a
 full quad transform — `renderer/shaders/tile.vert.ts` and `viewer.ts` change.
-`FitsViewer` gains a cursor→sky hook (likely a new `onCursor`). `pyramid_gen`
+`FitsViewer` gains a cursor→sky hook (likely a new `onCursor`). `fitsgl`
 needs no change (the per-level `wcs` dict already carries CD + CRPIX/CRVAL).
 
 **Manifest schema impact.** None — the `wcs` dict is already present per level.
@@ -245,7 +245,7 @@ pixel goes transparent only when all three are NaN (D8).
 
 **What changes architecturally.** Bounded by D7 (no in-browser resampling), the
 work concentrates in the renderer rather than the data layer:
-- **`pyramid_gen`**: no change to per-band generation. New: a **dataset-manifest
+- **`fitsgl`**: no change to per-band generation. New: a **dataset-manifest
   writer** that lists available bands and a canonical WCS-grid hash (D9).
 - **Data layer**: each band is an existing `TilePyramid`/`TileEngine`,
   **instantiated three times** — almost no engine change.
@@ -307,7 +307,7 @@ A new overlay subsystem in the renderer per D10: **WebGL marker geometry**
 viewer's transform so markers rotate with North-up for free; a **CPU
 spatial-index** (grid/quadtree) for click/hover hit-testing that fires callbacks
 with marker data; and **one reused DOM element** for the active tooltip/popup
-(rich content without thousands of nodes). Plus a `pyramid_gen` catalog export
+(rich content without thousands of nodes). Plus a `fitsgl` catalog export
 path (the synthetic catalog is currently discarded).
 
 **Manifest schema impact.** None to the pyramid manifest. A **new
@@ -374,7 +374,7 @@ analogue — may be added for the SSG path.)
 | Overlap | Per-tile interior clip; the ~1000-px overlap is trimmed, not blended. |
 | Sub-pixel offsets | Out of scope — producers drizzle onto one global grid, so offsets are integer. |
 
-**Alternative (zero-renderer-change fallback).** `pyramid_gen` could **stream the
+**Alternative (zero-renderer-change fallback).** `fitsgl` could **stream the
 N tiles into one field pyramid** at build time — *re-tiling, not re-drizzling*, so
 it sidesteps the whole-field drizzle bottleneck (at z=0 the aligned pixels are
 cropped/copied). It puts a large field on screen with today's renderer, at the
@@ -397,7 +397,7 @@ The three tiers are **one engine, three entry points** — not three products.
 
 ### 3.1 The shared core
 
-The core is the existing `fits-pyramid` package: `TilePyramid` (data) +
+The core is the existing `@fitsgl/core` package: `TilePyramid` (data) +
 `FitsViewer` (render) + `manifest` + decoders + the (new) `wcs` module. All
 v1.0 features (§2.1–2.4, §2.6) land **in the core**, expressed as imperative
 methods/options on `FitsViewer`/`TilePyramid`. The single most important
@@ -419,7 +419,7 @@ in the public surface.
 
 ### 3.2 React wrapper
 
-**Shipped** as the `fits-pyramid/react` subpath: a `<FitsViewer>` component that
+**Shipped** as the `@fitsgl/core/react` subpath: a `<FitsViewer>` component that
 owns a `<canvas>`, loads the config + constructs a core `FitsViewer` in an effect,
 and `destroy()`s the viewer **and every band pyramid** (which the core does not
 own) on unmount. It imports **only the frozen public API** — building the tier on
@@ -461,7 +461,7 @@ A bundled single artifact exposing a global init, e.g.
 
 ### 3.4 SSG (FITSMap replacement)
 
-A Python CLI (extend `pyramid_gen` or a sibling, e.g. `fitsgl-build-site`) that:
+A Python CLI (extend `fitsgl` or a sibling, e.g. `fitsgl-build-site`) that:
 (1) runs the existing pyramid build(s), (2) copies a **vendored copy of the
 vanilla embed bundle** + an HTML template into the output dir, (3) templates in
 the manifest/dataset-manifest URL(s), default stretch/colormap, and an optional
@@ -493,7 +493,7 @@ Spaces in play: **level-pixel** (per-z), **native-pixel / world** (the camera's
 space), **sky / RA-Dec**, **screen**, and — once North-up lands — the rotation
 folded into the world→screen step. There is **no canonical conversion code
 today**; the camera knows only world↔screen. A dedicated module
-(`fits-pyramid/src/wcs/` or `coords/`) owns world↔sky (TAN, CD matrix, ICRS) and
+(`fitsgl-core/src/wcs/` or `coords/`) owns world↔sky (TAN, CD matrix, ICRS) and
 the North-up rotation, and is the single source every consumer (RA/Dec readout,
 overlays, North-up render) calls. **Building it before overlays is a sequencing
 constraint** (M2 before M3). Per **D2**, the rotation is a view-transform layer:
@@ -568,7 +568,7 @@ astronomically-correct single-band viewer. *Depends on:* M1's shader structure
 
 ### M3 — Overlays (total ~L)
 *Features:* catalog/region overlays (§2.6, per D10) + a catalog export from
-`pyramid_gen`. *Why grouped:* overlays are the first consumer of M2's sky
+`fitsgl`. *Why grouped:* overlays are the first consumer of M2's sky
 transforms and inherit M2's rotation. *Deployable:* viewer with markers; the
 SSG-grade "CSV of RA/Dec" path and a programmatic add/update/remove + click/hover
 API for React. *Depends on:* M2 (sky transforms, rotation).
@@ -589,7 +589,7 @@ on:* M1–M4.
 
 *Progress:* the **`ViewerConfig` contract** (D14), the **`autoStretch` promotion**
 and **D11 API narrowing** (+ `/internal` subpath), and the **React tier**
-(`fits-pyramid/react`, D12) have landed. Remaining: the **vanilla embed** and
+(`@fitsgl/core/react`, D12) have landed. Remaining: the **vanilla embed** and
 **SSG** tiers (both need bundler infra not yet present — `tsc`-only today), and the
 §4.5 architecture/usage docs.
 
@@ -675,7 +675,7 @@ WCS, the overlap clip). *Deployable:* COSMOS-scale fields in the viewer.
 
 Not in v1.0, restated to anchor scope: region selection / measurement; HiPS
 underlay; animation/blinking; mobile/touch polish; multi-extension FITS UI;
-SIP/TPV distortion (still **rejected** by `pyramid_gen`, not handled); spectral
+SIP/TPV distortion (still **rejected** by `fitsgl`, not handled); spectral
 cubes. Also out: non-ICRS coordinate systems; arbitrary N-band beyond the three
 RGB channels; in-browser resampling of mismatched-WCS bands (D7); arbitrary
 polygon region overlays (simple shapes only, D10); overlay-driven measurement.

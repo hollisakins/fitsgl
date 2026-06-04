@@ -142,7 +142,7 @@ export default defineConfig({
     // hooks keep `dist/` fresh. (The demo runs the engine inline, so that worker
     // is bundled but never instantiated.)
     alias: {
-      'fits-pyramid': resolve(repoRoot, 'fits-pyramid', 'dist', 'index.js'),
+      '@fitsgl/core': resolve(repoRoot, 'fitsgl-core', 'dist', 'index.js'),
     },
   },
   server: {

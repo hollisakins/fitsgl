@@ -20,7 +20,7 @@
 #   ROTATE   WCS roll in degrees (default 30) so the demo shows North-up doing
 #            something visible; set ROTATE=0 for an axis-aligned field
 #
-# Honours $PYTHON (default: python). pyramid_gen need not be pip-installed; we
+# Honours $PYTHON (default: python). fitsgl need not be pip-installed; we
 # add its src/ to PYTHONPATH.
 set -euo pipefail
 
@@ -31,7 +31,7 @@ OUT_DIR="$DEMO_DIR/public/pyramid"
 PY="${PYTHON:-python}"
 SIZE="${SIZE:-512}"
 
-export PYTHONPATH="$REPO_ROOT/pyramid_gen/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO_ROOT/fitsgl-py/src${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "==> output dir: $OUT_DIR"
 mkdir -p "$DEMO_DIR/public"
@@ -44,7 +44,7 @@ if [[ $# -ge 1 ]]; then
     exit 1
   fi
   echo "==> building pyramid from real mosaic: $INPUT"
-  "$PY" -m pyramid_gen "$INPUT" -o "$OUT_DIR"
+  "$PY" -m fitsgl "$INPUT" -o "$OUT_DIR"
 else
   WORK="$(mktemp -d)"
   trap 'rm -rf "$WORK"' EXIT
@@ -59,8 +59,8 @@ import os
 import sys
 from pathlib import Path
 from astropy.io import fits
-from pyramid_gen.synthetic import generate_synthetic_mosaic
-from pyramid_gen.catalog import write_catalog_csv
+from fitsgl.synthetic import generate_synthetic_mosaic
+from fitsgl.catalog import write_catalog_csv
 
 work = Path(sys.argv[1])
 size = int(sys.argv[2])
@@ -87,14 +87,14 @@ write_catalog_csv(catalog, work / "catalog.csv")
 PY
   echo "==> building 3 band pyramids"
   for band in f150w f277w f444w; do
-    "$PY" -m pyramid_gen "$WORK/$band.fits" -o "$OUT_DIR/$band"
+    "$PY" -m fitsgl "$WORK/$band.fits" -o "$OUT_DIR/$band"
   done
   # Write the dataset manifest grouping the three bands (pure helper, no Pool).
   echo "==> writing dataset.json"
   "$PY" - "$OUT_DIR" <<'PY'
 import sys
 from pathlib import Path
-from pyramid_gen.dataset import build_dataset
+from fitsgl.dataset import build_dataset
 
 out = Path(sys.argv[1])
 bands = [(b, out / b / "manifest.json") for b in ("f150w", "f277w", "f444w")]

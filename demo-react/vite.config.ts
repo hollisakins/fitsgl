@@ -108,15 +108,15 @@ export default defineConfig({
   plugins: [react(), pyramidServer()],
   resolve: {
     // Consume the library's COMPILED output (like the vanilla demo): the core via
-    // `fits-pyramid`, the React tier via `fits-pyramid/react`. Anchored regexes so
+    // `@fitsgl/core`, the React tier via `@fitsgl/core/react`. Anchored regexes so
     // the `/react` subpath isn't swallowed by the bare-specifier alias. The npm
     // pre-build hooks keep `dist/` fresh.
     alias: [
       {
-        find: /^fits-pyramid\/react$/,
-        replacement: resolve(repoRoot, 'fits-pyramid', 'dist', 'react', 'index.js'),
+        find: /^@fitsgl\/core\/react$/,
+        replacement: resolve(repoRoot, 'fitsgl-core', 'dist', 'react', 'index.js'),
       },
-      { find: /^fits-pyramid$/, replacement: resolve(repoRoot, 'fits-pyramid', 'dist', 'index.js') },
+      { find: /^@fitsgl\/core$/, replacement: resolve(repoRoot, 'fitsgl-core', 'dist', 'index.js') },
     ],
   },
   server: {

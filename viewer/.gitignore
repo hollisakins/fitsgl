@@ -1,3 +1,3 @@
 node_modules/
-# The build output goes to ../pyramid_gen/src/pyramid_gen/_viewer (vendored,
+# The build output goes to ../fitsgl-py/src/fitsgl/_viewer (vendored,
 # committed) — there is no local dist/ to ignore here.

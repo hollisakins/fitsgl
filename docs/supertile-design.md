@@ -239,7 +239,7 @@ header read per supertile on first touch (memoized).
 
 ## 8. Generator architecture
 
-**Python (`pyramid_gen`):**
+**Python (`fitsgl`):**
 
 - **Config** — `BandSpec.input` accepts a *list* / glob of FITS for pre-tiled
   input (single path stays valid). New validation: SP8's shared-WCS guard across a

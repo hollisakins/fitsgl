@@ -158,7 +158,7 @@ export CLOUDFLARE_API_TOKEN=...    # optional, enables the edge purge
 ```
 
 Install the deploy extra (it pulls in boto3, which the base install omits) — from a
-checkout of this repo, in the `pyramid_gen/` directory:
+checkout of this repo, in the `fitsgl-py/` directory:
 
 ```bash
 pip install -e ".[deploy]"

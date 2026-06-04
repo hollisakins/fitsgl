@@ -26,7 +26,7 @@ import {
   type StretchMode,
   type TilePyramid,
   type ViewerFrameInfo,
-} from 'fits-pyramid';
+} from '@fitsgl/core';
 
 /** Which RGB channel the min/max inputs currently edit. */
 type Channel = 'r' | 'g' | 'b';

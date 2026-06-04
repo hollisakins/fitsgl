@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { FitsExplorer } from 'fits-pyramid/react';
+import { FitsExplorer } from '@fitsgl/core/react';
 import {
   fitsglConfigFromDataset,
   formatDec,
@@ -7,7 +7,7 @@ import {
   loadDataset,
   type FitsglConfig,
   type ResolvedMarker,
-} from 'fits-pyramid';
+} from '@fitsgl/core';
 
 /** Where the (shared) pyramid is served — see vite.config.ts. */
 const PYRAMID = '/pyramid/';

@@ -59,7 +59,7 @@ Any host MUST satisfy these — they are already exercised locally by `fitsgl se
 
 1. **HTTP Range / `206 Partial Content`** — non-negotiable. The client sends
    `Range: bytes=…` and **hard-throws on a `200`** and on any non-`206` status
-   (`fits-pyramid/src/fpack/fpack-file.ts:42-55`). A host that ignores Range is the
+   (`fitsgl-core/src/fpack/fpack-file.ts:42-55`). A host that ignores Range is the
    single biggest deploy footgun and it fails *loudly but late* (blank viewer). R2
    serves Range natively; Cloudflare in front of it does too.
 2. **Correct MIME types** — `.js` must be a JS type (ES-module `<script>` is

@@ -1,6 +1,6 @@
-# fits-pyramid demo (React)
+# @fitsgl/core demo (React)
 
-A minimal React page that renders a FITS pyramid through the `fits-pyramid/react`
+A minimal React page that renders a FITS pyramid through the `@fitsgl/core/react`
 `<FitsViewer>` component — the M5 React delivery tier (decision D12). It reuses the
 pyramid built by the vanilla [`demo/`](../demo) (served here with HTTP Range
 support) and exercises both halves of the D12 boundary:
@@ -34,4 +34,4 @@ teardown.
   optional `catalog.csv`), builds the controlled `ViewerConfig` from React state,
   and drives markers/actions through the ref handle.
 - `vite.config.ts` — serves `../demo/public/pyramid/*` (Range-aware for `.fits.fz`)
-  and aliases `fits-pyramid` + `fits-pyramid/react` to the library's `dist/`.
+  and aliases `@fitsgl/core` + `@fitsgl/core/react` to the library's `dist/`.

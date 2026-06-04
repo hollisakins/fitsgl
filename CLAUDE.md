@@ -11,30 +11,30 @@ both.
 
 ## Layout
 
-- `pyramid_gen/` — Python pipeline. Reads a FITS mosaic, writes one fpacked
-  `.fits.fz` per resolution level plus a `manifest.json`. Every level is a
-  display-only product: `RICE_1`, `quantize_level=8`, `SUBTRACTIVE_DITHER_2`
-  (lossy but ~0.03% photometry-faithful; the raw lossless mosaic ships
-  separately). Entry: `pyramid_gen.build_pyramid.build_pyramid`.
-- `fits-pyramid/` — TypeScript library (single entry `src/index.ts`):
-  `rice/` (RICE decode), `fpack/` (file parsing + tile fetch over range
-  requests, `TilePyramid`), `renderer/` (`FitsViewer`, WebGL2). Builds with
-  `tsc` (no bundler).
-- `demo/` — Vite app for end-to-end visual verification.
-- `viewer/` — the SSG viewer app (Vite + the `fits-pyramid` React
-  `<FitsExplorer>`). `npm run build-vendor` compiles it into
-  `pyramid_gen/src/pyramid_gen/_viewer/` — the committed bundle that `fitsgl
-  build` copies next to a dataset to emit a self-contained, deployable site.
+- `fitsgl-py/` — Python pipeline (pip package `fitsgl`, CLI `fitsgl`). Reads a
+  FITS mosaic, writes one fpacked `.fits.fz` per resolution level plus a
+  `manifest.json`. Every level is a display-only product: `RICE_1`,
+  `quantize_level=8`, `SUBTRACTIVE_DITHER_2` (lossy but ~0.03% photometry-faithful;
+  the raw lossless mosaic ships separately). Entry: `fitsgl.build_pyramid.build_pyramid`.
+- `fitsgl-core/` — TypeScript library (npm `@fitsgl/core`, single entry
+  `src/index.ts`): `rice/` (RICE decode), `fpack/` (file parsing + tile fetch over
+  range requests, `TilePyramid`), `renderer/` (`FitsViewer`, WebGL2). Builds with
+  `tsc` (no bundler). The `@fitsgl/core/react` subpath ships the React tier.
+- `demo/` — Vite app for end-to-end visual verification (npm `@fitsgl/demo`).
+- `viewer/` — the SSG viewer app (npm `@fitsgl/viewer`; Vite + the `@fitsgl/core`
+  React `<FitsExplorer>`). `npm run build-vendor` compiles it into
+  `fitsgl-py/src/fitsgl/_viewer/` — the committed bundle that `fitsgl build` copies
+  next to a dataset to emit a self-contained, deployable site.
 
 ## Commands
 
 ```bash
-# Python
-cd pyramid_gen && pip install -e ".[test]" && pytest
-python -m pyramid_gen path/to/mosaic.fits -o out/   # build a pyramid
+# Python (pip package `fitsgl`)
+cd fitsgl-py && pip install -e ".[test]" && pytest
+python -m fitsgl path/to/mosaic.fits -o out/   # build a pyramid (or the `fitsgl-gen` script)
 
-# TypeScript library
-cd fits-pyramid && npm install
+# TypeScript library (npm `@fitsgl/core`)
+cd fitsgl-core && npm install
 npm test          # vitest
 npm run typecheck # tsc --noEmit
 npm run build     # tsc -> dist/
@@ -42,11 +42,11 @@ npm run build     # tsc -> dist/
 # Demo
 cd demo && npm install && npm run build-pyramid && npm run dev
 
-# SSG viewer bundle — re-vendor after ANY change to fits-pyramid/ or viewer/
-# source, or the bundle `fitsgl build` ships stays stale. A pyramid_gen test
+# SSG viewer bundle — re-vendor after ANY change to fitsgl-core/ or viewer/
+# source, or the bundle `fitsgl build` ships stays stale. A fitsgl-py test
 # (test_vendored_viewer_is_fresh) fails until you do; commit the rebuilt
-# pyramid_gen/_viewer/. To refresh only the site in an already-built dataset
-# afterwards: `fitsgl build --site-only`.
+# fitsgl-py/src/fitsgl/_viewer/. To refresh only the site in an already-built
+# dataset afterwards: `fitsgl build --site-only`.
 npm --prefix viewer run build-vendor
 ```
 
