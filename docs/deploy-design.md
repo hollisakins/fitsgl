@@ -396,9 +396,10 @@ confirmed):
   slow site. No `--ensure-cache-rule` flag in v1 (could be a later convenience if
   demand appears).
 
-## 9. Companion docs to write (after the code lands)
+## 9. Companion docs
 
-- **`docs/r2-setup.md` — R2 deployment setup guide.** Assumes basic familiarity (the
+- ✅ **`docs/r2-setup.md` — R2 deployment setup guide** (written; the code has landed).
+  Assumes basic familiarity (the
   user has a Cloudflare account and understands object storage); covers only the
   bucket/account configuration that **can't be done from the CLI**, and ends by
   spelling out exactly which identifiers/keys FitsGL needs and where they go. Most
