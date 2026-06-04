@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+node_modules/
 .DS_Store
 
 # Deploy secrets — never commit (`fitsgl deploy` reads these; see docs/r2-setup.md)
