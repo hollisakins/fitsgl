@@ -18,10 +18,13 @@
 
 import {
   fitsglConfigFromDataset,
+  DEFAULT_TRILOGY_PARAMS,
   type ColormapName,
   type DatasetManifest,
   type FitsglConfig,
   type StretchMode,
+  type TrilogyParams,
+  type TrilogyStats,
   type ViewerConfig,
   type ViewerView,
 } from '../index.js';
@@ -44,6 +47,9 @@ export interface ExplorerBand {
   /** Pre-computed display histogram (wire shape) seeding the stretch panel so it
    *  need not scan live; counts per bin over `[lo, hi]`. Omitted ⇒ scan on first frame. */
   histogram?: { counts: number[]; lo: number; hi: number };
+  /** Pre-computed global trilogy stats (native z=0); drives a stable, color-preserving
+   *  trilogy stretch with no live rescan. Omitted ⇒ trilogy falls back to a percentile fit. */
+  trilogy?: TrilogyStats;
 }
 
 /** The producer's default view (from `[viewer]` / `defaultView`). All overridable. */
@@ -66,6 +72,8 @@ export interface ExplorerState {
   /** RGB channel assignment (always populated within one grid group). */
   rgb: { r: string; g: string; b: string };
   stretch: StretchMode;
+  /** Trilogy knobs (noiselum/satpercent/noisesig/noisesig0), used when `stretch` is `trilogy`. */
+  trilogyParams: TrilogyParams;
   /** Single-band colormap (`'gray'` is the grayscale fast path). */
   colormap: ColormapName;
   northUp: boolean;
@@ -164,6 +172,7 @@ export function defaultExplorerState(
     band,
     rgb: defaultTriple(bands, dv),
     stretch: dv?.stretch ?? 'asinh',
+    trilogyParams: { ...DEFAULT_TRILOGY_PARAMS },
     colormap: dv?.colormap ?? 'gray',
     northUp: dv?.northUp ?? true,
     overlay: false,
@@ -211,6 +220,7 @@ export function explorerBandsFromConfig(config: FitsglConfig): ExplorerBand[] {
     if (b.label !== undefined) band.label = b.label;
     if (b.grid.pixelScaleArcsec !== undefined) band.pixelScaleArcsec = b.grid.pixelScaleArcsec;
     if (b.stats?.histogram !== undefined) band.histogram = b.stats.histogram;
+    if (b.stats?.trilogy !== undefined) band.trilogy = b.stats.trilogy;
     return band;
   });
 }

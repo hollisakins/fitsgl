@@ -40,6 +40,8 @@ import {
   type ResolvedMarker,
   type StretchMode,
   type TilePyramidOptions,
+  type TrilogyParams,
+  type TrilogyStats,
   type ViewerFrameInfo,
 } from '../index.js';
 import {
@@ -201,6 +203,110 @@ function LimitsControl({
           onChange={(e) => onChange(min, Math.max(Number(e.target.value), min + step))}
         />
       </div>
+    </div>
+  );
+}
+
+/** One labelled trilogy knob; `log` maps the slider over `10^value` decades. */
+function TriSlider({
+  label,
+  value,
+  min,
+  max,
+  step,
+  log = false,
+  fmt,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  log?: boolean;
+  fmt: (v: number) => string;
+  onChange: (v: number) => void;
+}): JSX.Element {
+  const sliderVal = log ? Math.log10(value) : value;
+  return (
+    <label className="fgl-tri-row">
+      <span className="fgl-tri-lbl">{label}</span>
+      <input
+        type="range"
+        className="fgl-tri-range"
+        min={min}
+        max={max}
+        step={step}
+        value={sliderVal}
+        onChange={(e) => {
+          const sv = Number(e.target.value);
+          onChange(log ? Math.pow(10, sv) : sv);
+        }}
+      />
+      <span className="fgl-tri-val">{fmt(value)}</span>
+    </label>
+  );
+}
+
+/**
+ * Trilogy knobs (faithful, color-preserving): noise luminance, saturation
+ * percent, and the noise/black sigmas. The black/white points (`x0`/`x2`) and
+ * the softening are derived from these + the band's precomputed global stats, so
+ * there are no manual limit sliders here — moving a knob re-derives instantly.
+ */
+function TrilogyControls({
+  params,
+  missing,
+  onChange,
+}: {
+  params: TrilogyParams;
+  missing: boolean;
+  onChange: (patch: Partial<TrilogyParams>) => void;
+}): JSX.Element {
+  return (
+    <div className="fgl-tri">
+      {missing && (
+        <div className="fgl-tri-warn">
+          No precomputed trilogy stats for these bands — rebuild the dataset for a faithful fit.
+        </div>
+      )}
+      <TriSlider
+        label="Noise lum"
+        value={params.noiselum}
+        min={0.01}
+        max={0.8}
+        step={0.01}
+        fmt={(v) => v.toFixed(2)}
+        onChange={(v) => onChange({ noiselum: v })}
+      />
+      <TriSlider
+        label="Saturate %"
+        value={params.satpercent}
+        min={-3}
+        max={0}
+        step={0.1}
+        log
+        fmt={(v) => (v >= 0.01 ? v.toFixed(2) : v.toExponential(0))}
+        onChange={(v) => onChange({ satpercent: v })}
+      />
+      <TriSlider
+        label="Noise σ"
+        value={params.noisesig}
+        min={0}
+        max={5}
+        step={0.1}
+        fmt={(v) => v.toFixed(1)}
+        onChange={(v) => onChange({ noisesig: v })}
+      />
+      <TriSlider
+        label="Black σ"
+        value={params.noisesig0}
+        min={0}
+        max={5}
+        step={0.1}
+        fmt={(v) => v.toFixed(1)}
+        onChange={(v) => onChange({ noisesig0: v })}
+      />
     </div>
   );
 }
@@ -400,9 +506,16 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   }, [state.overlay, markers, readyTick]);
 
   // Stretch MODE is imperative: a flip must not re-auto-stretch the manual limits.
+  // Trilogy needs precomputed per-band stats; when an active band lacks them, drive
+  // the viewer with a plain `log` curve instead (the UI still shows `trilogy` + the
+  // "no precomputed stats" warning, and seed() sets sane limits). Otherwise the
+  // mode-3 RGB luminance path would render with its un-solved default (Lsat = 1).
   useEffect(() => {
-    getViewer()?.setStretchMode(state.stretch);
-  }, [state.stretch, readyTick, getViewer]);
+    const triMissing =
+      state.stretch === 'trilogy' &&
+      activeBandNames(state).some((n) => bands.find((b) => b.name === n)?.trilogy === undefined);
+    getViewer()?.setStretchMode(triMissing ? 'log' : state.stretch);
+  }, [state.stretch, state.mode, state.band, state.rgb, bands, readyTick, getViewer]);
 
   // Seed the limits sliders + histograms from the data in view, after the source
   // changes (or a reload). Deferred to the next drawn frame (autoStretch /
@@ -414,10 +527,55 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     needSeedRef.current = true;
   }, [viewSig, readyTick]);
 
+  // Faithful, color-preserving trilogy from the producer's precomputed global
+  // stats — no tile rescan, so it is stable and viewport-independent. Returns
+  // false (caller falls back to the percentile auto-stretch) when the viewer mode
+  // is mid-switch or a band lacks precomputed stats. Reflects the solved black/
+  // white points (x0/x2) back into the sliders.
+  const applyTrilogyFromStats = useCallback(
+    (v: FitsViewerCore): boolean => {
+      if ((state.mode === 'rgb') !== v.isRgb) return false; // viewer not yet synced
+      const names = activeBandNames(state);
+      const triStats = names.map((n) => bands.find((b) => b.name === n)?.trilogy);
+      if (triStats.some((s) => s === undefined)) return false;
+      if (state.mode === 'rgb') {
+        const triple = triStats as [TrilogyStats, TrilogyStats, TrilogyStats];
+        const levels = v.applyTrilogy(triple, state.trilogyParams);
+        setLimits((prev) => {
+          const next = { ...prev };
+          (['r', 'g', 'b'] as const).forEach((role, i) => {
+            next[state.rgb[role]] = { min: levels[i].x0, max: levels[i].x2 };
+          });
+          return next;
+        });
+      } else {
+        const [lv] = v.applyTrilogy(triStats[0] as TrilogyStats, state.trilogyParams);
+        setLimits((prev) => ({ ...prev, [state.band]: { min: lv.x0, max: lv.x2 } }));
+      }
+      return true;
+    },
+    [bands, state.mode, state.band, state.rgb, state.trilogyParams],
+  );
+
+  // Re-apply trilogy live when a knob moves (the viewer mode is already settled,
+  // so no rescan and no source-switch race — purely the precomputed-stats path).
+  useEffect(() => {
+    if (state.stretch !== 'trilogy') return;
+    const v = getViewer();
+    if (v !== null) applyTrilogyFromStats(v);
+  }, [state.stretch, state.trilogyParams, readyTick, getViewer, applyTrilogyFromStats]);
+
   const seed = useCallback(async (): Promise<void> => {
     const v = getViewer();
     if (v === null) return;
-    const [auto, hist] = await Promise.all([v.autoStretch(), v.visibleHistogram()]);
+    // Trilogy drives its levels from precomputed global stats; still seed the
+    // panel histograms below for display. Fall through to percentile only when
+    // trilogy could not apply (mode mid-switch or no precomputed stats).
+    const trilogyApplied = state.stretch === 'trilogy' && applyTrilogyFromStats(v);
+    const [auto, hist] = await Promise.all([
+      trilogyApplied ? Promise.resolve(null) : v.autoStretch(),
+      v.visibleHistogram(),
+    ]);
     setLimits((prev) => {
       if (auto === null) return prev;
       const next = { ...prev };
@@ -440,7 +598,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
       }
       return next;
     });
-  }, [getViewer, state.mode, state.band, state.rgb.r, state.rgb.g, state.rgb.b]);
+  }, [getViewer, state.mode, state.band, state.rgb.r, state.rgb.g, state.rgb.b, state.stretch, applyTrilogyFromStats]);
 
   const onFrame = (info: ViewerFrameInfo): void => {
     setFrame((prev) =>
@@ -550,7 +708,17 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                 </div>
 
                 <div className="fgl-limits">
-                  {state.mode === 'single' ? (
+                  {state.stretch === 'trilogy' ? (
+                    <TrilogyControls
+                      params={state.trilogyParams}
+                      missing={activeBandNames(state).some(
+                        (n) => bands.find((b) => b.name === n)?.trilogy === undefined,
+                      )}
+                      onChange={(patch) =>
+                        setState((s) => ({ ...s, trilogyParams: { ...s.trilogyParams, ...patch } }))
+                      }
+                    />
+                  ) : state.mode === 'single' ? (
                     <LimitsControl
                       histo={histos[state.band]}
                       value={limits[state.band]}
@@ -573,9 +741,11 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                       );
                     })
                   )}
-                  <button type="button" className="fgl-auto" onClick={() => void seed()}>
-                    Auto-stretch visible
-                  </button>
+                  {state.stretch !== 'trilogy' && (
+                    <button type="button" className="fgl-auto" onClick={() => void seed()}>
+                      Auto-stretch visible
+                    </button>
+                  )}
                 </div>
 
                 {state.mode === 'single' && (
@@ -736,6 +906,15 @@ const STYLE_CSS = `
 .fgl-auto{width:100%;margin-top:3px;background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
   font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:7px;border-radius:4px;cursor:pointer;}
 .fgl-auto:hover{border-color:var(--gold-d);color:var(--gold);}
+.fgl-tri{display:flex;flex-direction:column;gap:7px;}
+.fgl-tri-warn{font-size:9.5px;line-height:1.4;color:var(--gold);background:rgba(224,173,77,.08);
+  border:1px solid var(--gold-d);border-radius:4px;padding:5px 7px;}
+.fgl-tri-row{display:flex;align-items:center;gap:8px;}
+.fgl-tri-lbl{font-size:10px;color:var(--dim);min-width:62px;letter-spacing:.04em;}
+.fgl-tri-range{flex:1;appearance:none;height:3px;border-radius:2px;background:var(--line2);cursor:ew-resize;}
+.fgl-tri-range::-webkit-slider-thumb{appearance:none;width:10px;height:14px;border-radius:2px;background:var(--gold);border:1px solid #161003;cursor:ew-resize;}
+.fgl-tri-range::-moz-range-thumb{width:10px;height:14px;border-radius:2px;background:var(--gold);border:1px solid #161003;cursor:ew-resize;}
+.fgl-tri-val{font-size:9.5px;color:var(--text);font-variant-numeric:tabular-nums;min-width:42px;text-align:right;}
 .fgl-cm{position:relative;flex:1;}
 .fgl-cm-trigger{display:flex;align-items:center;gap:9px;width:100%;cursor:pointer;background:var(--inset);
   border:1px solid var(--line2);border-radius:4px;padding:6px 9px;}

@@ -30,7 +30,7 @@ from .deploy_plan import (  # CDN cache-window + upload defaults (lightweight, n
 )
 
 #: Known transfer curves (kept in lockstep with the TS ``StretchMode``).
-STRETCH_MODES = ("linear", "log", "asinh")
+STRETCH_MODES = ("linear", "log", "asinh", "trilogy")
 
 #: Band names that would collide with a top-level output file/dir in the dataset
 #: directory, so they are refused (a band becomes a subdirectory named for it).

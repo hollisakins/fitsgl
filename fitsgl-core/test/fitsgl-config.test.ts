@@ -109,6 +109,30 @@ describe('validateFitsglConfig', () => {
     expect(c.dataset.bands[1].stats).toBeUndefined(); // omitted ⇒ undefined (viewer scans live)
   });
 
+  it('accepts and preserves precomputed trilogy stats alongside the histogram', () => {
+    const r = raw();
+    const trilogy = {
+      mean: 100,
+      sigma: 5,
+      tail: { p99: 200, p99_9: 400, p99_99: 800, p99_999: 1600 },
+    };
+    (r.dataset as { bands: Record<string, unknown>[] }).bands[0].stats = {
+      histogram: { counts: [1, 2, 3, 0], lo: 0.5, hi: 9.5 },
+      trilogy,
+    };
+    const c = validateFitsglConfig(r);
+    expect(c.dataset.bands[0].stats?.trilogy).toEqual(trilogy);
+  });
+
+  it('rejects malformed trilogy stats', () => {
+    const r = raw();
+    (r.dataset as { bands: Record<string, unknown>[] }).bands[0].stats = {
+      histogram: { counts: [1, 2], lo: 0, hi: 1 },
+      trilogy: { mean: 1, sigma: 2, tail: { p99: 1 } },
+    };
+    expect(() => validateFitsglConfig(r)).toThrow(/trilogy/);
+  });
+
   it('rejects a malformed band stats histogram', () => {
     const bad = (h: unknown): Record<string, unknown> => {
       const r = raw();
