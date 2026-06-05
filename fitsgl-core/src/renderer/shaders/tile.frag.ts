@@ -35,6 +35,21 @@ function glslFloat(n: number): string {
   return Number.isInteger(n) ? `${n}.0` : `${n}`;
 }
 
+/**
+ * Emit a literal-indexed dispatch over the `u_band[]` sampler array. GLSL ES
+ * 3.00 (spec §4.1.7) requires a sampler-array index to be a *constant integral
+ * expression* — a loop induction variable is not one, so `u_band[i]` is invalid
+ * even though some drivers unroll the loop and tolerate it. Comparing `idx`
+ * against each literal index keeps every `u_band[N]` a compile-time constant.
+ */
+function bandSamplerDispatch(): string {
+  let body = '';
+  for (let i = 0; i < MAX_BANDS; i++) {
+    body += `  if (idx == ${i}) return texture(u_band[${i}], v_uv).r;\n`;
+  }
+  return body;
+}
+
 export const TILE_FRAG = `#version 300 es
 precision highp float;
 
@@ -98,6 +113,13 @@ float scaleChannel(float v, float lo, float hi, float k) {
   return applyStretch(norm, k);
 }
 
+// Sample band texture \`idx\` from the sampler array via literal-constant indices
+// (see bandSamplerDispatch / GLSL ES 3.00 §4.1.7): a sampler-array subscript must
+// be a constant integral expression, which a loop variable is not.
+float sampleBand(int idx) {
+${bandSamplerDispatch()}  return 0.0;
+}
+
 void main() {
   if (u_mode == 1) {
     // RGB composite (M4). Per-channel NaN -> 0; transparent only if all NaN (D8).
@@ -147,13 +169,14 @@ void main() {
     // host so a zero-weight channel is exactly 0. A NaN band contributes 0 to
     // every channel; the pixel is opaque background only when ALL participating
     // bands are NaN (generalizes the D8 all-three-NaN rule). The loop bound is the
-    // fixed MAX_BANDS with an early break — sampler arrays are indexed only by the
-    // loop induction variable (a constant-index expression under GLSL ES 3.00).
+    // fixed MAX_BANDS with an early break; the sampler array is indexed only by
+    // literal constants inside sampleBand() (GLSL ES 3.00 §4.1.7 forbids indexing
+    // a sampler array with the loop induction variable).
     vec3 num = vec3(0.0);
     int nanCount = 0;
     for (int i = 0; i < MAX_BANDS; i++) {
       if (i >= u_nBands) break;
-      float v = texture(u_band[i], v_uv).r;
+      float v = sampleBand(i);
       if (isnan(v)) { nanCount++; continue; }
       float s = scaleChannel(v, u_bx0[i], u_bx2[i], u_bk[i]);
       num += u_weight[i] * s;

@@ -426,11 +426,22 @@ describe('TILE_FRAG — weighted multi-band trilogy branch (u_mode == 2)', () =>
   it('accumulates per-band weighted, trilogy-stretched contributions', () => {
     const mb = TILE_FRAG.indexOf('u_mode == 2');
     expect(mb).toBeGreaterThan(0);
-    expect(TILE_FRAG).toContain('texture(u_band[i], v_uv).r');
+    expect(TILE_FRAG).toContain('float v = sampleBand(i)');
     expect(TILE_FRAG).toContain('scaleChannel(v, u_bx0[i], u_bx2[i], u_bk[i])');
     expect(TILE_FRAG).toContain('num += u_weight[i] * s');
     // Normalized by the host-precomputed Σ weights, with a per-channel zero guard.
     expect(TILE_FRAG).toContain('u_weightSum.r > 0.0 ? num.r / u_weightSum.r : 0.0');
+  });
+
+  it('indexes the u_band sampler array only by constant integral expressions', () => {
+    // GLSL ES 3.00 §4.1.7: a sampler-array subscript must be a constant integral
+    // expression. Indexing with the loop variable (`u_band[i]`) is unrolled and
+    // tolerated by some drivers but rejected by strict ones (the deployed-site
+    // compile error). sampleBand() dispatches through literal indices instead;
+    // assert no `u_band[<non-literal>]` slips back in.
+    expect(TILE_FRAG).not.toMatch(/u_band\[\s*i\s*\]/);
+    expect(TILE_FRAG).toContain('texture(u_band[0], v_uv).r');
+    expect(TILE_FRAG).toContain(`texture(u_band[${MAX_BANDS - 1}], v_uv).r`);
   });
 
   it('emits the background only when ALL participating bands are NaN', () => {
