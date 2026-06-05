@@ -81,6 +81,10 @@ uniform float u_trilogyK;   // trilogy softening (mode 3); solved on the host fr
 uniform float u_trilogyLsat;// trilogy RGB: bias-subtracted luminance mapping to 1
 uniform vec3 u_bg;          // opaque background colour; NaN/no-data pixels emit this
 
+// Declared before the uniform block below: GLSL ES requires the array-size
+// identifier to exist before it is used as a uniform array length.
+const int MAX_BANDS = ${De};
+
 // Weighted multi-band trilogy (u_mode == 2): one entry per participating band.
 uniform sampler2D u_band[MAX_BANDS]; // band textures, bound by the viewer's unit map
 uniform vec3 u_weight[MAX_BANDS];    // per-band (R,G,B) contribution weight
@@ -92,7 +96,6 @@ uniform vec3 u_weightSum;            // host-precomputed Σ weights per channel
 
 const float LOG_A = ${lu(qf)};
 const float ASINH_A = ${lu(Im)};
-const int MAX_BANDS = ${De};
 
 in vec2 v_uv;
 out vec4 outColor;

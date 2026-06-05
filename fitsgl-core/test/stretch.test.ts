@@ -411,6 +411,18 @@ describe('TILE_FRAG — weighted multi-band trilogy branch (u_mode == 2)', () =>
     expect(TILE_FRAG).toContain('uniform sampler2D u_band[MAX_BANDS]');
   });
 
+  it('declares MAX_BANDS before it is used as a uniform array size (GLSL needs decl-before-use)', () => {
+    // The browser is the only thing that compiles this shader; Node never does.
+    // GLSL ES requires the array-length identifier to exist before the uniform
+    // declarations reference it, or every `[MAX_BANDS]` is an undeclared-identifier
+    // compile error. Guard the ordering statically so the regression can't recur.
+    const decl = TILE_FRAG.indexOf('const int MAX_BANDS =');
+    const firstUse = TILE_FRAG.indexOf('[MAX_BANDS]');
+    expect(decl).toBeGreaterThan(0);
+    expect(firstUse).toBeGreaterThan(0);
+    expect(decl).toBeLessThan(firstUse);
+  });
+
   it('accumulates per-band weighted, trilogy-stretched contributions', () => {
     const mb = TILE_FRAG.indexOf('u_mode == 2');
     expect(mb).toBeGreaterThan(0);
