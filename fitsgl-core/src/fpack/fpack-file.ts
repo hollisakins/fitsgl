@@ -3,9 +3,10 @@
  * fetch+decode over HTTP range requests.
  *
  * Lifecycle:
- *   1. `FpackFile.open(url, fetcher)` — range-fetch the first ~16 KB, parse the
- *      primary + BINTABLE headers, read the Z, N, and T keywords, and reject any
- *      compression type other than RICE_1 / GZIP_2.
+ *   1. `FpackFile.open(url, fetcher)` — range-fetch the first ~32 KB (usually
+ *      enough to also cover the tile index), parse the primary + BINTABLE headers,
+ *      read the Z, N, and T keywords, and reject any compression type other than
+ *      RICE_1 / GZIP_2.
  *   2. `loadTileIndex()` — range-fetch the BINTABLE row table once and parse each
  *      tile's descriptor (+ ZSCALE/ZZERO/ZBLANK for RICE). Cached for O(1) lookup.
  *   3. `getTile(x, y)` — range-fetch just that tile's heap bytes and dispatch on
@@ -72,6 +73,19 @@ interface TileIndexEntry {
 export interface FpackOpenOptions {
   initialBytes?: number;
 }
+
+/**
+ * Bytes range-fetched on `open()`. Sized to usually cover the primary + BINTABLE
+ * headers AND the BINTABLE row table (the tile index) in one request, so the
+ * common `open()` → `loadTileIndex()` sequence costs a single round trip for all
+ * but the largest (finest, many-tile) levels — `getBytes` serves the index from
+ * this buffer when it fits. Larger than strictly needed for coarse levels (a
+ * one-time cost per file, then cached), but it collapses the first-tile latency of
+ * a fresh level from three serial round trips to two. `open()` still grows the
+ * window automatically if even the headers do not fit (the IncompleteHeaderError
+ * retry loop).
+ */
+const DEFAULT_INITIAL_BYTES = 32768;
 
 /**
  * Everything `FpackFile.decodeTile` needs to turn a tile's compressed bytes into
@@ -176,7 +190,7 @@ export class FpackFile {
     fetcher: RangeFetcher = httpRangeFetch,
     options: FpackOpenOptions = {},
   ): Promise<FpackFile> {
-    const initial = options.initialBytes ?? 16384;
+    const initial = options.initialBytes ?? DEFAULT_INITIAL_BYTES;
     let requested = initial;
     let head = await fetcher(url, 0, requested - 1);
 

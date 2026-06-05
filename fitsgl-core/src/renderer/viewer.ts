@@ -68,6 +68,7 @@ import { OverlayPopup } from '../overlay/popup.js';
 import {
   TileManager,
   buildLevelGeoms,
+  centerOutOrder,
   coarserFallback,
   commonResidentLevel,
   fallbackUV,
@@ -78,6 +79,7 @@ import {
   tileKey,
   tileWorldRect,
   visibleTiles,
+  TILE_SIZE,
   type LevelGeom,
   type TileCoord,
   type WorldRect,
@@ -97,17 +99,30 @@ const DEFAULT_TEXTURE_BUDGET = 200;
  */
 const MAX_UPLOADS_PER_FRAME = 8;
 /**
- * Crossfade-in duration (ms) for a tile's first appearance at its own level.
- * The newly-resident tile ramps alpha 0→1 over this window while its fallback
- * (the just-left finer level on zoom-out, or a coarse ancestor) shows through
- * underneath — so a level switch dissolves in rather than popping. Kept short so
- * it reads as a settle, not an animation. 0 disables the fade (pure fallback).
+ * Crossfade-in duration (ms) for a tile that appears OVER finer detail — the
+ * zoom-OUT level switch, where the incoming coarse tile replaces sharper content
+ * still resident underneath and a hard cut would pop. The tile ramps alpha 0→1
+ * over this window while that finer detail shows through. A zoom-IN tile (or a
+ * fresh load over a coarse ancestor) instead hard-cuts in at full opacity: fading
+ * sharp detail up over a blurry ancestor blends two different-σ images, which
+ * reads as the noise "melting" — see `appearOpacity`. Kept short so the zoom-out
+ * dissolve reads as a settle, not an animation. 0 disables the fade entirely.
  */
 const DEFAULT_CROSSFADE_MS = 150;
 /** Prefetch ring width in tiles beyond the viewport edge (P5). */
 const PREFETCH_MARGIN = 1;
-/** Quiet period after the last camera move before the ring is prefetched (ms). */
+/** Quiet period after the last camera move before the camera counts as settled
+ *  (gates the final prefetch pass + the speculative finer-level index warm). */
 const PREFETCH_IDLE_MS = 150;
+/**
+ * Leading-edge throttle for speculative ring/parent prefetch DURING motion (ms).
+ * The draw loop runs every animation frame while the camera moves, so checking
+ * wall-clock elapsed since the last prefetch issues at most one ring/parent batch
+ * per this interval — keeping tiles in flight ahead of the viewport edge through a
+ * pan/zoom (a warm edge, CARTA's 50ms `ImageThrottleTime`) instead of starting
+ * cold at every gesture. `cancelExcept` still aborts batches that scroll away.
+ */
+const PREFETCH_THROTTLE_MS = 80;
 /** Wheel sensitivity: zoom factor per deltaY unit (exponential). */
 const WHEEL_ZOOM_RATE = 0.0015;
 /**
@@ -205,18 +220,25 @@ export interface FitsViewerOptions {
    */
   hiDpiLevels?: boolean;
   /**
-   * Crossfade-in duration (ms) for a tile appearing at its own level over its
-   * fallback, smoothing zoom-level switches. Default 150; set 0 to disable.
+   * Crossfade-in duration (ms) for a tile appearing over finer detail on a
+   * zoom-OUT level switch (zoom-in and fresh loads hard-cut in; see
+   * `DEFAULT_CROSSFADE_MS`). Default 150; set 0 to disable the fade entirely.
    */
   crossfadeMs?: number;
   /**
-   * Defer pyramid-level switches until interaction settles (CARTA-style). While
-   * the camera is actively moving, the level showing when the gesture began is
-   * held and the camera just resamples the resident textures; the correct level
-   * loads once motion stops (after the same idle delay that gates prefetch). This
-   * keeps the displayed noise level steady through a zoom instead of visibly
-   * dropping as coarser, block-averaged levels fade in mid-gesture. Default
-   * `true`; set `false` to switch levels live every frame.
+   * Freeze the pyramid level for the duration of a gesture. When `true`, the level
+   * showing when the gesture began is held and the camera just resamples the
+   * resident textures; the correct level is not selected (or its tiles requested)
+   * until motion stops. That keeps the displayed noise σ perfectly steady through a
+   * zoom, but means sharp imagery cannot even begin loading until the user pauses —
+   * the "settle then snap" that reads as clunky.
+   *
+   * Default `false` (live LOD, like CARTA): the level tracks the zoom every frame
+   * and the correct-resolution tiles are requested immediately during the gesture,
+   * filled by the resident coarser/finer fallback until they land. Noise still
+   * steps once (not continuously), because the displayed pixels come from the
+   * finest *resident* level and the real tile hard-cuts in (`appearOpacity`) rather
+   * than dissolving. Set `true` to restore the old frozen-level behaviour.
    */
   deferLevelOnInteraction?: boolean;
   /**
@@ -384,6 +406,9 @@ export class FitsViewer {
    *  prefetch so it never competes with visible-tile fetches mid-interaction. */
   private cameraIdle = false;
   private idleTimerId: ReturnType<typeof setTimeout> | 0 = 0;
+  /** Wall-clock ms of the last speculative prefetch pass; throttles ring/parent
+   *  prefetch during motion (see PREFETCH_THROTTLE_MS). */
+  private lastPrefetchAt = 0;
   /** Level + world bounds of the last drawn frame; `autoStretch` reuses them so
    *  it samples exactly the tiles already on screen (cache hits). */
   private lastLevel = 0;
@@ -433,7 +458,7 @@ export class FitsViewer {
     this.onCursor = options.onCursor;
     this.hiDpiLevels = options.hiDpiLevels ?? false;
     this.crossfadeMs = Math.max(0, options.crossfadeMs ?? DEFAULT_CROSSFADE_MS);
-    this.deferLevelSwitch = options.deferLevelOnInteraction ?? true;
+    this.deferLevelSwitch = options.deferLevelOnInteraction ?? false;
 
     // North-up: parse the z=0 WCS (world pixels are native = z=0 pixels) and
     // precompute the orientation at the image centre once — it is a fixed rigid
@@ -1234,22 +1259,36 @@ export class FitsViewer {
     const geom = this.geoms.get(level);
     let visibleTileCount = 0;
     if (geom !== undefined) {
-      const tiles = visibleTiles(geom, bounds);
+      // Center-out order: the draw loops both REQUEST and draw in this order, so
+      // the tile under the viewport centre (where the user is looking) is requested
+      // and sharpens before the periphery on a viewport burst or fast-pan settle.
+      // Drawing disjoint, non-overlapping quads in any order is identical under the
+      // alpha-over blend, so reordering changes only load priority, not the frame.
+      const tiles = centerOutOrder(
+        visibleTiles(geom, bounds),
+        geom,
+        this.camera.centerX,
+        this.camera.centerY,
+      );
       visibleTileCount = tiles.length;
       if (this.mode === 'rgb') this.drawRgbTiles(orient, geom, level, tiles);
       else if (this.mode === 'multiband') this.drawMultiBandTiles(orient, geom, level, tiles);
       else this.drawSingleBandTiles(orient, geom, level, tiles);
 
       // Prefetch ring (P5) + cancel abandoned in-flight fetches (P6a). The
-      // retention region is the visible tiles plus a one-tile margin; the ring is
-      // requested only when the camera is idle (so it never competes with visible
-      // fetches mid-pan), and any in-flight fetch at this level outside the region
-      // is aborted (a tile the user scrolled away from before it loaded).
+      // retention region is the visible tiles plus a one-tile margin. The ring is
+      // requested on a leading-edge throttle DURING motion (and again once idle), so
+      // a pan/zoom keeps a warm edge ahead of the viewport instead of starting cold;
+      // any in-flight fetch at this level outside the region is aborted (a tile the
+      // user scrolled away from before it loaded).
+      const prefetchNow =
+        this.cameraIdle || this.frameNow - this.lastPrefetchAt >= PREFETCH_THROTTLE_MS;
+      if (prefetchNow) this.lastPrefetchAt = this.frameNow;
       const ring = ringTiles(geom, bounds, PREFETCH_MARGIN);
       const retain = new Set<string>();
       for (const t of tiles) retain.add(tileKey(level, t.tileX, t.tileY));
       for (const t of ring) retain.add(tileKey(level, t.tileX, t.tileY));
-      if (this.cameraIdle) {
+      if (prefetchNow) {
         for (const t of ring) {
           for (const m of this.bandManagers) m.request(level, t.tileX, t.tileY);
         }
@@ -1259,22 +1298,44 @@ export class FitsViewer {
       // Option A: keep the next-coarser PARENT level warm so a zoom-out lands on
       // already-resident tiles — and so any still-missing target tile falls back
       // on a one-step-coarser ancestor — instead of snapping to the pinned
-      // whole-image overview (the coarse "blocky flash"). Prefetch the parent
-      // tiles over the viewport while idle (like the ring, so it never competes
-      // with visible fetches mid-gesture) and re-acquire any resident ones every
-      // frame so they survive idle/budget eviction while the user lingers here.
-      // `cancelExcept` only aborts fetches at the target level, so these parent
-      // fetches are never cancelled. Skipped at the coarsest level (no parent).
+      // whole-image overview (the coarse "blocky flash"). Prefetch the parent tiles
+      // over the viewport on the same throttle as the ring and re-acquire any
+      // resident ones every frame so they survive idle/budget eviction while the
+      // user lingers here. `cancelExcept` only aborts fetches at the target level,
+      // so these parent fetches are never cancelled. Skipped at the coarsest level.
       if (level < this.maxLevel) {
         const parentLevel = level + 1;
         const parentGeom = this.geoms.get(parentLevel);
         if (parentGeom !== undefined) {
           for (const t of visibleTiles(parentGeom, bounds)) {
             for (const m of this.bandManagers) {
-              if (this.cameraIdle) m.request(parentLevel, t.tileX, t.tileY);
+              if (prefetchNow) m.request(parentLevel, t.tileX, t.tileY);
               m.acquire(parentLevel, t.tileX, t.tileY);
             }
           }
+        }
+      }
+
+      // Warm the finer CHILD level's tile index speculatively once the camera
+      // settles, so a subsequent zoom-IN pays only the tile-bytes fetch instead of
+      // the file-open + index round trips on top (the per-level first-touch cliff).
+      // Idle-only (not throttled): it is a "you paused, prepare to zoom in" hint,
+      // and one warmed tile loads the whole child level's index for that supertile.
+      // Skipped at native (no finer level).
+      if (this.cameraIdle && level > 0) {
+        const childLevel = level - 1;
+        const childGeom = this.geoms.get(childLevel);
+        if (childGeom !== undefined) {
+          const span = TILE_SIZE * 2 ** childLevel; // world px per child tile
+          const cx = Math.min(
+            childGeom.nTilesX - 1,
+            Math.max(0, Math.floor(this.camera.centerX / span)),
+          );
+          const cy = Math.min(
+            childGeom.nTilesY - 1,
+            Math.max(0, Math.floor(this.camera.centerY / span)),
+          );
+          for (const m of this.bandManagers) m.warmLevel(childLevel, cx, cy);
         }
       }
     }
@@ -1359,10 +1420,15 @@ export class FitsViewer {
       const rect = tileWorldRect(geom, t.tileX, t.tileY);
       const entry = mgr.acquire(level, t.tileX, t.tileY);
       if (entry !== undefined) {
-        const op = this.fadeOpacity(entry.uploadedAt);
+        // Crossfade only when finer detail is resident underneath (zoom-out); a
+        // zoom-in / fresh-over-coarse tile hard-cuts in (see `appearOpacity`).
+        const op = this.appearOpacity(
+          entry.uploadedAt,
+          () => finerFallback(level, t.tileX, t.tileY, (l, x, y) => mgr.has(l, x, y)) !== null,
+        );
         // While the tile crossfades in, draw its fallback underneath so it
-        // dissolves in over real context (the finer detail it covers on a
-        // zoom-out, or a coarse ancestor) rather than over the cleared frame.
+        // dissolves in over the finer detail it covers rather than over the
+        // cleared frame. (Hard cuts return op === 1 and skip this.)
         if (op < 1) this.drawSingleBandFallback(orient, mgr, level, t.tileX, t.tileY, rect);
         this.drawTile(orient, rect, entry.texture, 0, 0, 1, 1, op);
         continue;
@@ -1421,14 +1487,24 @@ export class FitsViewer {
   }
 
   /**
-   * Crossfade-in alpha in [0,1] for a tile uploaded at `uploadedAt` (wall-clock
-   * ms). Returns 1 immediately when the fade is disabled or already complete;
-   * while ramping it flags `fadeActive` so the loop schedules the next frame.
+   * Appearance alpha in [0,1] for a freshly-resident tile uploaded at `uploadedAt`
+   * (wall-clock ms). HARD-CUTS (returns 1 immediately) in the common cases — a
+   * zoom-IN to a finer level, or a fresh load over a coarse ancestor — so sharp
+   * detail snaps in cleanly instead of dissolving (a dissolve blends two
+   * different-σ images, which reads as the noise "melting" the deferral was added
+   * to avoid). It keeps the crossfade ONLY when finer detail is resident
+   * underneath (`hasFinerUnderneath`), i.e. a zoom-OUT level switch where the
+   * incoming coarse tile replaces sharper content and a hard cut would pop —
+   * matching CARTA, which hard-cuts everything else. `fadeActive` is flagged only
+   * while actually ramping, so a hard cut never spins an extra frame. The cheap
+   * time check short-circuits before the `hasFinerUnderneath` probe once the fade
+   * window (or a disabled fade) has elapsed, so steady-state frames pay nothing.
    */
-  private fadeOpacity(uploadedAt: number): number {
+  private appearOpacity(uploadedAt: number, hasFinerUnderneath: () => boolean): number {
     if (this.crossfadeMs <= 0) return 1;
     const op = (this.frameNow - uploadedAt) / this.crossfadeMs;
     if (op >= 1) return 1;
+    if (!hasFinerUnderneath()) return 1; // hard cut: zoom-in / fresh-over-coarse
     this.fadeActive = true;
     return op > 0 ? op : 0;
   }
@@ -1476,8 +1552,18 @@ export class FitsViewer {
       const eg = mg.acquire(level, t.tileX, t.tileY);
       const eb = mb.acquire(level, t.tileX, t.tileY);
       if (er !== undefined && eg !== undefined && eb !== undefined) {
-        // Fade from the newest of the three uploads (when it became drawable).
-        const op = this.fadeOpacity(Math.max(er.uploadedAt, eg.uploadedAt, eb.uploadedAt));
+        // Fade from the newest of the three uploads (when it became drawable), and
+        // only when finer detail common to all bands is resident underneath.
+        const op = this.appearOpacity(
+          Math.max(er.uploadedAt, eg.uploadedAt, eb.uploadedAt),
+          () =>
+            finerFallback(
+              level,
+              t.tileX,
+              t.tileY,
+              (l, x, y) => mr.has(l, x, y) && mg.has(l, x, y) && mb.has(l, x, y),
+            ) !== null,
+        );
         if (op < 1) this.drawRgbFallback(orient, level, t.tileX, t.tileY, rect, mr, mg, mb);
         this.drawTileRGB(orient, rect, er.texture, eg.texture, eb.texture, 0, 0, 1, 1, op);
         continue;
@@ -1712,7 +1798,13 @@ export class FitsViewer {
         newest = Math.max(newest, e.uploadedAt);
       }
       if (allResident) {
-        const op = this.fadeOpacity(newest);
+        const op = this.appearOpacity(
+          newest,
+          () =>
+            finerFallback(level, t.tileX, t.tileY, (l, x, y) =>
+              this.bandManagers.every((m) => m.has(l, x, y)),
+            ) !== null,
+        );
         if (op < 1) this.drawMultiBandFallback(orient, level, t.tileX, t.tileY, rect);
         this.drawTileMultiBand(orient, rect, textures, 0, 0, 1, 1, op);
         continue;

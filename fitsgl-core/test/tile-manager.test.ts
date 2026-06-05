@@ -4,6 +4,7 @@ import {
   targetLevel,
   visibleTiles,
   ringTiles,
+  centerOutOrder,
   coarserFallback,
   commonResidentLevel,
   finerFallback,
@@ -163,6 +164,31 @@ describe('ringTiles (prefetch margin)', () => {
   it('returns [] for margin 0 or a non-overlapping viewport', () => {
     expect(ringTiles(g, { x0: 0, y0: 0, x1: 512, y1: 512 }, 0)).toEqual([]);
     expect(ringTiles(g, { x0: 5000, y0: 5000, x1: 6000, y1: 6000 }, 1)).toEqual([]);
+  });
+});
+
+describe('centerOutOrder', () => {
+  const g = geom({ z: 0, levelW: 2048, levelH: 2048 }); // 8x8 tiles, span 256
+
+  it('orders tiles by distance of their centre to the focus point (nearest first)', () => {
+    // A 3x3 block of tiles (0..2)²; focus on the centre of tile (1,1) -> centre is
+    // first, the four edge-adjacent tiles next, the four corners last.
+    const tiles = [];
+    for (let ty = 0; ty < 3; ty++) for (let tx = 0; tx < 3; tx++) tiles.push({ level: 0, tileX: tx, tileY: ty });
+    const cx = 256 * 1 + 128; // centre of tile (1,1)
+    const cy = 256 * 1 + 128;
+    const ordered = centerOutOrder(tiles, g, cx, cy);
+    expect({ x: ordered[0].tileX, y: ordered[0].tileY }).toEqual({ x: 1, y: 1 }); // nearest
+    // The four corners (distance √2·span) are the last four, in some order.
+    const lastFour = new Set(ordered.slice(5).map((t) => `${t.tileX},${t.tileY}`));
+    expect(lastFour).toEqual(new Set(['0,0', '2,0', '0,2', '2,2']));
+  });
+
+  it('does not mutate the input and is a no-op shape for a single tile', () => {
+    const input = [{ level: 0, tileX: 3, tileY: 4 }];
+    const ordered = centerOutOrder(input, g, 0, 0);
+    expect(ordered).toEqual(input);
+    expect(ordered).not.toBe(input); // returns a fresh array
   });
 });
 

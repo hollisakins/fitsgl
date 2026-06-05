@@ -149,6 +149,35 @@ describe('TileEngine — caching and de-duplication', () => {
     expect(b).toBe(a);
     expect(rf.calls.length).toBe(callsAfterFirst); // served from cache
   });
+
+  it('prefetchTileIndex warms the file+index so a later getTile only fetches tile bytes', async () => {
+    const rf = fixtureRangeFetcher();
+    const engine = await TileEngine.load(MANIFEST_URL, {
+      fetchImpl: manifestFetch(),
+      rangeFetch: rf.fetch,
+      blobStore: null,
+    });
+    await engine.prefetchTileIndex(1, 0, 0);
+    const callsAfterWarm = rf.calls.length;
+    expect(callsAfterWarm).toBeGreaterThan(0); // the warm opened the file (+ index)
+
+    const tile = await engine.getTile(1, 0, 0);
+    const added = rf.calls.slice(callsAfterWarm);
+    // getTile re-opened nothing (no fetch at offset 0); it only fetched tile heap
+    // bytes — so the per-level open + index round trips were paid by the warm-up.
+    expect(added.length).toBeGreaterThan(0);
+    expect(added.every((c) => c.start > 0)).toBe(true);
+    expect(firstFloatMismatch(tile, z1Decoded, 0)).toBe(-1); // and the tile is correct
+  });
+
+  it('prefetchTileIndex is best-effort: an out-of-range tile resolves without throwing', async () => {
+    const engine = await TileEngine.load(MANIFEST_URL, {
+      fetchImpl: manifestFetch(),
+      rangeFetch: fixtureRangeFetcher().fetch,
+      blobStore: null,
+    });
+    await expect(engine.prefetchTileIndex(0, 99, 99)).resolves.toBeUndefined();
+  });
 });
 
 describe('TilePyramid (decode worker-pool mode, in-process workers)', () => {

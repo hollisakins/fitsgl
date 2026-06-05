@@ -212,6 +212,29 @@ export function ringTiles(geom: LevelGeom, bounds: WorldBounds, margin: number):
 }
 
 /**
+ * Reorder visible tiles center-out: nearest to the world point `(cx, cy)` first,
+ * so the area the user is looking at sharpens before the periphery (CARTA orders
+ * every request batch by squared distance to its view focus point). Pure; returns
+ * a new array sorted by the squared distance from each tile's world-rect centre to
+ * `(cx, cy)`. A stable, allocation-light comparator — the per-tile distance is
+ * recomputed in the comparator, which is fine for the handful of visible tiles.
+ */
+export function centerOutOrder(
+  tiles: readonly TileCoord[],
+  geom: LevelGeom,
+  cx: number,
+  cy: number,
+): TileCoord[] {
+  const dist2 = (t: TileCoord): number => {
+    const r = tileWorldRect(geom, t.tileX, t.tileY);
+    const mx = (r.x0 + r.x1) / 2 - cx;
+    const my = (r.y0 + r.y1) / 2 - cy;
+    return mx * mx + my * my;
+  };
+  return [...tiles].sort((a, b) => dist2(a) - dist2(b));
+}
+
+/**
  * Find the finest loaded coarser ancestor of a tile for progressive-refinement
  * fallback while the target tile is still loading. Walks up one level at a time
  * (each level halves the tile index) and returns the first ancestor for which
@@ -391,6 +414,9 @@ interface TileTexture {
 export class TileManager {
   private readonly textures = new Map<string, TileTexture>();
   private readonly inflight = new Set<string>();
+  /** Tile keys whose level file+index has been speculatively warmed (`warmLevel`),
+   *  so the warm fires once per supertile rather than every idle frame. */
+  private readonly warmed = new Set<string>();
   /**
    * In-flight FETCH-phase requests (not yet decoded): their abort controller +
    * level, so `cancelExcept` can abort tiles that scrolled out of the retention
@@ -432,6 +458,23 @@ export class TileManager {
     const entry = this.textures.get(tileKey(level, tileX, tileY));
     if (entry !== undefined) entry.lastVisibleFrame = this.frame;
     return entry;
+  }
+
+  /**
+   * Speculatively warm a level's file + tile index (no tile fetch/decode), so a
+   * later `request` at that level pays only the tile-bytes round trip instead of
+   * the file-open + index-parse round trips on top — used to hide the per-level
+   * first-touch cliff for an anticipated zoom-in. Deduped per tile key so it fires
+   * once per supertile; on failure the key is cleared so a later idle frame can
+   * retry. One warmed tile covers the whole level index for its supertile.
+   */
+  warmLevel(level: number, tileX: number, tileY: number): void {
+    const key = tileKey(level, tileX, tileY);
+    if (this.warmed.has(key) || this.textures.has(key) || this.inflight.has(key)) return;
+    this.warmed.add(key);
+    this.pyramid.prefetchTileIndex(level, tileX, tileY).catch(() => {
+      this.warmed.delete(key);
+    });
   }
 
   /** Kick off loading a tile if not already resident or in flight. */
@@ -545,6 +588,7 @@ export class TileManager {
     for (const t of this.textures.values()) this.gl.deleteTexture(t.texture);
     this.textures.clear();
     this.inflight.clear();
+    this.warmed.clear();
     this.pendingUploads.length = 0;
   }
 }

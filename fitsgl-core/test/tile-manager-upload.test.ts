@@ -131,6 +131,37 @@ describe('TileManager upload queue (P4 throttling)', () => {
   });
 });
 
+describe('TileManager.warmLevel (speculative index prefetch)', () => {
+  it('warms once per tile key and skips already-warmed / resident tiles', async () => {
+    let warms = 0;
+    const pyramid = {
+      getTile: () => Promise.resolve(new Float32Array(TILE_LEN)),
+      prefetchTileIndex: () => {
+        warms++;
+        return Promise.resolve();
+      },
+    } as unknown as TilePyramid;
+    const { gl } = fakeGl();
+    const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
+    mgr.frame = 1;
+
+    mgr.warmLevel(0, 1, 1);
+    mgr.warmLevel(0, 1, 1); // deduped via the warmed set
+    expect(warms).toBe(1);
+
+    mgr.warmLevel(0, 2, 2); // a distinct supertile → a second warm
+    expect(warms).toBe(2);
+
+    // A tile already resident needs no index warm.
+    mgr.request(0, 3, 3);
+    await settle();
+    mgr.flushUploads(8);
+    mgr.warmLevel(0, 3, 3);
+    expect(warms).toBe(2);
+    mgr.destroy();
+  });
+});
+
 describe('TileManager request cancellation (P6a)', () => {
   /** Fake pyramid whose getTile hangs until its signal aborts, then rejects. */
   function hangingPyramid(): { pyramid: TilePyramid; calls: () => number } {

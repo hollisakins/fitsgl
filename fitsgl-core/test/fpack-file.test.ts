@@ -105,6 +105,17 @@ describe('FpackFile.loadTileIndex', () => {
     expect(index[0]!.zzero).toBeCloseTo(expected.sampleRiceTile.zzero, 12);
     expect(index[0]!.zblank).toBe(-2147483648);
   });
+
+  it('serves the index from the open() head buffer (open + index = one round trip)', async () => {
+    // The default initial window covers the headers AND the row table, so the
+    // common open()->loadTileIndex() sequence costs a single range request — one
+    // fewer round trip on a fresh level's first touch.
+    const fx = bufferFetcher(readFixtureBytes('synthetic_z0.fits.fz'));
+    const f = await FpackFile.open(Z0_URL, fx.fetch);
+    expect(fx.count).toBe(1); // headers fetched once
+    await f.loadTileIndex();
+    expect(fx.count).toBe(1); // index already covered — no second fetch
+  });
 });
 
 describe('FpackFile.getTile', () => {

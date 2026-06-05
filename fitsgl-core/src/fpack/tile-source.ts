@@ -210,6 +210,26 @@ export class TileEngine {
     return fetched;
   }
 
+  /**
+   * Speculatively warm a level's file + tile index without fetching or decoding a
+   * tile — open the supertile that holds `(level, tileX, tileY)` and parse its
+   * BINTABLE row table, both memoized. Used to hide the per-level first-touch
+   * latency (file open + index parse) behind idle time, so a later `getTile` at
+   * that level pays only the tile-bytes round trip. Best-effort: any error
+   * (network blip, out-of-range tile) is swallowed and re-thrown to the caller is
+   * avoided — `getTile` will re-open on demand, since `fileForTile` drops a failed
+   * open from its memo. One warmed tile loads the whole level index for its
+   * supertile.
+   */
+  async prefetchTileIndex(level: number, tileX: number, tileY: number): Promise<void> {
+    try {
+      const { file } = await this.fileForTile(level, tileX, tileY);
+      await file.loadTileIndex();
+    } catch {
+      // Speculative: a failed warm-up costs nothing; the real getTile retries.
+    }
+  }
+
   /** Number of cached tiles (diagnostics/tests). */
   get cacheSize(): number {
     return this.cache.size;
@@ -300,6 +320,17 @@ export class TilePyramid {
   ): Promise<Float32Array> {
     if (this.destroyed) throw new Error('TilePyramid: getTile called after destroy()');
     return this.engine.getTile(level, tileX, tileY, signal);
+  }
+
+  /**
+   * Speculatively warm a level's file + tile index (no tile fetch/decode), so a
+   * later `getTile` at that level pays only the tile-bytes round trip rather than
+   * the file-open + index-parse round trips on top. Best-effort and silent; a no-op
+   * after `destroy()`. See `TileEngine.prefetchTileIndex`.
+   */
+  async prefetchTileIndex(level: number, tileX: number, tileY: number): Promise<void> {
+    if (this.destroyed) return;
+    return this.engine.prefetchTileIndex(level, tileX, tileY);
   }
 
   destroy(): void {
