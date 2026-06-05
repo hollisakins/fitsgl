@@ -9,8 +9,12 @@ import {
   explorerBandsFromDataset,
   gridGroupOf,
   isBandSelectableForRgb,
+  isTrilogyComposite,
+  rainbowAction,
   rgbActiveGroup,
+  trilogyComposite,
   type ExplorerBand,
+  type ExplorerState,
 } from '../../src/react/explorer-state.js';
 import type { DatasetBand, DatasetManifest, FitsglConfig } from '../../src/index.js';
 
@@ -128,6 +132,90 @@ describe('activeBandNames / bandForRole', () => {
     expect(activeBandNames(rgb)).toEqual(['f444w', 'f277w', 'f150w']);
     expect(bandForRole(rgb, 'g')).toBe('f277w');
   });
+
+  it('lists the weighted composite bands in trilogy mode', () => {
+    const s: ExplorerState = {
+      ...defaultExplorerState(BANDS),
+      mode: 'rgb',
+      stretch: 'trilogy',
+      weightBands: ['f090w', 'f277w'],
+      weights: { f090w: [0, 0, 1], f277w: [1, 0, 0] },
+    };
+    expect(activeBandNames(s)).toEqual(['f090w', 'f277w']);
+  });
+});
+
+describe('trilogy weighted composite (faithful)', () => {
+  const base = (): ExplorerState => ({
+    ...defaultExplorerState(BANDS),
+    mode: 'rgb',
+    stretch: 'trilogy',
+    rgb: { r: 'f444w', g: 'f277w', b: 'f150w' },
+  });
+
+  it('isTrilogyComposite is true only for RGB + trilogy', () => {
+    expect(isTrilogyComposite(base())).toBe(true);
+    expect(isTrilogyComposite({ ...base(), stretch: 'log' })).toBe(false);
+    expect(isTrilogyComposite({ ...base(), mode: 'single' })).toBe(false);
+  });
+
+  it('falls back to the rgb triple on pure per-channel weights when none are set', () => {
+    expect(trilogyComposite(base())).toEqual([
+      { band: 'f444w', weight: [1, 0, 0] },
+      { band: 'f277w', weight: [0, 1, 0] },
+      { band: 'f150w', weight: [0, 0, 1] },
+    ]);
+  });
+
+  it('merges a repeated triple band by summing its weights (no duplicate manager)', () => {
+    const s = { ...base(), rgb: { r: 'f150w', g: 'f150w', b: 'f090w' } };
+    expect(trilogyComposite(s)).toEqual([
+      { band: 'f150w', weight: [1, 1, 0] },
+      { band: 'f090w', weight: [0, 0, 1] },
+    ]);
+  });
+
+  it('deriveViewerConfig emits a multiband view from the weights', () => {
+    const s: ExplorerState = {
+      ...base(),
+      weightBands: ['f090w', 'f277w'],
+      weights: { f090w: [0, 0, 1], f277w: [1, 0, 0] },
+    };
+    const cfg = deriveViewerConfig(BANDS, s);
+    expect(cfg.view).toEqual({
+      mode: 'multiband',
+      bands: [
+        { band: 'f090w', weight: [0, 0, 1] },
+        { band: 'f277w', weight: [1, 0, 0] },
+      ],
+    });
+  });
+
+  it('deriveViewerConfig keeps the strict rgb view for non-trilogy curves', () => {
+    const cfg = deriveViewerConfig(BANDS, { ...base(), stretch: 'asinh' });
+    expect(cfg.view).toEqual({ mode: 'rgb', r: 'f444w', g: 'f277w', b: 'f150w' });
+  });
+});
+
+describe('rainbowAction', () => {
+  const WB: ExplorerBand[] = [
+    { name: 'f444w', tiles: ['/x'], gridGroup: 0, wavelengthMicron: 4.4 },
+    { name: 'f090w', tiles: ['/x'], gridGroup: 0, wavelengthMicron: 0.9 },
+    { name: 'f277w', tiles: ['/x'], gridGroup: 0, wavelengthMicron: 2.77 },
+    { name: 'subaru', tiles: ['/x'], gridGroup: 1, wavelengthMicron: 0.6 },
+  ];
+
+  it('orders the active group by wavelength (blue→red) and tints the ends', () => {
+    const { weightBands, weights } = rainbowAction(WB, 0);
+    expect(weightBands).toEqual(['f090w', 'f277w', 'f444w']); // group 0, wavelength-sorted
+    expect(weights['f090w'][2]).toBeGreaterThan(weights['f090w'][0]); // bluest → blue-dominant
+    expect(weights['f444w'][0]).toBeGreaterThan(weights['f444w'][2]); // reddest → red-dominant
+  });
+
+  it('falls back to declaration order when wavelengths are absent', () => {
+    const { weightBands } = rainbowAction(BANDS, 0);
+    expect(weightBands).toEqual(['f090w', 'f150w', 'f277w', 'f444w']);
+  });
 });
 
 // ---- dataset-manifest ingestion (real gridsMatch grouping) ------------------
@@ -163,6 +251,7 @@ describe('explorerBandsFromConfig', () => {
             tiles: ['a/manifest.json'],
             grid: { group: 2, pixelScaleArcsec: 0.06 },
             label: 'Band A',
+            pivotUm: 1.501,
             stats: { histogram: { counts: [1, 2, 3], lo: 0.5, hi: 9.5 } },
           },
           { name: 'b', tiles: ['b/manifest.json'], grid: { group: 0 } },
@@ -176,9 +265,11 @@ describe('explorerBandsFromConfig', () => {
       label: 'Band A',
       gridGroup: 2,
       pixelScaleArcsec: 0.06,
+      wavelengthMicron: 1.501,
       histogram: { counts: [1, 2, 3], lo: 0.5, hi: 9.5 },
     });
     expect(bands[1].histogram).toBeUndefined(); // no stats ⇒ no precomputed histogram
+    expect(bands[1].wavelengthMicron).toBeUndefined(); // no pivot ⇒ none
   });
 });
 

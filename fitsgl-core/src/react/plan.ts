@@ -48,10 +48,20 @@ export function bandsSignature(config: ViewerConfig): string {
 
 /**
  * Stable key for the *render source* selection — mode + which band(s) fill it,
- * deliberately excluding the colormap (a separate `setColormap`, not `setSource`).
+ * deliberately excluding the colormap (a separate `setColormap`, not `setSource`)
+ * AND the multiband per-band weights (a separate imperative `setBandWeights`, so a
+ * weight tweak repaints without rebuilding the source — only a change to the *set*
+ * of bands forces a `setSource`).
  */
 export function viewSignature(view: ViewerView): string {
-  return view.mode === 'single' ? `single:${view.band}` : `rgb:${view.r}|${view.g}|${view.b}`;
+  switch (view.mode) {
+    case 'single':
+      return `single:${view.band}`;
+    case 'rgb':
+      return `rgb:${view.r}|${view.g}|${view.b}`;
+    case 'multiband':
+      return `mb:${view.bands.map((b) => b.band).join('|')}`;
+  }
 }
 
 /**

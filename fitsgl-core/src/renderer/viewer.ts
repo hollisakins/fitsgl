@@ -23,7 +23,9 @@ import {
   STRETCH_MODE_IDS,
   DEFAULT_TRILOGY_K,
   DEFAULT_TRILOGY_PARAMS,
+  MAX_BANDS,
   trilogyLevels,
+  trilogyLevelsForBands,
   combineTrilogyLuminance,
   type StretchMode,
   type TrilogyStats,
@@ -265,11 +267,16 @@ export class FitsViewer {
   /**
    * The pyramids behind `bandManagers`, in the same order. Kept so `autoStretch`
    * can read decoded tile values (the managers hold only GPU textures). Length 1
-   * for single-band, 3 (R, G, B) for RGB; reassigned by `setSource`.
+   * for single-band, 3 (R, G, B) for RGB, N for multiband; reassigned by `setSource`.
    */
   private bandPyramids: TilePyramid[];
-  /** 'single' or 'rgb' — which draw path and shader mode this frame uses. */
-  private mode: 'single' | 'rgb';
+  /** 'single', 'rgb', or 'multiband' — which draw path and shader mode this frame uses. */
+  private mode: 'single' | 'rgb' | 'multiband';
+  /** Multiband: per-band (R, G, B) weights, parallel to `bandManagers`. */
+  private bandWeights: Array<readonly [number, number, number]> = [];
+  /** Multiband: per-band trilogy levels (x0/x2/k), parallel to `bandManagers`;
+   *  set by `applyTrilogy`. Empty until a trilogy fit is applied. */
+  private bandLevels: TrilogyLevels[] = [];
   /** Per-band GPU texture budget; each manager gets this (so RGB ≈ 3× resident). */
   private readonly textureBudget: number;
   /** The construction-time grid every `setSource` band must match (D7). */
@@ -309,6 +316,14 @@ export class FitsViewer {
   private readonly uTrilogyK: WebGLUniformLocation | null;
   private readonly uTrilogyLsat: WebGLUniformLocation | null;
   private readonly uBg: WebGLUniformLocation | null;
+  // Weighted multi-band trilogy (u_mode == 2) uniform-array bases.
+  private readonly uBand: WebGLUniformLocation | null;
+  private readonly uWeight: WebGLUniformLocation | null;
+  private readonly uBx0: WebGLUniformLocation | null;
+  private readonly uBx2: WebGLUniformLocation | null;
+  private readonly uBk: WebGLUniformLocation | null;
+  private readonly uNBands: WebGLUniformLocation | null;
+  private readonly uWeightSum: WebGLUniformLocation | null;
 
   private stretchMin = 0;
   private stretchMax = 1;
@@ -448,11 +463,23 @@ export class FitsViewer {
     this.uTrilogyK = gl.getUniformLocation(this.program, 'u_trilogyK');
     this.uTrilogyLsat = gl.getUniformLocation(this.program, 'u_trilogyLsat');
     this.uBg = gl.getUniformLocation(this.program, 'u_bg');
+    this.uBand = gl.getUniformLocation(this.program, 'u_band');
+    this.uWeight = gl.getUniformLocation(this.program, 'u_weight');
+    this.uBx0 = gl.getUniformLocation(this.program, 'u_bx0');
+    this.uBx2 = gl.getUniformLocation(this.program, 'u_bx2');
+    this.uBk = gl.getUniformLocation(this.program, 'u_bk');
+    this.uNBands = gl.getUniformLocation(this.program, 'u_nBands');
+    this.uWeightSum = gl.getUniformLocation(this.program, 'u_weightSum');
 
     this.camera = new Camera(Math.max(1, canvas.width), Math.max(1, canvas.height));
-    // In RGB mode every band must share the construction grid (identical shape +
-    // WCS), so compositing samples all three at one shared texcoord (D7). Verify
-    // the non-representative bands before building managers; throw on mismatch.
+    if (norm.pyramids.length > MAX_BANDS) {
+      throw new Error(
+        `FitsViewer: a composite mixes at most ${MAX_BANDS} bands (got ${norm.pyramids.length}).`,
+      );
+    }
+    // In RGB/multiband mode every band must share the construction grid (identical
+    // shape + WCS), so compositing samples all bands at one shared texcoord (D7).
+    // Verify the non-representative bands before building managers; throw on mismatch.
     for (let i = 1; i < norm.pyramids.length; i++) {
       this.assertCompatibleGrid(norm.pyramids[i]);
     }
@@ -460,6 +487,7 @@ export class FitsViewer {
       (p) => new TileManager(gl, p, this.geoms, this.textureBudget, () => this.requestRender()),
     );
     this.bandPyramids = norm.pyramids;
+    this.bandWeights = norm.weights ?? [];
     // Prime the coarsest level (one tile per band) so the viewer shows a whole-
     // image low-res preview almost immediately rather than staying blank until the
     // target level loads. Single-band uses it as the last-resort coarse-to-fine
@@ -741,6 +769,11 @@ export class FitsViewer {
    */
   setSource(source: RenderSource): void {
     const norm = normalizeSource(source);
+    if (norm.pyramids.length > MAX_BANDS) {
+      throw new Error(
+        `FitsViewer: a composite mixes at most ${MAX_BANDS} bands (got ${norm.pyramids.length}).`,
+      );
+    }
     for (const p of norm.pyramids) this.assertCompatibleGrid(p);
 
     const next = norm.pyramids.map(
@@ -751,6 +784,10 @@ export class FitsViewer {
     const old = this.bandManagers;
     this.bandManagers = next;
     this.bandPyramids = norm.pyramids;
+    this.bandWeights = norm.weights ?? [];
+    // The new source carries a different band set; per-band trilogy levels are
+    // stale until the host re-applies a fit (the explorer does on a source swap).
+    this.bandLevels = [];
     this.mode = norm.mode;
     for (const m of old) m.destroy();
     this.requestRender();
@@ -769,9 +806,31 @@ export class FitsViewer {
     this.requestRender();
   }
 
+  /**
+   * Replace the per-band (R, G, B) weights of a weighted multi-band composite,
+   * in band order. Multiband only — high-frequency, like `setChannelStretch`, so
+   * weight tweaks repaint without rebuilding the source. The band *set* is fixed
+   * by `setSource`; this only changes how the resident bands are mixed. Throws if
+   * the count does not match the current band set.
+   */
+  setBandWeights(weights: ReadonlyArray<readonly [number, number, number]>): void {
+    if (weights.length !== this.bandManagers.length) {
+      throw new Error(
+        `setBandWeights: expected ${this.bandManagers.length} weights, got ${weights.length}.`,
+      );
+    }
+    this.bandWeights = weights.map((w) => [w[0], w[1], w[2]] as const);
+    this.requestRender();
+  }
+
   /** Whether the viewer is currently in RGB composite mode. */
   get isRgb(): boolean {
     return this.mode === 'rgb';
+  }
+
+  /** Which composite the viewer currently draws: 'single', 'rgb', or 'multiband'. */
+  get sourceMode(): 'single' | 'rgb' | 'multiband' {
+    return this.mode;
   }
 
   /**
@@ -782,19 +841,31 @@ export class FitsViewer {
    *
    * Single-band: pass one stats object; sets `[x0, x2]` and the solved softening.
    * RGB: pass `[r, g, b]` stats; sets each channel's black point (`x0`) and the
-   * shared luminance saturation + softening that preserves color ratios. Does not
-   * switch mode — call `setStretchMode('trilogy')` to select the curve. Returns
-   * the per-channel levels it applied so a host can reflect them in its inputs.
+   * shared luminance saturation + softening that preserves color ratios.
+   * Multiband: pass one stats per band (same order as the source); each band is
+   * stretched by its OWN levels (`x0`/`x2`/`k`) — Dan Coe's faithful composite,
+   * no luminance coupling. Does not switch mode — call `setStretchMode('trilogy')`
+   * to select the curve. Returns the per-band levels so a host can reflect them.
    */
   applyTrilogy(
-    stats: TrilogyStats | readonly [TrilogyStats, TrilogyStats, TrilogyStats],
+    stats: TrilogyStats | readonly TrilogyStats[],
     params: TrilogyParams = DEFAULT_TRILOGY_PARAMS,
   ): TrilogyLevels[] {
+    if (this.mode === 'multiband') {
+      if (!Array.isArray(stats) || stats.length !== this.bandManagers.length) {
+        throw new Error(
+          `applyTrilogy: multiband mode needs one stats per band (${this.bandManagers.length}).`,
+        );
+      }
+      this.bandLevels = trilogyLevelsForBands(stats as readonly TrilogyStats[], params);
+      this.requestRender();
+      return this.bandLevels;
+    }
     if (this.mode === 'rgb') {
       if (!Array.isArray(stats) || stats.length !== 3) {
         throw new Error('applyTrilogy: RGB mode needs [r, g, b] stats');
       }
-      const triple = stats as readonly [TrilogyStats, TrilogyStats, TrilogyStats];
+      const triple = stats as unknown as readonly [TrilogyStats, TrilogyStats, TrilogyStats];
       const levels = triple.map((s) => trilogyLevels(s, params)) as [
         TrilogyLevels,
         TrilogyLevels,
@@ -1136,6 +1207,7 @@ export class FitsViewer {
       const tiles = visibleTiles(geom, bounds);
       visibleTileCount = tiles.length;
       if (this.mode === 'rgb') this.drawRgbTiles(orient, geom, level, tiles);
+      else if (this.mode === 'multiband') this.drawMultiBandTiles(orient, geom, level, tiles);
       else this.drawSingleBandTiles(orient, geom, level, tiles);
 
       // Prefetch ring (P5) + cancel abandoned in-flight fetches (P6a). The
@@ -1522,6 +1594,209 @@ export class FitsViewer {
     gl.bindTexture(gl.TEXTURE_2D, texG);
     gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, texB);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // ---- weighted multi-band trilogy compositing ----------------------------
+
+  /** The texture unit band `i` binds to: 0, then 2, 3, 4… (unit 1 = colormap LUT,
+   *  unused in a composite). `unitForBand(0..2)` is exactly the RGB 0/2/3 map. */
+  private unitForBand(i: number): number {
+    return i === 0 ? 0 : i + 1;
+  }
+
+  /** Per-band trilogy levels for the multiband shader, or a benign default set
+   *  during the transient between `setSource` and the host's `applyTrilogy`. */
+  private effectiveBandLevels(): TrilogyLevels[] {
+    const n = this.bandManagers.length;
+    if (this.bandLevels.length === n) return this.bandLevels;
+    const fallback: TrilogyLevels[] = [];
+    for (let i = 0; i < n; i++) fallback.push({ x0: 0, x1: 0, x2: 1, k: DEFAULT_TRILOGY_K });
+    return fallback;
+  }
+
+  /**
+   * Weighted multi-band trilogy tile pass (the faithful composite). Mirrors
+   * `drawRgbTiles` generalized to N bands: tile selection is grid-only (shared by
+   * all bands), each band is driven toward the target tile and acquired
+   * unconditionally (so a band that is ahead cannot evict a tile its laggards
+   * still need), and the tile draws only when every band is resident at a common
+   * level. Per-band weights + trilogy levels + the host-precomputed Σ weights ride
+   * in uniform arrays; the all-bands-NaN→background rule (D8) lives in the shader.
+   */
+  private drawMultiBandTiles(
+    orient: Mat2,
+    geom: LevelGeom,
+    level: number,
+    tiles: ReadonlyArray<{ tileX: number; tileY: number }>,
+  ): void {
+    const gl = this.gl;
+    const n = this.bandManagers.length;
+    gl.uniform1i(this.uMode, 2);
+    gl.uniform1i(this.uNBands, n);
+
+    const units = new Int32Array(n);
+    const weights = new Float32Array(n * 3);
+    const x0 = new Float32Array(n);
+    const x2 = new Float32Array(n);
+    const k = new Float32Array(n);
+    const levels = this.effectiveBandLevels();
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    for (let i = 0; i < n; i++) {
+      units[i] = this.unitForBand(i);
+      const w = this.bandWeights[i] ?? [0, 0, 0];
+      weights[i * 3] = w[0];
+      weights[i * 3 + 1] = w[1];
+      weights[i * 3 + 2] = w[2];
+      sumR += w[0];
+      sumG += w[1];
+      sumB += w[2];
+      x0[i] = levels[i].x0;
+      x2[i] = levels[i].x2;
+      k[i] = levels[i].k;
+    }
+    gl.uniform1iv(this.uBand, units);
+    gl.uniform3fv(this.uWeight, weights);
+    gl.uniform1fv(this.uBx0, x0);
+    gl.uniform1fv(this.uBx2, x2);
+    gl.uniform1fv(this.uBk, k);
+    gl.uniform3f(this.uWeightSum, sumR, sumG, sumB);
+
+    for (const t of tiles) {
+      const rect = tileWorldRect(geom, t.tileX, t.tileY);
+      for (const m of this.bandManagers) m.request(level, t.tileX, t.tileY);
+      // Acquire EVERY band unconditionally (no short-circuit) so the cross-band
+      // eviction guard marks each consulted tile visible this frame.
+      const textures: WebGLTexture[] = [];
+      let allResident = true;
+      let newest = 0;
+      for (const m of this.bandManagers) {
+        const e = m.acquire(level, t.tileX, t.tileY);
+        if (e === undefined) {
+          allResident = false;
+          continue;
+        }
+        textures.push(e.texture);
+        newest = Math.max(newest, e.uploadedAt);
+      }
+      if (allResident) {
+        const op = this.fadeOpacity(newest);
+        if (op < 1) this.drawMultiBandFallback(orient, level, t.tileX, t.tileY, rect);
+        this.drawTileMultiBand(orient, rect, textures, 0, 0, 1, 1, op);
+        continue;
+      }
+      this.drawMultiBandFallback(orient, level, t.tileX, t.tileY, rect);
+    }
+  }
+
+  /**
+   * Best resident stand-in for a multiband tile missing at the target level (or
+   * crossfading in): a coarse base from the finest level common to ALL bands plus
+   * a finer overlay of resident descendants common to all bands — the N-band
+   * generalization of `drawRgbFallback`. The shader's single shared UV forces one
+   * common source level + sub-rect across bands. Draws nothing if no common level
+   * is resident (common-level-hold).
+   */
+  private drawMultiBandFallback(
+    orient: Mat2,
+    level: number,
+    tileX: number,
+    tileY: number,
+    rect: WorldRect,
+  ): void {
+    const common = commonResidentLevel(
+      level,
+      tileX,
+      tileY,
+      this.maxLevel,
+      (l, x, y) => this.acquireAllBands(l, x, y),
+      level + 1,
+    );
+    if (common !== null) {
+      const fbGeom = this.geoms.get(common.level);
+      const texs = this.texturesIfAllResident(common.level, common.tileX, common.tileY);
+      if (texs !== null && fbGeom !== undefined) {
+        const ancestor = tileWorldRect(fbGeom, common.tileX, common.tileY);
+        const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
+        this.drawTileMultiBand(orient, rect, texs, u0, v0, u1, v1, 1);
+      }
+    }
+    const finer = finerFallback(level, tileX, tileY, (l, x, y) =>
+      this.bandManagers.every((m) => m.has(l, x, y)),
+    );
+    if (finer !== null) {
+      const fGeom = this.geoms.get(finer.level);
+      if (fGeom !== undefined) {
+        for (const ft of finer.tiles) {
+          const texs = this.texturesIfAllResident(ft.level, ft.tileX, ft.tileY);
+          if (texs === null) continue; // raced an eviction; skip this sub-tile
+          const fRect = tileWorldRect(fGeom, ft.tileX, ft.tileY);
+          this.drawTileMultiBand(orient, fRect, texs, 0, 0, 1, 1, 1);
+        }
+      }
+    }
+  }
+
+  /** Acquire the tile in EVERY band (no short-circuit, so each is marked visible)
+   *  and report whether all are resident — the cross-band eviction guard. */
+  private acquireAllBands(level: number, tileX: number, tileY: number): boolean {
+    let all = true;
+    for (const m of this.bandManagers) {
+      if (m.acquire(level, tileX, tileY) === undefined) all = false;
+    }
+    return all;
+  }
+
+  /** The N band textures at a tile if ALL are resident, else null. Acquires every
+   *  band unconditionally first (eviction guard), then collects the textures. */
+  private texturesIfAllResident(
+    level: number,
+    tileX: number,
+    tileY: number,
+  ): WebGLTexture[] | null {
+    const textures: WebGLTexture[] = [];
+    let all = true;
+    for (const m of this.bandManagers) {
+      const e = m.acquire(level, tileX, tileY);
+      if (e === undefined) all = false;
+      else textures.push(e.texture);
+    }
+    return all ? textures : null;
+  }
+
+  /**
+   * Draw one composite tile from N same-grid band textures (multiband mode).
+   * Destination quad + the single shared UV are computed exactly as `drawTile`
+   * (same grid ⟹ identical for every band); band `i` binds to `unitForBand(i)` to
+   * match the `u_band` sampler array set in `drawMultiBandTiles`.
+   */
+  private drawTileMultiBand(
+    orient: Mat2,
+    rect: WorldRect,
+    textures: readonly WebGLTexture[],
+    u0: number,
+    v0: number,
+    u1: number,
+    v1: number,
+    opacity: number,
+  ): void {
+    const gl = this.gl;
+    const p00 = this.worldToNdc(orient, rect.x0, rect.y0);
+    const p10 = this.worldToNdc(orient, rect.x1, rect.y0);
+    const p01 = this.worldToNdc(orient, rect.x0, rect.y1);
+    const p11 = this.worldToNdc(orient, rect.x1, rect.y1);
+    gl.uniform2f(this.uP00, p00.x, p00.y);
+    gl.uniform2f(this.uP10, p10.x, p10.y);
+    gl.uniform2f(this.uP01, p01.x, p01.y);
+    gl.uniform2f(this.uP11, p11.x, p11.y);
+    gl.uniform4f(this.uUV, u0, v0, u1, v1);
+    gl.uniform1f(this.uOpacity, opacity);
+    for (let i = 0; i < textures.length; i++) {
+      gl.activeTexture(gl.TEXTURE0 + this.unitForBand(i));
+      gl.bindTexture(gl.TEXTURE_2D, textures[i]);
+    }
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 

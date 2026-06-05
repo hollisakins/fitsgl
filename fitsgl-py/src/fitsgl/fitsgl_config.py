@@ -97,6 +97,7 @@ def build_fitsgl_config(
     title: str | None = None,
     catalog_url: str | None = None,
     band_stats: dict[str, dict] | None = None,
+    band_pivots: dict[str, float] | None = None,
 ) -> dict:
     """Assemble + write ``fitsgl.json`` from already-built band pyramids.
 
@@ -104,9 +105,10 @@ def build_fitsgl_config(
     URL/dir-safe slug, ``label`` the human display string (the pyramids must
     exist; this only reads their manifests). ``band_stats`` (optional) maps a band
     name to a display ``stats`` block (e.g. ``{"histogram": {...}}``) the viewer's
-    stretch panel shows without a live scan. Band tile URLs are written RELATIVE
-    to the output file's directory. Returns the config dict (also serialized to
-    ``output_path``).
+    stretch panel shows without a live scan. ``band_pivots`` (optional) maps a band
+    name to its pivot wavelength (microns), so the viewer's trilogy rainbow can
+    order filters blue→red. Band tile URLs are written RELATIVE to the output
+    file's directory. Returns the config dict (also serialized to ``output_path``).
     """
     output_path = Path(output_path)
     out_dir = output_path.parent
@@ -127,6 +129,8 @@ def build_fitsgl_config(
             "grid": grid,
             "label": blabel,
         }
+        if band_pivots is not None and bname in band_pivots:
+            entry["pivotUm"] = float(band_pivots[bname])
         if band_stats is not None and bname in band_stats:
             entry["stats"] = band_stats[bname]
         band_entries.append(entry)

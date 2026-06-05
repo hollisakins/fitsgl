@@ -40,6 +40,10 @@ export interface FitsglBand {
   grid: { group: number; pixelScaleArcsec?: number };
   /** Display label; defaults to `name`. */
   label?: string;
+  /** Pivot wavelength (microns), when the producer detected the filter — lets the
+   *  trilogy rainbow auto-assign order filters blue→red. Omitted ⇒ ordered by
+   *  declaration order in the viewer. */
+  pivotUm?: number;
   /** Pre-computed display stats (e.g. a histogram) the stretch panel shows without
    *  a live scan; producer-emitted, a UI convenience (omitted ⇒ the viewer scans). */
   stats?: FitsglBandStats;
@@ -87,6 +91,10 @@ export interface FitsglDefaultView {
   r?: string;
   g?: string;
   b?: string;
+  /** Optional weighted-trilogy seed: participating bands + per-band (R,G,B) weights.
+   *  Allowed with `mode:'rgb'` (advisory `stretch.mode:'trilogy'`); drives the
+   *  faithful weighted composite on first paint. */
+  weights?: Array<{ band: string; weight: [number, number, number] }>;
   colormap?: ColormapName;
   stretch?: { mode?: StretchMode };
   northUp?: boolean;
@@ -211,6 +219,9 @@ export function validateFitsglConfig(raw: unknown): FitsglConfig {
     const band: FitsglBand = { name, tiles, grid };
     const label = asOptStr(rawBand.label, `band "${name}" label`);
     if (label !== undefined) band.label = label;
+    if (rawBand.pivotUm !== undefined && rawBand.pivotUm !== null) {
+      band.pivotUm = asFiniteNum(rawBand.pivotUm, `band "${name}" pivotUm`);
+    }
     const stats = asBandStats(rawBand.stats, name);
     if (stats !== undefined) band.stats = stats;
     return band;
@@ -254,6 +265,25 @@ export function validateFitsglConfig(raw: unknown): FitsglConfig {
     defaultView.r = r;
     defaultView.g = g;
     defaultView.b = b;
+    if (dvRaw.weights !== undefined && dvRaw.weights !== null) {
+      if (!Array.isArray(dvRaw.weights)) {
+        throw new Error('fitsgl-config: defaultView.weights must be an array');
+      }
+      defaultView.weights = dvRaw.weights.map((w, i) => {
+        if (!isObj(w)) throw new Error(`fitsgl-config: defaultView.weights[${i}] must be an object`);
+        const wband = asStr(w.band, `defaultView.weights[${i}].band`);
+        requireBand(wband, `weights[${i}].band`);
+        const wt = w.weight;
+        if (
+          !Array.isArray(wt) ||
+          wt.length !== 3 ||
+          !wt.every((c) => typeof c === 'number' && Number.isFinite(c))
+        ) {
+          throw new Error(`fitsgl-config: defaultView.weights[${i}].weight must be 3 finite numbers`);
+        }
+        return { band: wband, weight: [wt[0], wt[1], wt[2]] as [number, number, number] };
+      });
+    }
   }
   if (dvRaw.stretch !== undefined && dvRaw.stretch !== null) {
     if (!isObj(dvRaw.stretch)) throw new Error('fitsgl-config: "defaultView.stretch" must be an object');

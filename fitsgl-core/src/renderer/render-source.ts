@@ -38,28 +38,58 @@ export interface RgbSource {
   b: TilePyramid;
 }
 
+/** One band participating in a weighted multi-band composite: a pyramid + weight. */
+export interface WeightedBand {
+  pyramid: TilePyramid;
+  /** (R, G, B) contribution weight. */
+  weight: readonly [number, number, number];
+}
+
 /**
- * What a viewer draws: a single band, or an RGB composite. A bare `TilePyramid`
- * is shorthand for `{ kind: 'single', pyramid }` (the pre-M4 constructor signature
- * stays valid).
+ * Weighted multi-band composite (the faithful trilogy path): N co-gridded
+ * single-band pyramids, each contributing to R/G/B by its own weight. Like
+ * `RgbSource` every band must share an identical pixel grid + WCS
+ * (`gridsMatch`/`isCompatibleGrid`) because compositing samples all bands at one
+ * shared texcoord with no in-browser resampling (D7). `RgbSource` is the special
+ * case of 3 bands with unit per-channel weights; it is kept separate so the
+ * strict-3 (linear/log/asinh) draw path stays byte-identical.
  */
-export type RenderSource = SingleBandSource | RgbSource;
+export interface MultiBandSource {
+  kind: 'multiband';
+  bands: WeightedBand[];
+}
+
+/**
+ * What a viewer draws: a single band, an RGB composite, or a weighted multi-band
+ * composite. A bare `TilePyramid` is shorthand for `{ kind: 'single', pyramid }`
+ * (the pre-M4 constructor signature stays valid).
+ */
+export type RenderSource = SingleBandSource | RgbSource | MultiBandSource;
 
 export interface NormalizedSource {
-  mode: 'single' | 'rgb';
-  /** length 1 for single-band; length 3 (R, G, B in order) for RGB. */
+  mode: 'single' | 'rgb' | 'multiband';
+  /** length 1 for single-band; 3 (R, G, B) for RGB; N (ordered) for multiband. */
   pyramids: TilePyramid[];
+  /** Per-band (R, G, B) weights, parallel to `pyramids`; present iff multiband. */
+  weights?: Array<readonly [number, number, number]>;
 }
 
 export function isRenderSource(s: TilePyramid | RenderSource): s is RenderSource {
   const kind = (s as { kind?: unknown }).kind;
-  return kind === 'single' || kind === 'rgb';
+  return kind === 'single' || kind === 'rgb' || kind === 'multiband';
 }
 
 /** Normalize the constructor/`setSource` argument to a mode + ordered pyramids. */
 export function normalizeSource(source: TilePyramid | RenderSource): NormalizedSource {
   if (isRenderSource(source)) {
     if (source.kind === 'rgb') return { mode: 'rgb', pyramids: [source.r, source.g, source.b] };
+    if (source.kind === 'multiband') {
+      return {
+        mode: 'multiband',
+        pyramids: source.bands.map((b) => b.pyramid),
+        weights: source.bands.map((b) => b.weight),
+      };
+    }
     return { mode: 'single', pyramids: [source.pyramid] };
   }
   return { mode: 'single', pyramids: [source] };

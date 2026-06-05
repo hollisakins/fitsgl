@@ -18,7 +18,10 @@
 
 import {
   fitsglConfigFromDataset,
+  rainbowWeights,
   DEFAULT_TRILOGY_PARAMS,
+  MAX_BANDS,
+  type BandWeight,
   type ColormapName,
   type DatasetManifest,
   type FitsglConfig,
@@ -44,6 +47,9 @@ export interface ExplorerBand {
   gridGroup?: number;
   /** Native pixel scale, for a scale-bar / label. */
   pixelScaleArcsec?: number;
+  /** Pivot wavelength (microns), for ordering filters blue→red in the trilogy
+   *  rainbow auto-assign. Omitted ⇒ the band sorts by declaration order. */
+  wavelengthMicron?: number;
   /** Pre-computed display histogram (wire shape) seeding the stretch panel so it
    *  need not scan live; counts per bin over `[lo, hi]`. Omitted ⇒ scan on first frame. */
   histogram?: { counts: number[]; lo: number; hi: number };
@@ -59,6 +65,8 @@ export interface ExplorerDefaultView {
   r?: string;
   g?: string;
   b?: string;
+  /** Optional weighted-trilogy seed: participating bands + per-band (R,G,B) weights. */
+  weights?: Array<{ band: string; weight: BandWeight }>;
   stretch?: StretchMode;
   colormap?: ColormapName;
   northUp?: boolean;
@@ -74,6 +82,15 @@ export interface ExplorerState {
   stretch: StretchMode;
   /** Trilogy knobs (noiselum/satpercent/noisesig/noisesig0), used when `stretch` is `trilogy`. */
   trilogyParams: TrilogyParams;
+  /**
+   * Faithful-trilogy weighted composite: per-band (R,G,B) weights keyed by band
+   * name, used when `mode==='rgb' && stretch==='trilogy'`. Empty until the user
+   * clicks "rainbow", edits a weight, or a weighted default view seeds it — until
+   * then the composite falls back to the `rgb` triple on pure per-channel weights.
+   */
+  weights: Record<string, BandWeight>;
+  /** Ordered participating bands for the weighted composite (by name); see `weights`. */
+  weightBands: string[];
   /** Single-band colormap (`'gray'` is the grayscale fast path). */
   colormap: ColormapName;
   northUp: boolean;
@@ -167,12 +184,19 @@ export function defaultExplorerState(
 ): ExplorerState {
   if (bands.length === 0) throw new Error('FitsExplorer: at least one band is required');
   const band = dv?.band !== undefined && find(bands, dv.band) !== undefined ? dv.band : bands[0].name;
+  // Seed a weighted-trilogy composite if the producer shipped one and every named
+  // band resolves; otherwise start empty (the composite falls back to the triple).
+  const seed = (dv?.weights ?? []).filter((w) => find(bands, w.band) !== undefined);
+  const weights: Record<string, BandWeight> = {};
+  for (const w of seed) weights[w.band] = w.weight;
   return {
     mode: dv?.mode ?? 'single',
     band,
     rgb: defaultTriple(bands, dv),
     stretch: dv?.stretch ?? 'asinh',
     trilogyParams: { ...DEFAULT_TRILOGY_PARAMS },
+    weights,
+    weightBands: seed.map((w) => w.band),
     colormap: dv?.colormap ?? 'gray',
     northUp: dv?.northUp ?? true,
     overlay: false,
@@ -184,9 +208,90 @@ export function bandForRole(state: ExplorerState, role: 'r' | 'g' | 'b'): string
   return state.rgb[role];
 }
 
-/** The bands currently driving the display (1 in single mode, 3 in RGB). */
+/** The bands of the active grid group — the candidates a weighted composite mixes. */
+export function groupBands(
+  bands: readonly ExplorerBand[],
+  activeGroup: number | null,
+): ExplorerBand[] {
+  return bands.filter((b) => activeGroup === null || gridGroupOf(b) === activeGroup);
+}
+
+/**
+ * Whether the view is a faithful-trilogy weighted composite (RGB mode + trilogy
+ * curve). In this state the renderer uses the N-band weighted path, not the
+ * strict-3 RGB path — so band selection comes from the weight matrix, not r/g/b.
+ */
+export function isTrilogyComposite(state: ExplorerState): boolean {
+  return state.mode === 'rgb' && state.stretch === 'trilogy';
+}
+
+/**
+ * The ordered, de-duplicated participating bands + (R,G,B) weights of a trilogy
+ * composite. When the user has set weights (`weightBands` non-empty) those drive
+ * it; otherwise it falls back to the `rgb` triple on pure per-channel weights
+ * (red/green/blue) — so 3-band trilogy is the faithful composite's special case.
+ * Duplicate band names (the padded triple can repeat a band) are merged by summing
+ * weights, so the composite never builds two managers for one pyramid. Pure.
+ */
+export function trilogyComposite(state: ExplorerState): Array<{ band: string; weight: BandWeight }> {
+  const entries: Array<[string, BandWeight]> =
+    state.weightBands.length > 0
+      ? state.weightBands.map((n) => [n, state.weights[n] ?? [0, 0, 0]])
+      : [
+          [state.rgb.r, [1, 0, 0]],
+          [state.rgb.g, [0, 1, 0]],
+          [state.rgb.b, [0, 0, 1]],
+        ];
+  const merged = new Map<string, [number, number, number]>();
+  for (const [name, w] of entries) {
+    const cur = merged.get(name);
+    if (cur === undefined) merged.set(name, [w[0], w[1], w[2]]);
+    else {
+      cur[0] += w[0];
+      cur[1] += w[1];
+      cur[2] += w[2];
+    }
+  }
+  return [...merged.entries()].map(([band, weight]) => ({ band, weight }));
+}
+
+/** The bands currently driving the display (1 single, 3 RGB, N weighted trilogy). */
 export function activeBandNames(state: ExplorerState): string[] {
-  return state.mode === 'single' ? [state.band] : [state.rgb.r, state.rgb.g, state.rgb.b];
+  if (state.mode === 'single') return [state.band];
+  if (isTrilogyComposite(state)) return trilogyComposite(state).map((e) => e.band);
+  return [state.rgb.r, state.rgb.g, state.rgb.b];
+}
+
+/** Evenly subsample `items` down to `cap`, always keeping the first and last
+ *  (so a wavelength-ordered rainbow keeps its blue and red endpoints). */
+function evenSubsample<T>(items: readonly T[], cap: number): T[] {
+  if (items.length <= cap) return items.slice();
+  const idx = new Set<number>();
+  for (let i = 0; i < cap; i++) idx.add(Math.round((i * (items.length - 1)) / (cap - 1)));
+  return [...idx].sort((a, b) => a - b).map((i) => items[i]);
+}
+
+/**
+ * Auto-fill rainbow weights for a trilogy composite: take the active grid group's
+ * bands, order them by wavelength (bluest first; bands with no wavelength sort to
+ * the end in declaration order), cap to `MAX_BANDS` (keeping the blue/red ends),
+ * and assign `rainbowWeights(n)[i]`. Returns the `{weights, weightBands}` patch the
+ * component merges into state. Pure — re-runnable on demand.
+ */
+export function rainbowAction(
+  bands: readonly ExplorerBand[],
+  activeGroup: number | null,
+): { weights: Record<string, BandWeight>; weightBands: string[] } {
+  const sorted = groupBands(bands, activeGroup)
+    .slice()
+    .sort((a, b) => (a.wavelengthMicron ?? Infinity) - (b.wavelengthMicron ?? Infinity));
+  const participating = evenSubsample(sorted, MAX_BANDS);
+  const w = rainbowWeights(participating.length);
+  const weights: Record<string, BandWeight> = {};
+  participating.forEach((b, i) => {
+    weights[b.name] = w[i];
+  });
+  return { weights, weightBands: participating.map((b) => b.name) };
 }
 
 /**
@@ -199,12 +304,20 @@ export function activeBandNames(state: ExplorerState): string[] {
  * fetches), so it is not a config field here.
  */
 export function deriveViewerConfig(bands: readonly ExplorerBand[], state: ExplorerState): ViewerConfig {
-  const view: ViewerView =
-    state.mode === 'rgb'
-      ? { mode: 'rgb', r: state.rgb.r, g: state.rgb.g, b: state.rgb.b }
-      : state.colormap === 'gray'
+  let view: ViewerView;
+  if (state.mode === 'rgb') {
+    // Trilogy in RGB mode is the faithful weighted composite (locked decision):
+    // each band stretched by its own levels, then a weighted average. Other RGB
+    // curves keep the strict-3 path; the byte-identical {r,g,b} view drives it.
+    view = isTrilogyComposite(state)
+      ? { mode: 'multiband', bands: trilogyComposite(state) }
+      : { mode: 'rgb', r: state.rgb.r, g: state.rgb.g, b: state.rgb.b };
+  } else {
+    view =
+      state.colormap === 'gray'
         ? { mode: 'single', band: state.band }
         : { mode: 'single', band: state.band, colormap: state.colormap };
+  }
   return {
     bands: bands.map((b) => ({ name: b.name, tiles: b.tiles })),
     view,
@@ -219,6 +332,7 @@ export function explorerBandsFromConfig(config: FitsglConfig): ExplorerBand[] {
     const band: ExplorerBand = { name: b.name, tiles: b.tiles.slice(), gridGroup: b.grid.group };
     if (b.label !== undefined) band.label = b.label;
     if (b.grid.pixelScaleArcsec !== undefined) band.pixelScaleArcsec = b.grid.pixelScaleArcsec;
+    if (b.pivotUm !== undefined) band.wavelengthMicron = b.pivotUm;
     if (b.stats?.histogram !== undefined) band.histogram = b.stats.histogram;
     if (b.stats?.trilogy !== undefined) band.trilogy = b.stats.trilogy;
     return band;
@@ -233,6 +347,9 @@ export function defaultViewFromConfig(config: FitsglConfig): ExplorerDefaultView
   if (dv.r !== undefined) out.r = dv.r;
   if (dv.g !== undefined) out.g = dv.g;
   if (dv.b !== undefined) out.b = dv.b;
+  if (dv.weights !== undefined) {
+    out.weights = dv.weights.map((w) => ({ band: w.band, weight: w.weight }));
+  }
   if (dv.stretch?.mode !== undefined) out.stretch = dv.stretch.mode;
   if (dv.colormap !== undefined) out.colormap = dv.colormap;
   if (dv.northUp !== undefined) out.northUp = dv.northUp;

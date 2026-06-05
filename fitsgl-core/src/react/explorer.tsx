@@ -27,11 +27,13 @@ import type { FitsViewerCore, FitsViewerHandle } from './index.js';
 import {
   COLORMAP_NAMES,
   STRETCH_MODES,
+  MAX_BANDS,
   colormapRGB,
   formatDec,
   formatRA,
   parseCatalogCSV,
   type BandHistogram,
+  type BandWeight,
   type ColormapName,
   type CursorInfo,
   type FitsglConfig,
@@ -50,11 +52,17 @@ import {
   defaultViewFromConfig,
   deriveViewerConfig,
   explorerBandsFromConfig,
+  groupBands,
   isBandSelectableForRgb,
+  isTrilogyComposite,
+  rainbowAction,
+  rgbActiveGroup,
+  trilogyComposite,
   type ExplorerBand,
   type ExplorerDefaultView,
   type ExplorerState,
 } from './explorer-state.js';
+import { viewSignature } from './plan.js';
 
 const CH_COLOR = { r: '#ff6b6b', g: '#56d089', b: '#5c8cff' } as const;
 type Role = 'r' | 'g' | 'b';
@@ -311,6 +319,114 @@ function TrilogyControls({
   );
 }
 
+/** CSS `rgb(...)` for a band's (R,G,B) weight, so a row's swatch shows its tint. */
+function weightSwatch(w: BandWeight): string {
+  const c = (x: number): number => Math.round(Math.min(1, Math.max(0, x)) * 255);
+  return `rgb(${c(w[0])},${c(w[1])},${c(w[2])})`;
+}
+
+const round2 = (x: number): number => Math.round(x * 100) / 100;
+
+/**
+ * Faithful-trilogy weight matrix: every co-gridded band in the active group, each
+ * with a participation checkbox and editable R/G/B contribution weights, plus a
+ * "Rainbow" button that orders the bands by wavelength and spreads them blue→red.
+ * Shown only for an RGB trilogy view; the noise/black knobs (`TrilogyControls`)
+ * still apply globally below it. Edits are materialized into `weights`/`weightBands`
+ * via `onApply` (the pure composite the parent derives the multiband view from).
+ */
+function TrilogyWeightMatrix({
+  bands,
+  state,
+  onApply,
+  onRainbow,
+}: {
+  bands: ExplorerBand[];
+  state: ExplorerState;
+  onApply: (entries: Array<{ band: string; weight: BandWeight }>) => void;
+  onRainbow: () => void;
+}): JSX.Element {
+  const activeGroup = rgbActiveGroup(bands, state.rgb);
+  const rows = groupBands(bands, activeGroup);
+  const comp = new Map(trilogyComposite(state).map((e) => [e.band, e.weight] as const));
+  const atCap = comp.size >= MAX_BANDS;
+
+  const toggle = (name: string): void => {
+    const cur = trilogyComposite(state);
+    const has = cur.some((e) => e.band === name);
+    if (!has && cur.length >= MAX_BANDS) return; // cap: ignore (a note explains)
+    const next = has
+      ? cur.filter((e) => e.band !== name)
+      : [...cur, { band: name, weight: state.weights[name] ?? ([1, 1, 1] as BandWeight) }];
+    onApply(next);
+  };
+
+  const editWeight = (name: string, ch: 0 | 1 | 2, value: number): void => {
+    const v = Number.isFinite(value) ? Math.max(0, value) : 0;
+    const cur = trilogyComposite(state);
+    const idx = cur.findIndex((e) => e.band === name);
+    const prev = idx >= 0 ? cur[idx].weight : state.weights[name] ?? [0, 0, 0];
+    const w: BandWeight = ch === 0 ? [v, prev[1], prev[2]] : ch === 1 ? [prev[0], v, prev[2]] : [prev[0], prev[1], v];
+    if (idx < 0 && comp.size >= MAX_BANDS) return; // editing would add past the cap
+    const next = idx >= 0 ? cur.map((e, i) => (i === idx ? { band: name, weight: w } : e)) : [...cur, { band: name, weight: w }];
+    onApply(next);
+  };
+
+  return (
+    <div className="fgl-wmx">
+      <div className="fgl-wmx-head">
+        <span className="fgl-wmx-cap">Band weights</span>
+        <button type="button" className="fgl-rainbow" onClick={onRainbow}>
+          Rainbow
+        </button>
+      </div>
+      <div className="fgl-wmx-cols">
+        <span />
+        <span />
+        <span className="fgl-wmx-hd" style={{ color: CH_COLOR.r }}>R</span>
+        <span className="fgl-wmx-hd" style={{ color: CH_COLOR.g }}>G</span>
+        <span className="fgl-wmx-hd" style={{ color: CH_COLOR.b }}>B</span>
+      </div>
+      {rows.map((b) => {
+        const on = comp.has(b.name);
+        const w = comp.get(b.name) ?? ([0, 0, 0] as BandWeight);
+        return (
+          <div key={b.name} className={`fgl-wrow${on ? '' : ' off'}`}>
+            <input
+              type="checkbox"
+              className="fgl-wchk"
+              checked={on}
+              disabled={!on && atCap}
+              aria-label={`include ${b.label ?? b.name}`}
+              onChange={() => toggle(b.name)}
+            />
+            <span className="fgl-wlbl">
+              <span className="fgl-wswatch" style={{ background: weightSwatch(w) }} />
+              {b.label ?? b.name}
+            </span>
+            {([0, 1, 2] as const).map((ch) => (
+              <input
+                key={ch}
+                type="number"
+                className="fgl-winp"
+                min={0}
+                step={0.05}
+                value={round2(w[ch])}
+                aria-label={`${b.label ?? b.name} ${'RGB'[ch]} weight`}
+                onChange={(e) => editWeight(b.name, ch, Number(e.target.value))}
+              />
+            ))}
+          </div>
+        );
+      })}
+      <div className="fgl-note">
+        Each band is trilogy-stretched, then blended by its R/G/B weights.
+        {atCap ? ` Max ${MAX_BANDS} bands per composite.` : ''}
+      </div>
+    </div>
+  );
+}
+
 /** The preview-keeping colormap dropdown (single-band mode). */
 function ColormapDropdown({
   value,
@@ -515,13 +631,14 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
       state.stretch === 'trilogy' &&
       activeBandNames(state).some((n) => bands.find((b) => b.name === n)?.trilogy === undefined);
     getViewer()?.setStretchMode(triMissing ? 'log' : state.stretch);
-  }, [state.stretch, state.mode, state.band, state.rgb, bands, readyTick, getViewer]);
+  }, [state.stretch, state.mode, state.band, state.rgb, state.weightBands, bands, readyTick, getViewer]);
 
   // Seed the limits sliders + histograms from the data in view, after the source
   // changes (or a reload). Deferred to the next drawn frame (autoStretch /
   // visibleHistogram need a frame's level+bounds), via `needSeedRef` + onFrame.
-  const viewSig =
-    state.mode === 'single' ? `s:${state.band}` : `rgb:${state.rgb.r}|${state.rgb.g}|${state.rgb.b}`;
+  // Keyed on the render-source signature (band set + mode, weights excluded) so a
+  // band-set change re-seeds but a pure weight tweak (pushed imperatively) does not.
+  const viewSig = viewSignature(viewerConfig.view);
   const needSeedRef = useRef(true);
   useEffect(() => {
     needSeedRef.current = true;
@@ -534,27 +651,30 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   // white points (x0/x2) back into the sliders.
   const applyTrilogyFromStats = useCallback(
     (v: FitsViewerCore): boolean => {
-      if ((state.mode === 'rgb') !== v.isRgb) return false; // viewer not yet synced
+      // The viewer mode for an RGB trilogy view is the faithful weighted composite
+      // ('multiband'); single-band trilogy is 'single'. Bail until it has synced.
+      const expectedMode = state.mode === 'single' ? 'single' : 'multiband';
+      if (v.sourceMode !== expectedMode) return false;
       const names = activeBandNames(state);
       const triStats = names.map((n) => bands.find((b) => b.name === n)?.trilogy);
       if (triStats.some((s) => s === undefined)) return false;
-      if (state.mode === 'rgb') {
-        const triple = triStats as [TrilogyStats, TrilogyStats, TrilogyStats];
-        const levels = v.applyTrilogy(triple, state.trilogyParams);
-        setLimits((prev) => {
-          const next = { ...prev };
-          (['r', 'g', 'b'] as const).forEach((role, i) => {
-            next[state.rgb[role]] = { min: levels[i].x0, max: levels[i].x2 };
-          });
-          return next;
+      // Each band stretched by its own levels (faithful trilogy): one stats per band.
+      const levels = v.applyTrilogy(
+        state.mode === 'single'
+          ? (triStats[0] as TrilogyStats)
+          : (triStats as TrilogyStats[]),
+        state.trilogyParams,
+      );
+      setLimits((prev) => {
+        const next = { ...prev };
+        names.forEach((n, i) => {
+          next[n] = { min: levels[i].x0, max: levels[i].x2 };
         });
-      } else {
-        const [lv] = v.applyTrilogy(triStats[0] as TrilogyStats, state.trilogyParams);
-        setLimits((prev) => ({ ...prev, [state.band]: { min: lv.x0, max: lv.x2 } }));
-      }
+        return next;
+      });
       return true;
     },
-    [bands, state.mode, state.band, state.rgb, state.trilogyParams],
+    [bands, state.mode, state.band, state.rgb, state.weightBands, state.trilogyParams],
   );
 
   // Re-apply trilogy live when a knob moves (the viewer mode is already settled,
@@ -565,6 +685,21 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     if (v !== null) applyTrilogyFromStats(v);
   }, [state.stretch, state.trilogyParams, readyTick, getViewer, applyTrilogyFromStats]);
 
+  // Push per-band weight edits imperatively (like the limit sliders): a weight
+  // tweak repaints without rebuilding the source. A change to the *set* of bands
+  // goes through `setSource` (the multiband view carries the new weights), so the
+  // count can momentarily mismatch mid-rebuild — guarded by the mode + a try/catch.
+  useEffect(() => {
+    if (!isTrilogyComposite(state)) return;
+    const v = getViewer();
+    if (v === null || v.sourceMode !== 'multiband') return;
+    try {
+      v.setBandWeights(trilogyComposite(state).map((e) => e.weight));
+    } catch {
+      // Band set mid-rebuild; the pending setSource carries the right weights.
+    }
+  }, [state, readyTick, getViewer]);
+
   const seed = useCallback(async (): Promise<void> => {
     const v = getViewer();
     if (v === null) return;
@@ -572,9 +707,12 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     // panel histograms below for display. Fall through to percentile only when
     // trilogy could not apply (mode mid-switch or no precomputed stats).
     const trilogyApplied = state.stretch === 'trilogy' && applyTrilogyFromStats(v);
+    // Trilogy has no per-channel limit sliders, so skip the percentile auto-stretch
+    // AND the histogram readback when it applied (in the weighted composite the
+    // histogram would describe the wrong band — the panel doesn't show it anyway).
     const [auto, hist] = await Promise.all([
       trilogyApplied ? Promise.resolve(null) : v.autoStretch(),
-      v.visibleHistogram(),
+      trilogyApplied ? Promise.resolve(null) : v.visibleHistogram(),
     ]);
     setLimits((prev) => {
       if (auto === null) return prev;
@@ -676,6 +814,10 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                       ))}
                     </select>
                   </div>
+                ) : state.stretch === 'trilogy' ? (
+                  <div className="fgl-note" style={{ marginTop: 11 }}>
+                    Trilogy composite — choose bands &amp; weights under Scaling below.
+                  </div>
                 ) : (
                   <div style={{ marginTop: 11 }}>
                     <RgbGrid
@@ -709,15 +851,36 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
 
                 <div className="fgl-limits">
                   {state.stretch === 'trilogy' ? (
-                    <TrilogyControls
-                      params={state.trilogyParams}
-                      missing={activeBandNames(state).some(
-                        (n) => bands.find((b) => b.name === n)?.trilogy === undefined,
+                    <>
+                      {state.mode === 'rgb' && (
+                        <TrilogyWeightMatrix
+                          bands={bands}
+                          state={state}
+                          onApply={(entries) =>
+                            setState((s) => {
+                              const weights = { ...s.weights };
+                              for (const e of entries) weights[e.band] = e.weight;
+                              return { ...s, weights, weightBands: entries.map((e) => e.band) };
+                            })
+                          }
+                          onRainbow={() =>
+                            setState((s) => {
+                              const patch = rainbowAction(bands, rgbActiveGroup(bands, s.rgb));
+                              return { ...s, weights: { ...s.weights, ...patch.weights }, weightBands: patch.weightBands };
+                            })
+                          }
+                        />
                       )}
-                      onChange={(patch) =>
-                        setState((s) => ({ ...s, trilogyParams: { ...s.trilogyParams, ...patch } }))
-                      }
-                    />
+                      <TrilogyControls
+                        params={state.trilogyParams}
+                        missing={activeBandNames(state).some(
+                          (n) => bands.find((b) => b.name === n)?.trilogy === undefined,
+                        )}
+                        onChange={(patch) =>
+                          setState((s) => ({ ...s, trilogyParams: { ...s.trilogyParams, ...patch } }))
+                        }
+                      />
+                    </>
                   ) : state.mode === 'single' ? (
                     <LimitsControl
                       histo={histos[state.band]}
@@ -915,6 +1078,21 @@ const STYLE_CSS = `
 .fgl-tri-range::-webkit-slider-thumb{appearance:none;width:10px;height:14px;border-radius:2px;background:var(--gold);border:1px solid #161003;cursor:ew-resize;}
 .fgl-tri-range::-moz-range-thumb{width:10px;height:14px;border-radius:2px;background:var(--gold);border:1px solid #161003;cursor:ew-resize;}
 .fgl-tri-val{font-size:9.5px;color:var(--text);font-variant-numeric:tabular-nums;min-width:42px;text-align:right;}
+.fgl-wmx{display:flex;flex-direction:column;gap:5px;margin-bottom:11px;}
+.fgl-wmx-head{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.fgl-wmx-cap{font-size:9px;color:var(--dim);letter-spacing:.1em;text-transform:uppercase;}
+.fgl-wmx-cols,.fgl-wrow{display:grid;grid-template-columns:14px 1fr 32px 32px 32px;gap:4px;align-items:center;}
+.fgl-wmx-hd{font-size:8.5px;text-align:center;letter-spacing:.04em;}
+.fgl-wrow.off{opacity:.5;}
+.fgl-wswatch{width:9px;height:9px;border-radius:2px;border:1px solid rgba(0,0,0,.4);display:inline-block;margin-right:5px;vertical-align:middle;}
+.fgl-wlbl{font-size:9.5px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.fgl-wchk{cursor:pointer;margin:0;}
+.fgl-winp{width:100%;background:var(--inset);border:1px solid var(--line2);border-radius:3px;color:var(--text);
+  font-family:var(--mono);font-size:9.5px;padding:3px 1px;text-align:center;font-variant-numeric:tabular-nums;}
+.fgl-winp:focus{outline:none;border-color:var(--gold-d);}
+.fgl-rainbow{background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
+  font-size:9px;letter-spacing:.1em;text-transform:uppercase;padding:4px 9px;border-radius:4px;cursor:pointer;}
+.fgl-rainbow:hover{border-color:var(--gold-d);color:var(--gold);}
 .fgl-cm{position:relative;flex:1;}
 .fgl-cm-trigger{display:flex;align-items:center;gap:9px;width:100%;cursor:pointer;background:var(--inset);
   border:1px solid var(--line2);border-radius:4px;padding:6px 9px;}

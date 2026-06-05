@@ -253,3 +253,109 @@ export function combineTrilogyLuminance(
   const norm1 = Math.min(0.999, Math.max(0, l1 / lsat));
   return { lsat, k: solveTrilogyK(norm1, noiselum) };
 }
+
+// ---- weighted multi-band trilogy (Dan Coe's faithful composite) -------------
+
+/**
+ * Maximum number of bands a weighted multi-band trilogy composite can mix in one
+ * draw. The shader declares fixed-size sampler/uniform arrays of this length and
+ * binds one texture unit per band; WebGL2 guarantees `MAX_TEXTURE_IMAGE_UNITS`
+ * >= 16, and the viewer reserves unit 1 for the colormap LUT, so 12 bands (units
+ * 0, 2..13) sits comfortably under the floor. This is the single source of truth:
+ * `tile.frag.ts` inlines it into the GLSL array sizes, so the two cannot drift.
+ */
+export const MAX_BANDS = 12;
+
+/** A per-band (R, G, B) contribution weight for a multi-band composite. */
+export type BandWeight = readonly [number, number, number];
+
+/**
+ * Solve each band's own trilogy levels (`x0`/`x1`/`x2`/`k`) from its precomputed
+ * stats and the shared user knobs. Faithful Trilogy stretches every band by *its
+ * own* levels before the channels are combined, so — unlike the color-preserving
+ * `combineTrilogyLuminance` path — there is no cross-band luminance coupling.
+ * Pure; one named entry point the host re-runs instantly when a knob moves.
+ */
+export function trilogyLevelsForBands(
+  stats: readonly TrilogyStats[],
+  params: TrilogyParams,
+): TrilogyLevels[] {
+  return stats.map((s) => trilogyLevels(s, params));
+}
+
+/**
+ * Convert HSV (`h` in degrees, `s`/`v` in [0,1]) to an RGB triple in [0,1]. Pure,
+ * exported for tests; `h` is taken modulo 360 so any angle is valid.
+ */
+export function hsvToRgb(h: number, s: number, v: number): BandWeight {
+  const hh = (((h % 360) + 360) % 360) / 60;
+  const c = v * s;
+  const x = c * (1 - Math.abs((hh % 2) - 1));
+  const m = v - c;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (hh < 1) [r, g, b] = [c, x, 0];
+  else if (hh < 2) [r, g, b] = [x, c, 0];
+  else if (hh < 3) [r, g, b] = [0, c, x];
+  else if (hh < 4) [r, g, b] = [0, x, c];
+  else if (hh < 5) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  return [r + m, g + m, b + m];
+}
+
+/**
+ * Per-band rainbow weights: spread `n` wavelength-ORDERED bands across the hue
+ * circle from blue (240°) to red (0°) and convert HSV(hue, 1, 1) -> RGB to get
+ * each band's [r, g, b] contribution. The caller supplies bands already sorted by
+ * wavelength (bluest first). `n == 1` gets white `[1,1,1]`; `n >= 2` maps position
+ * `t = i/(n-1)` to `hue = 240*(1 - t)`. Mirrors Dan Coe's trilogy rainbow mode.
+ */
+export function rainbowWeights(n: number): BandWeight[] {
+  if (n <= 0) return [];
+  if (n === 1) return [[1, 1, 1]];
+  const out: BandWeight[] = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    out.push(hsvToRgb(240 * (1 - t), 1, 1));
+  }
+  return out;
+}
+
+/**
+ * CPU reference of the shader's weighted multi-band trilogy composite for one
+ * pixel: each band is normalized over its own `[x0, x2]` and trilogy-stretched
+ * with its own `k` to a scalar `s_i`, then the channels are weighted averages
+ * `R = Σ wr_i·s_i / Σ wr_i` (G, B analogous). A NaN band contributes 0 to every
+ * channel; a channel whose weight-sum is 0 is 0. The GLSL `u_mode == 2` loop
+ * transcribes this exactly (the `tile.frag.ts` <-> `stretch.ts` non-drift rule),
+ * so a golden test pins both to one formula. The all-NaN background case is the
+ * caller's concern (the shader emits `u_bg`).
+ */
+export function weightedTrilogyPixel(
+  values: readonly number[],
+  levels: readonly TrilogyLevels[],
+  weights: readonly BandWeight[],
+): [number, number, number] {
+  let rNum = 0;
+  let gNum = 0;
+  let bNum = 0;
+  let rDen = 0;
+  let gDen = 0;
+  let bDen = 0;
+  for (let i = 0; i < values.length; i++) {
+    const w = weights[i];
+    rDen += w[0];
+    gDen += w[1];
+    bDen += w[2];
+    const v = values[i];
+    if (Number.isNaN(v)) continue; // NaN band contributes 0 to every channel
+    const s = scaleValue(v, levels[i].x0, levels[i].x2, 'trilogy', levels[i].k);
+    rNum += w[0] * s;
+    gNum += w[1] * s;
+    bNum += w[2] * s;
+  }
+  const ch = (num: number, den: number): number =>
+    den > 0 ? Math.min(1, Math.max(0, num / den)) : 0;
+  return [ch(rNum, rDen), ch(gNum, gDen), ch(bNum, bDen)];
+}
