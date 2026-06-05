@@ -5,9 +5,12 @@ read each header-only to get its shape + WCS, group bands by the advisory
 ``grid_hash`` (so the scaffold can *tell the user* which bands are co-gridded and
 therefore RGB-combinable), and hand-serialize a starter ``fitsgl.toml``.
 
-By design init does NOT guess an RGB view — it scaffolds a single-band default and
-leaves the RGB role assignment to the user (the grid-group comments show which
-bands are valid together). The toml is the review surface; init is batch-only.
+Band-aware: each header is run through :func:`bands.detect_band`, so a recognized
+HST/JWST imaging file is named + labelled by its filter (``F444W`` rather than the
+filename), and init auto-picks a default RGB view when ≥3 co-gridded broadbands are
+found (reddest→r, bluest→b). Unrecognized files fall back to filename-derived names
+and a single-band default — so a non-HST/JWST or header-less mosaic is unchanged.
+The toml is the review surface; init is batch-only.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from pathlib import Path, PurePath
 from astropy.io import fits
 from astropy.wcs import WCS
 
+from .bands import DetectedBand, detect_band
 from .config import sanitize_band_name
 from .dataset import grid_hash
 
@@ -37,6 +41,13 @@ class ScannedBand:
     name: str
     shape: list[int]  # [H, W]
     grid_hash: str
+    #: Detected display label (e.g. "F444W"); None when the filter wasn't recognized,
+    #: in which case render_toml falls back to the filename-stem label logic.
+    label: str | None = None
+    #: Detected pivot wavelength (microns), for RGB ordering; None when undetected.
+    pivot_um: float | None = None
+    #: Detected wide ("W") filter — a candidate for the default RGB composite.
+    is_broadband: bool = False
 
 
 @dataclass
@@ -49,6 +60,9 @@ class InitPlan:
     grid_groups: dict[str, list[str]] = field(default_factory=dict)
     #: (file, reason) for files that could not be scanned.
     skipped: list[tuple[Path, str]] = field(default_factory=list)
+    #: The scaffold's default view — an auto-picked {"mode":"rgb",...} when ≥3
+    #: co-gridded broadbands were detected, else {"mode":"single","band":...}.
+    default_view: dict | None = None
 
     def groups_in_order(self) -> list[list[str]]:
         """Grid groups as ordered lists of band names (group 0 first)."""
@@ -121,19 +135,21 @@ def _slug(text: str) -> str:
 def scan_directory(directory: Path) -> InitPlan:
     """Scan ``directory`` for FITS mosaics and build the scaffold plan.
 
-    Lenient: files that can't be read header-only (or are ambiguous) are recorded
-    in ``skipped`` and the scan continues. Raises ``ValueError`` only when no
-    usable band is found at all.
+    Two passes: read every header (lenient — unreadable/ambiguous files go to
+    ``skipped`` and the scan continues) and detect each band's filter, then assign
+    each a unique slug + label. A filter token shared across instruments is
+    disambiguated with an instrument prefix; everything else gets the bare filter.
+    Finally picks a default view (auto-RGB when ≥3 co-gridded broadbands exist).
+    Raises ``ValueError`` only when no usable band is found at all.
     """
     directory = directory.resolve()
     if not directory.is_dir():
         raise ValueError(f"not a directory: {directory}")
     files = discover_fits(directory)
-    bands: list[ScannedBand] = []
     skipped: list[tuple[Path, str]] = []
-    taken: set[str] = set()
-    groups: dict[str, list[str]] = {}
 
+    # Pass 1: header-only read + grid hash + filter detection.
+    scanned: list[tuple[Path, list[int], str, DetectedBand | None]] = []
     for path in files:
         try:
             header, shape = read_header_only(path)
@@ -141,18 +157,83 @@ def scan_directory(directory: Path) -> InitPlan:
         except Exception as e:  # noqa: BLE001 - lenient scan: skip + record, keep going
             skipped.append((path, str(e)))
             continue
-        name = sanitize_band_name(_strip_fits_suffix(path.name), taken)
-        taken.add(name)
-        bands.append(ScannedBand(path=path, name=name, shape=shape, grid_hash=ghash))
-        groups.setdefault(ghash, []).append(name)
+        scanned.append((path, shape, ghash, detect_band(header)))
 
-    if not bands:
+    if not scanned:
         detail = "; ".join(f"{p.name}: {why}" for p, why in skipped)
         raise ValueError(
             f"no usable FITS mosaics found in {directory}"
             + (f" ({len(skipped)} skipped: {detail})" if skipped else "")
         )
-    return InitPlan(name=_slug(directory.name), bands=bands, grid_groups=groups, skipped=skipped)
+
+    # A filter token shared across >1 instrument (e.g. F150W on NIRCam + NIRISS,
+    # F814W on ACS + WFC3) is "contended" — disambiguate those bands (and only
+    # those) with an instrument prefix so labels stay clean in the common case.
+    instruments_by_filter: dict[str, set[str]] = {}
+    for _, _, _, det in scanned:
+        if det is not None:
+            instruments_by_filter.setdefault(det.filter, set()).add(det.instrument)
+    contended = {f for f, instrs in instruments_by_filter.items() if len(instrs) > 1}
+
+    # Pass 2: assign each band a unique slug + display label (filename fallback when
+    # undetected, preserving prior behavior for non-HST/JWST or header-less files).
+    bands: list[ScannedBand] = []
+    taken: set[str] = set()
+    groups: dict[str, list[str]] = {}
+    for path, shape, ghash, det in scanned:
+        if det is not None:
+            disambiguate = det.filter in contended
+            label = f"{det.instrument} {det.filter}" if disambiguate else det.filter
+            seed = (f"{det.instrument}-{det.filter}" if disambiguate else det.filter).lower()
+            name = sanitize_band_name(seed, taken)
+            band = ScannedBand(
+                path=path, name=name, shape=shape, grid_hash=ghash,
+                label=label, pivot_um=det.pivot_um, is_broadband=det.is_broadband,
+            )
+        else:
+            name = sanitize_band_name(_strip_fits_suffix(path.name), taken)
+            band = ScannedBand(path=path, name=name, shape=shape, grid_hash=ghash)
+        taken.add(name)
+        bands.append(band)
+        groups.setdefault(ghash, []).append(name)
+
+    return InitPlan(
+        name=_slug(directory.name),
+        bands=bands,
+        grid_groups=groups,
+        skipped=skipped,
+        default_view=_pick_default_view(bands, groups),
+    )
+
+
+def _pick_default_view(bands: list[ScannedBand], grid_groups: dict[str, list[str]]) -> dict:
+    """Pick the scaffold's default view.
+
+    An RGB composite from the broadbands of the largest co-gridded group when ≥3 are
+    available, else single-band on the first band (the prior default). Confining the
+    pick to one grid group keeps the three channels co-gridded (the viewer only
+    composites co-gridded bands); ordering by pivot wavelength assigns reddest→R and
+    bluest→B, with the middle channel the broadband nearest the band's mid-wavelength.
+    """
+    by_name = {b.name: b for b in bands}
+    best: list[ScannedBand] = []
+    for names in grid_groups.values():
+        broadbands = [
+            by_name[n] for n in names
+            if by_name[n].is_broadband and by_name[n].pivot_um is not None
+        ]
+        if len(broadbands) > len(best):
+            best = broadbands
+
+    if len(best) < 3:
+        return {"mode": "single", "band": bands[0].name}
+
+    ordered = sorted(best, key=lambda b: b.pivot_um or 0.0)  # blue -> red
+    blue, red = ordered[0], ordered[-1]
+    mid_target = ((blue.pivot_um or 0.0) + (red.pivot_um or 0.0)) / 2.0
+    inner = [b for b in ordered if b is not blue and b is not red]
+    middle = min(inner, key=lambda b: abs((b.pivot_um or 0.0) - mid_target))
+    return {"mode": "rgb", "r": red.name, "g": middle.name, "b": blue.name}
 
 
 def _toml_str(value: str) -> str:
@@ -169,9 +250,10 @@ def _rel_posix(target: Path, start: Path) -> str:
 def render_toml(plan: InitPlan, config_dir: Path) -> str:
     """Hand-serialize ``plan`` to a ``fitsgl.toml`` string.
 
-    Single-band default; the grid groups are surfaced as comments so the user
-    knows which bands are co-gridded (RGB-combinable). Output is guaranteed to
-    round-trip through :func:`config.load_config`.
+    Emits ``plan.default_view`` (an auto-picked RGB composite when ≥3 co-gridded
+    broadbands were detected, else single-band); the grid groups are surfaced as
+    comments so the user knows which bands are co-gridded (RGB-combinable). Output
+    is guaranteed to round-trip through :func:`config.load_config`.
     """
     config_dir = config_dir.resolve()
     groups = plan.groups_in_order()
@@ -195,38 +277,57 @@ def render_toml(plan: InitPlan, config_dir: Path) -> str:
             "[[dataset.bands]]",
             f"name = {_toml_str(band.name)}",
         ]
-        stem = _strip_fits_suffix(band.path.name)
-        if stem != band.name:
-            # The slug was sanitized from the filename; surface the original as a label.
-            lines.append(f"label = {_toml_str(stem)}")
+        if band.label is not None:
+            # Detected filter — surface it as the human-readable display label.
+            lines.append(f"label = {_toml_str(band.label)}")
+        else:
+            stem = _strip_fits_suffix(band.path.name)
+            if stem != band.name:
+                # The slug was sanitized from the filename; surface the original as a label.
+                lines.append(f"label = {_toml_str(stem)}")
         lines += [
             f"input = {_toml_str(_rel_posix(band.path, config_dir))}",
             "",
         ]
 
+    dv = plan.default_view or {"mode": "single", "band": plan.bands[0].name}
     lines += [
         "[build]",
         "quantize_level = 8",
         "tile_size = 256",
         "",
         "[viewer]",
-        'default = "single"',
-        f"band = {_toml_str(plan.bands[0].name)}",
-        '# stretch = "asinh"   # linear | log | asinh',
-        "# north_up = true",
     ]
-    rgb_group = next((g for g in groups if len(g) >= 3), None)
-    lines.append("#")
-    if rgb_group is not None:
+    if dv.get("mode") == "rgb":
         lines += [
-            "# To show an RGB composite instead, pick three co-gridded bands, e.g.:",
-            '#   default = "rgb"',
-            f"#   r = {_toml_str(rgb_group[0])}",
-            f"#   g = {_toml_str(rgb_group[1])}",
-            f"#   b = {_toml_str(rgb_group[2])}",
+            "# RGB composite auto-selected from the detected broadband filters",
+            "# (reddest -> r, bluest -> b) — change these to taste.",
+            'default = "rgb"',
+            f"r = {_toml_str(dv['r'])}",
+            f"g = {_toml_str(dv['g'])}",
+            f"b = {_toml_str(dv['b'])}",
+            '# stretch = "asinh"   # linear | log | asinh | trilogy',
+            "# north_up = true",
         ]
     else:
-        lines.append("# (no co-gridded group of >=3 bands found, so RGB is not offered as a default)")
+        lines += [
+            'default = "single"',
+            f"band = {_toml_str(dv.get('band', plan.bands[0].name))}",
+            '# stretch = "asinh"   # linear | log | asinh',
+            "# north_up = true",
+        ]
+        rgb_group = next((g for g in groups if len(g) >= 3), None)
+        lines.append("#")
+        if rgb_group is not None:
+            lines += [
+                "# To show an RGB composite instead, pick three co-gridded bands, e.g.:",
+                '#   default = "rgb"',
+                f"#   r = {_toml_str(rgb_group[0])}",
+                f"#   g = {_toml_str(rgb_group[1])}",
+                f"#   b = {_toml_str(rgb_group[2])}",
+            ]
+        else:
+            lines.append("# (no co-gridded group of >=3 bands found, so RGB is not offered as a default)")
 
     # Commented [deploy] stub — fill in + uncomment to enable `fitsgl deploy` to
     # Cloudflare R2. Secrets never live in this file: `fitsgl deploy` reads them from

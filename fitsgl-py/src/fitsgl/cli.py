@@ -144,7 +144,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"  grid {gi}: {', '.join(names)}")
     for skip_path, reason in plan.skipped:
         print(f"  skipped {skip_path.name}: {reason}")
-    print(f"wrote {path} — edit it (set [viewer], add a catalog), then run `fitsgl build`")
+    dv = plan.default_view or {"mode": "single", "band": plan.bands[0].name}
+    if dv.get("mode") == "rgb":
+        print(f"  default view: rgb (r={dv['r']}, g={dv['g']}, b={dv['b']})")
+    else:
+        print(f"  default view: single ({dv.get('band', plan.bands[0].name)})")
+    print(f"wrote {path} — review it (tweak [viewer], add a catalog), then run `fitsgl build`")
     return 0
 
 

@@ -20,6 +20,19 @@ def _write_band(path, *, rotation=0.0, seed=1, shape=(64, 64)):
     fits.PrimaryHDU(data=img, header=hdr).writeto(path, overwrite=True)
 
 
+def _write_band_hdr(path, cards, *, rotation=0.0, seed=1, shape=(64, 64)):
+    """Write a synthetic mosaic with extra header cards (TELESCOP/INSTRUME/FILTER/...)
+    stamped in, so `scan_directory` can detect a real filter."""
+    img, hdr, _ = generate_synthetic_mosaic(shape=shape, n_sources=5, rotation_deg=rotation, seed=seed)
+    for k, v in cards.items():
+        hdr[k] = v
+    fits.PrimaryHDU(data=img, header=hdr).writeto(path, overwrite=True)
+
+
+def _nircam(filt):
+    return {"TELESCOP": "JWST", "INSTRUME": "NIRCAM", "FILTER": filt, "PUPIL": "CLEAR"}
+
+
 def test_discover_fits_globs_and_exclusions(tmp_path):
     for name in ("a.fits", "b.fit", "c.fits.gz", "out.fits.fz", "notes.txt"):
         (tmp_path / name).write_bytes(b"")
@@ -122,6 +135,78 @@ def test_render_toml_emits_label_for_sanitized_name(tmp_path):
         cfg = load_config(toml_path)
     assert cfg.bands[0].name == "f150w_v1" and cfg.bands[0].label == "f150w.v1"
     assert not any("not URL-safe" in str(r.message) for r in rec)  # the emitted label silences it
+
+
+def test_scan_detects_filter_labels(tmp_path):
+    for i, filt in enumerate(["F150W", "F277W", "F444W"]):
+        _write_band_hdr(tmp_path / f"{i}.fits", _nircam(filt), seed=i + 1)
+    plan = scan_directory(tmp_path)
+    by_name = {b.name: b for b in plan.bands}
+    assert set(by_name) == {"f150w", "f277w", "f444w"}
+    assert by_name["f444w"].label == "F444W"  # bare filter token, no instrument prefix
+    toml_text = render_toml(plan, tmp_path)
+    assert 'name = "f444w"' in toml_text and 'label = "F444W"' in toml_text
+
+
+def test_scan_auto_picks_rgb(tmp_path):
+    for i, filt in enumerate(["F150W", "F277W", "F444W"]):
+        _write_band_hdr(tmp_path / f"{i}.fits", _nircam(filt), seed=i + 1)
+    plan = scan_directory(tmp_path)
+    assert plan.default_view == {"mode": "rgb", "r": "f444w", "g": "f277w", "b": "f150w"}
+
+    toml_path = tmp_path / "fitsgl.toml"
+    toml_path.write_text(render_toml(plan, tmp_path))
+    cfg = load_config(toml_path)  # the RGB scaffold must round-trip to a valid config
+    assert cfg.viewer.mode == "rgb"
+    assert (cfg.viewer.r, cfg.viewer.g, cfg.viewer.b) == ("f444w", "f277w", "f150w")
+
+
+def test_scan_rgb_spreads_with_many_broadbands(tmp_path):
+    # 5 broadbands: R=reddest, B=bluest, G=broadband nearest the mid-wavelength.
+    for i, filt in enumerate(["F090W", "F150W", "F200W", "F356W", "F444W"]):
+        _write_band_hdr(tmp_path / f"{i}.fits", _nircam(filt), seed=i + 1)
+    plan = scan_directory(tmp_path)
+    # pivots ≈ 0.90, 1.50, 1.99, 3.56, 4.42; midpoint ≈ 2.66 -> nearest is F200W.
+    assert plan.default_view == {"mode": "rgb", "r": "f444w", "g": "f200w", "b": "f090w"}
+
+
+def test_scan_single_default_when_few_broadbands(tmp_path):
+    # Only 2 wide filters (+ a pupil narrowband) -> keep the single-band default.
+    _write_band_hdr(tmp_path / "a.fits", _nircam("F150W"), seed=1)
+    _write_band_hdr(tmp_path / "b.fits", _nircam("F444W"), seed=2)
+    _write_band_hdr(tmp_path / "c.fits", {"TELESCOP": "JWST", "INSTRUME": "NIRCAM", "FILTER": "F322W2", "PUPIL": "F323N"}, seed=3)
+    plan = scan_directory(tmp_path)
+    assert plan.default_view == {"mode": "single", "band": "f150w"}
+
+
+def test_scan_falls_back_to_filename_for_unknown_header(tmp_path):
+    _write_band(tmp_path / "myimage.fits", seed=1)  # no band keywords -> undetected
+    plan = scan_directory(tmp_path)
+    assert plan.bands[0].name == "myimage" and plan.bands[0].label is None
+    assert plan.default_view == {"mode": "single", "band": "myimage"}
+
+
+def test_scan_disambiguates_cross_instrument_collision(tmp_path):
+    # F150W on both NIRCam and NIRISS -> instrument-prefixed; the unique F277W stays bare.
+    _write_band_hdr(tmp_path / "a.fits", _nircam("F150W"), seed=1)
+    _write_band_hdr(tmp_path / "b.fits", {"TELESCOP": "JWST", "INSTRUME": "NIRISS", "FILTER": "F150W", "PUPIL": "CLEARP"}, seed=2)
+    _write_band_hdr(tmp_path / "c.fits", _nircam("F277W"), seed=3)
+    plan = scan_directory(tmp_path)
+    assert {b.label for b in plan.bands} == {"NIRCam F150W", "NIRISS F150W", "F277W"}
+    assert {b.name for b in plan.bands} == {"nircam-f150w", "niriss-f150w", "f277w"}
+
+
+def test_scan_rgb_default_stays_within_one_grid_group(tmp_path):
+    # Three co-gridded broadbands + an off-grid (rolled) one — RGB must come from the
+    # co-gridded group so the composite can actually form (no cross-grid spanning).
+    for i, filt in enumerate(["F150W", "F277W", "F444W"]):
+        _write_band_hdr(tmp_path / f"{i}.fits", _nircam(filt), seed=i + 1, rotation=0.0)
+    _write_band_hdr(tmp_path / "z.fits", _nircam("F356W"), seed=9, rotation=30.0)
+    plan = scan_directory(tmp_path)
+    dv = plan.default_view
+    assert dv["mode"] == "rgb"
+    group_of = {n: gi for gi, names in enumerate(plan.groups_in_order()) for n in names}
+    assert len({group_of[dv["r"]], group_of[dv["g"]], group_of[dv["b"]]}) == 1
 
 
 def test_write_scaffold_refuses_overwrite_without_force(tmp_path):
