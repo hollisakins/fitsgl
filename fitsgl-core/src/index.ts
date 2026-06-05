@@ -41,23 +41,41 @@ export type {
 // and `.visibleHistogram` apply them; `percentileRange`/`histogram` are the pure
 // underlying math, for a host computing a stretch/histogram from its own data).
 export { percentileRange, histogram, PERCENTILE_SAMPLE_CAP } from './renderer/index.js';
-// M4 — render source (single band, or three same-grid bands) accepted by the viewer.
-export type { RenderSource, SingleBandSource, RgbSource } from './renderer/index.js';
+// M4 — render source (single band, three same-grid bands, or N weighted bands).
+export type {
+  RenderSource,
+  SingleBandSource,
+  RgbSource,
+  MultiBandSource,
+  WeightedBand,
+} from './renderer/index.js';
 
 // M1 — display modes: stretch curves + bundled colormaps (single-band).
 export { STRETCH_MODES, isStretchMode } from './renderer/index.js';
 export type { StretchMode } from './renderer/index.js';
-// Trilogy stretch: pure level-determination math + precomputed-stats types.
+// Trilogy stretch: pure level-determination math + precomputed-stats types, plus
+// the weighted multi-band helpers (faithful trilogy: per-band stretch + rainbow).
 export {
   trilogyCurve,
   solveTrilogyK,
   saturationValue,
   trilogyLevels,
   combineTrilogyLuminance,
+  trilogyLevelsForBands,
+  rainbowWeights,
+  hsvToRgb,
+  weightedTrilogyPixel,
+  MAX_BANDS,
   DEFAULT_TRILOGY_PARAMS,
   DEFAULT_TRILOGY_K,
 } from './renderer/index.js';
-export type { TrilogyStats, TrilogyParams, TrilogyLevels, TrilogyLuminance } from './renderer/index.js';
+export type {
+  TrilogyStats,
+  TrilogyParams,
+  TrilogyLevels,
+  TrilogyLuminance,
+  BandWeight,
+} from './renderer/index.js';
 export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './renderer/index.js';
 export type { ColormapName, ColormapLUT } from './renderer/index.js';
 
@@ -113,6 +131,7 @@ export type {
   StretchRange,
   ViewerStretchConfig,
   ViewerView,
+  WeightedBandView,
   OverlaySource,
   LoadedViewerSource,
 } from './viewer-config.js';

@@ -30,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .bands import detect_band
 from .build_pyramid import DEFAULT_SUPERTILE_BLOCKS, build_pyramid
 from .catalog import ingest_catalog
 from .config import DatasetConfig
@@ -146,6 +147,34 @@ def _load_prev_band_stats(fitsgl_json: Path) -> dict[str, dict]:
     return out
 
 
+def _detect_band_pivot(input_path: Path) -> float | None:
+    """Pivot wavelength (microns) for a band's first input, for trilogy rainbow
+    ordering, or ``None`` when the filter can't be detected.
+
+    Merges the primary header with the 2D image HDU's (JWST/HST mosaics often carry
+    ``FILTER``/``INSTRUME`` in the primary while the science pixels live in an
+    extension) and runs the pure :func:`bands.detect_band`. Lenient: any read/parse
+    failure yields ``None`` (the viewer then orders that band by declaration order).
+    """
+    try:
+        from astropy.io import fits
+
+        with fits.open(input_path) as hdul:
+            merged = fits.Header()
+            merged.update(hdul[0].header)
+            two_d = [
+                h
+                for h in hdul
+                if isinstance(getattr(h, "shape", None), tuple) and len(h.shape) == 2
+            ]
+            if len(two_d) == 1:
+                merged.update(two_d[0].header)
+        det = detect_band(merged)
+        return det.pivot_um if det is not None else None
+    except Exception:  # noqa: BLE001 - pivot is an optional ordering hint; never fail the build
+        return None
+
+
 def build_dataset(
     config: DatasetConfig,
     out_root: str | Path,
@@ -189,6 +218,7 @@ def build_dataset(
 
     band_levels: dict[str, int] = {}
     band_stats: dict[str, dict] = {}  # band name -> {"histogram": {...}} for the viewer panel
+    band_pivots: dict[str, float] = {}  # band name -> pivot µm, for the trilogy rainbow
     reused: list[str] = []
     # Stats of reused bands are carried over from the prior build's fitsgl.json so a
     # reused band never re-decodes its native level just to recompute them.
@@ -229,6 +259,12 @@ def build_dataset(
             # becomes visible (and resume-skippable on a re-run) atomically, never partial.
             _promote_band(staging, final)
         band_levels[band.name] = manifest.n_levels
+
+        # Pivot wavelength (cheap header read) for the trilogy rainbow's blue→red
+        # ordering; optional, so a band whose filter isn't recognized just omits it.
+        pivot = _detect_band_pivot(band.inputs[0])
+        if pivot is not None:
+            band_pivots[band.name] = pivot
 
         # Display stats for the viewer's stretch panel. A reused band keeps the stats the
         # prior build computed (recomputing the trilogy stats would re-decode the whole
@@ -284,6 +320,7 @@ def build_dataset(
             default_view=dv,
             catalog_url=catalog_url,
             band_stats=band_stats,
+            band_pivots=band_pivots,
         ),
     )
 

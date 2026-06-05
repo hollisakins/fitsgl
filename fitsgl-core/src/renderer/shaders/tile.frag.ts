@@ -3,8 +3,10 @@
  *
  * One program with uniform branches covers every v1.0 display mode so the shader
  * is not rewritten per feature:
- *   - `u_mode`        0 = single-band, 1 = RGB composite (the M4 slot, built now).
- *   - `u_stretchMode` 0 = linear, 1 = log, 2 = asinh — see `stretch.ts`.
+ *   - `u_mode`        0 = single-band, 1 = RGB composite (the M4 slot), 2 = weighted
+ *                     multi-band trilogy composite (N bands, each with an (R,G,B)
+ *                     contribution weight — Dan Coe's faithful trilogy).
+ *   - `u_stretchMode` 0 = linear, 1 = log, 2 = asinh, 3 = trilogy — see `stretch.ts`.
  *   - `u_useColormap` single-band only: 0 = grayscale, 1 = sample `u_colormap`.
  *
  * The raw float values live untouched in the R32F textures; this shader does the
@@ -26,7 +28,7 @@
  * the GLSL curve and the TS reference cannot drift.
  */
 
-import { ASINH_SOFTENING, LOG_SOFTENING } from '../stretch.js';
+import { ASINH_SOFTENING, LOG_SOFTENING, MAX_BANDS } from '../stretch.js';
 
 /** Format a JS number as a GLSL `float` literal (always with a decimal point). */
 function glslFloat(n: number): string {
@@ -44,7 +46,7 @@ uniform sampler2D u_tileB;
 // 1-D palette sampled by the single-band colormap path.
 uniform sampler2D u_colormap;
 
-uniform int u_mode;         // 0 = single-band, 1 = RGB composite
+uniform int u_mode;         // 0 = single-band, 1 = RGB composite, 2 = weighted multi-band
 uniform int u_stretchMode;  // 0 = linear, 1 = log, 2 = asinh, 3 = trilogy
 uniform int u_useColormap;  // single-band: 0 = grayscale, 1 = colormap LUT
 
@@ -57,8 +59,18 @@ uniform float u_trilogyK;   // trilogy softening (mode 3); solved on the host fr
 uniform float u_trilogyLsat;// trilogy RGB: bias-subtracted luminance mapping to 1
 uniform vec3 u_bg;          // opaque background colour; NaN/no-data pixels emit this
 
+// Weighted multi-band trilogy (u_mode == 2): one entry per participating band.
+uniform sampler2D u_band[MAX_BANDS]; // band textures, bound by the viewer's unit map
+uniform vec3 u_weight[MAX_BANDS];    // per-band (R,G,B) contribution weight
+uniform float u_bx0[MAX_BANDS];      // per-band trilogy black point (x0)
+uniform float u_bx2[MAX_BANDS];      // per-band trilogy white point (x2)
+uniform float u_bk[MAX_BANDS];       // per-band trilogy softening (k)
+uniform int u_nBands;                // number of participating bands (<= MAX_BANDS)
+uniform vec3 u_weightSum;            // host-precomputed Σ weights per channel
+
 const float LOG_A = ${glslFloat(LOG_SOFTENING)};
 const float ASINH_A = ${glslFloat(ASINH_SOFTENING)};
+const int MAX_BANDS = ${MAX_BANDS};
 
 in vec2 v_uv;
 out vec4 outColor;
@@ -121,6 +133,37 @@ void main() {
     float gs = gn ? 0.0 : scaleChannel(g, u_minRGB.g, u_maxRGB.g, u_trilogyK);
     float bs = bn ? 0.0 : scaleChannel(b, u_minRGB.b, u_maxRGB.b, u_trilogyK);
     outColor = vec4(rs, gs, bs, u_opacity);
+    return;
+  }
+
+  if (u_mode == 2) {
+    // Weighted multi-band trilogy (Dan Coe's faithful composite). Each band is
+    // trilogy-stretched by its OWN levels to s_i in [0,1] (u_stretchMode == 3 so
+    // scaleChannel takes the trilogy arm with the band's own k); the channels are
+    // weighted averages num/u_weightSum, with the Σ weights precomputed on the
+    // host so a zero-weight channel is exactly 0. A NaN band contributes 0 to
+    // every channel; the pixel is opaque background only when ALL participating
+    // bands are NaN (generalizes the D8 all-three-NaN rule). The loop bound is the
+    // fixed MAX_BANDS with an early break — sampler arrays are indexed only by the
+    // loop induction variable (a constant-index expression under GLSL ES 3.00).
+    vec3 num = vec3(0.0);
+    int nanCount = 0;
+    for (int i = 0; i < MAX_BANDS; i++) {
+      if (i >= u_nBands) break;
+      float v = texture(u_band[i], v_uv).r;
+      if (isnan(v)) { nanCount++; continue; }
+      float s = scaleChannel(v, u_bx0[i], u_bx2[i], u_bk[i]);
+      num += u_weight[i] * s;
+    }
+    if (nanCount == u_nBands) {
+      outColor = vec4(u_bg, 1.0);
+      return;
+    }
+    vec3 rgb = vec3(
+      u_weightSum.r > 0.0 ? num.r / u_weightSum.r : 0.0,
+      u_weightSum.g > 0.0 ? num.g / u_weightSum.g : 0.0,
+      u_weightSum.b > 0.0 ? num.b / u_weightSum.b : 0.0);
+    outColor = vec4(clamp(rgb, 0.0, 1.0), u_opacity);
     return;
   }
 

@@ -32,6 +32,8 @@ export type {
   RenderSource,
   SingleBandSource,
   RgbSource,
+  MultiBandSource,
+  WeightedBand,
   NormalizedSource,
 } from './render-source.js';
 
@@ -49,10 +51,21 @@ export {
   saturationValue,
   trilogyLevels,
   combineTrilogyLuminance,
+  trilogyLevelsForBands,
+  rainbowWeights,
+  hsvToRgb,
+  weightedTrilogyPixel,
+  MAX_BANDS,
   DEFAULT_TRILOGY_PARAMS,
   DEFAULT_TRILOGY_K,
 } from './stretch.js';
-export type { TrilogyStats, TrilogyParams, TrilogyLevels, TrilogyLuminance } from './stretch.js';
+export type {
+  TrilogyStats,
+  TrilogyParams,
+  TrilogyLevels,
+  TrilogyLuminance,
+  BandWeight,
+} from './stretch.js';
 export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './colormaps.js';
 export type { ColormapName, ColormapLUT } from './colormaps.js';
 

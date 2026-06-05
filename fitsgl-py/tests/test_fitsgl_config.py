@@ -106,6 +106,19 @@ def test_emits_band_stats_histogram(tmp_path):
     assert "stats" not in cfg2["dataset"]["bands"][0]
 
 
+def test_emits_band_pivot_um(tmp_path):
+    cfg = build_fitsgl_config(
+        [_band(tmp_path, "a"), _band(tmp_path, "b")],
+        tmp_path / "fitsgl.json",
+        name="set",
+        default_view=default_view_dict(mode="rgb", r="a", g="b", b="a"),
+        band_pivots={"a": 1.501},
+    )
+    assert cfg["dataset"]["bands"][0]["pivotUm"] == 1.501
+    # A band without a detected pivot omits the key.
+    assert "pivotUm" not in cfg["dataset"]["bands"][1]
+
+
 def test_assigns_grid_groups_by_grid_hash(tmp_path):
     # a, b co-gridded (same WCS); c is 50 deg away -> its own group.
     manifests = [_manifest("a", 150.0), _manifest("b", 150.0), _manifest("c", 200.0)]

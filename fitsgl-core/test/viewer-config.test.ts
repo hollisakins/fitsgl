@@ -120,6 +120,54 @@ describe('validateViewerConfig', () => {
     } as unknown as ViewerConfig;
     expect(() => validateViewerConfig(cfg)).toThrow(/not a known colormap/);
   });
+
+  it('accepts a weighted multiband view', () => {
+    const cfg: ViewerConfig = {
+      bands: [band('a'), band('b'), band('c')],
+      view: {
+        mode: 'multiband',
+        bands: [
+          { band: 'a', weight: [1, 0, 0] },
+          { band: 'b', weight: [0, 1, 0] },
+          { band: 'c', weight: [0, 0, 1] },
+        ],
+      },
+    };
+    expect(() => validateViewerConfig(cfg)).not.toThrow();
+  });
+
+  it('rejects a multiband view referencing an unknown band', () => {
+    const cfg: ViewerConfig = {
+      bands: [band('a')],
+      view: { mode: 'multiband', bands: [{ band: 'z', weight: [1, 1, 1] }] },
+    };
+    expect(() => validateViewerConfig(cfg)).toThrow(/references unknown band "z"/);
+  });
+
+  it('rejects a multiband band with a malformed weight', () => {
+    const cfg = {
+      bands: [band('a')],
+      view: { mode: 'multiband', bands: [{ band: 'a', weight: [1, 0] }] },
+    } as unknown as ViewerConfig;
+    expect(() => validateViewerConfig(cfg)).toThrow(/weight must be 3 finite numbers/);
+  });
+
+  it('rejects an empty multiband view', () => {
+    const cfg: ViewerConfig = {
+      bands: [band('a')],
+      view: { mode: 'multiband', bands: [] },
+    };
+    expect(() => validateViewerConfig(cfg)).toThrow(/non-empty "bands" list/);
+  });
+
+  it('rejects range/channels on a multiband view (trilogy derives levels from stats)', () => {
+    const cfg: ViewerConfig = {
+      bands: [band('a')],
+      view: { mode: 'multiband', bands: [{ band: 'a', weight: [1, 1, 1] }] },
+      stretch: { channels: { r: { min: 0, max: 1 } } },
+    };
+    expect(() => validateViewerConfig(cfg)).toThrow(/no range\/channels/);
+  });
 });
 
 describe('renderSourceForView', () => {
@@ -142,6 +190,31 @@ describe('renderSourceForView', () => {
       expect(src.r).toBe(pyrs.get('x'));
       expect(src.g).toBe(pyrs.get('y'));
       expect(src.b).toBe(pyrs.get('z'));
+    }
+  });
+
+  it('builds a multiband source in band order with weights', () => {
+    const pyrs = new Map([
+      ['x', fakePyramid('x')],
+      ['y', fakePyramid('y')],
+    ]);
+    const src = renderSourceForView(
+      {
+        mode: 'multiband',
+        bands: [
+          { band: 'x', weight: [1, 0, 0] },
+          { band: 'y', weight: [0, 0.5, 1] },
+        ],
+      },
+      pyrs,
+    );
+    expect(src.kind).toBe('multiband');
+    if (src.kind === 'multiband') {
+      expect(src.bands.map((b) => b.pyramid)).toEqual([pyrs.get('x'), pyrs.get('y')]);
+      expect(src.bands.map((b) => b.weight)).toEqual([
+        [1, 0, 0],
+        [0, 0.5, 1],
+      ]);
     }
   });
 

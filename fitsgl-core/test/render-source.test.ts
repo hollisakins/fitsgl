@@ -7,6 +7,7 @@ import {
   manifestGridSpec,
   geomsEqual,
   isCompatibleGrid,
+  type MultiBandSource,
 } from '../src/renderer/render-source.js';
 import { buildLevelGeoms } from '../src/renderer/tile-manager.js';
 
@@ -81,6 +82,27 @@ describe('normalizeSource / isRenderSource', () => {
     const s = { kind: 'rgb', r: a, g: b, b: c } as const;
     expect(isRenderSource(s)).toBe(true);
     expect(normalizeSource(s)).toEqual({ mode: 'rgb', pyramids: [a, b, c] });
+  });
+
+  it('a multiband source unwraps to ordered pyramids + parallel weights', () => {
+    const s: MultiBandSource = {
+      kind: 'multiband',
+      bands: [
+        { pyramid: a, weight: [1, 0, 0] },
+        { pyramid: b, weight: [0, 1, 0] },
+        { pyramid: c, weight: [0, 0, 1] },
+      ],
+    };
+    expect(isRenderSource(s)).toBe(true);
+    expect(normalizeSource(s)).toEqual({
+      mode: 'multiband',
+      pyramids: [a, b, c],
+      weights: [
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1],
+      ],
+    });
   });
 });
 

@@ -37,6 +37,53 @@ describe('validateFitsglConfig', () => {
     expect(c.defaultView).toEqual({ mode: 'rgb', r: 'a', g: 'b', b: 'c', stretch: { mode: 'asinh' }, northUp: true });
   });
 
+  it('carries a band pivotUm through validation', () => {
+    const r = raw();
+    (r.dataset as { bands: Array<Record<string, unknown>> }).bands[0].pivotUm = 1.501;
+    const c = validateFitsglConfig(r);
+    expect(c.dataset.bands[0].pivotUm).toBe(1.501);
+    expect(c.dataset.bands[1].pivotUm).toBeUndefined();
+  });
+
+  it('rejects a non-finite pivotUm', () => {
+    const r = raw();
+    (r.dataset as { bands: Array<Record<string, unknown>> }).bands[0].pivotUm = 'x';
+    expect(() => validateFitsglConfig(r)).toThrow(/pivotUm must be a finite number/);
+  });
+
+  it('accepts a weighted-trilogy default view and rejects a malformed weight', () => {
+    const ok = validateFitsglConfig({
+      ...raw(),
+      defaultView: {
+        mode: 'rgb',
+        r: 'a',
+        g: 'b',
+        b: 'c',
+        stretch: { mode: 'trilogy' },
+        weights: [
+          { band: 'a', weight: [1, 0, 0] },
+          { band: 'b', weight: [0, 1, 1] },
+        ],
+      },
+    });
+    expect(ok.defaultView.weights).toEqual([
+      { band: 'a', weight: [1, 0, 0] },
+      { band: 'b', weight: [0, 1, 1] },
+    ]);
+    expect(() =>
+      validateFitsglConfig({
+        ...raw(),
+        defaultView: { mode: 'rgb', r: 'a', g: 'b', b: 'c', weights: [{ band: 'a', weight: [1, 0] }] },
+      }),
+    ).toThrow(/weight must be 3 finite numbers/);
+    expect(() =>
+      validateFitsglConfig({
+        ...raw(),
+        defaultView: { mode: 'rgb', r: 'a', g: 'b', b: 'c', weights: [{ band: 'zz', weight: [1, 0, 0] }] },
+      }),
+    ).toThrow(/references unknown band "zz"/);
+  });
+
   it('accepts a minimal single-band config (no band/colormap/catalog/title)', () => {
     const c = validateFitsglConfig({
       schemaVersion: 1,

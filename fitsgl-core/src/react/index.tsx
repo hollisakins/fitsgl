@@ -202,6 +202,13 @@ const FitsViewerComponent = forwardRef<FitsViewerHandle, FitsViewerProps>(functi
   // three channels, any *explicitly pinned* channels are re-applied after it
   // resolves, honouring the config contract's "omit a channel to auto-stretch it".
   const applyControlledStretch = (viewer: CoreViewer, config: ViewerConfig): void => {
+    if (config.view.mode === 'multiband') {
+      // A weighted multi-band composite is the faithful-trilogy path: per-band
+      // levels come from precomputed stats and are applied imperatively by the host
+      // (`applyTrilogy`), not from a controlled interval — so there is nothing to
+      // auto-stretch here.
+      return;
+    }
     if (config.view.mode === 'single') {
       const r = config.stretch?.range;
       if (r !== undefined) {

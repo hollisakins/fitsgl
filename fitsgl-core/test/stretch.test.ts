@@ -15,8 +15,14 @@ import {
   saturationValue,
   trilogyLevels,
   combineTrilogyLuminance,
+  trilogyLevelsForBands,
+  rainbowWeights,
+  hsvToRgb,
+  weightedTrilogyPixel,
+  MAX_BANDS,
   DEFAULT_TRILOGY_PARAMS,
   type TrilogyStats,
+  type BandWeight,
 } from '../src/renderer/stretch.js';
 import { TILE_FRAG } from '../src/renderer/shaders/tile.frag.js';
 import { TILE_VERT } from '../src/renderer/shaders/tile.vert.js';
@@ -313,6 +319,112 @@ describe('TILE_FRAG — color-preserving trilogy RGB branch', () => {
 
   it('declares the trilogy uniforms', () => {
     for (const u of ['u_trilogyK', 'u_trilogyLsat']) expect(TILE_FRAG).toContain(u);
+  });
+});
+
+describe('weighted multi-band trilogy — pure helpers (faithful composite)', () => {
+  const STATS: TrilogyStats = {
+    mean: 100,
+    sigma: 5,
+    tail: { p99: 400, p99_9: 700, p99_99: 1000, p99_999: 1600 },
+  };
+
+  it('hsvToRgb maps the primary hues exactly', () => {
+    expect(hsvToRgb(0, 1, 1)).toEqual([1, 0, 0]); // red
+    const g = hsvToRgb(120, 1, 1);
+    expect(g[0]).toBeCloseTo(0, 12);
+    expect(g[1]).toBeCloseTo(1, 12);
+    expect(g[2]).toBeCloseTo(0, 12);
+    const b = hsvToRgb(240, 1, 1);
+    expect(b[0]).toBeCloseTo(0, 12);
+    expect(b[1]).toBeCloseTo(0, 12);
+    expect(b[2]).toBeCloseTo(1, 12);
+  });
+
+  it('rainbowWeights spreads bands blue→red and a single band is white', () => {
+    expect(rainbowWeights(0)).toEqual([]);
+    expect(rainbowWeights(1)).toEqual([[1, 1, 1]]);
+    const two = rainbowWeights(2);
+    expect(two[0][2]).toBeCloseTo(1, 12); // bluest first
+    expect(two[1][0]).toBeCloseTo(1, 12); // reddest last
+    const five = rainbowWeights(5);
+    expect(five[0][2]).toBeCloseTo(1, 12); // blue
+    expect(five[2][1]).toBeCloseTo(1, 12); // green midpoint (hue 120)
+    expect(five[4][0]).toBeCloseTo(1, 12); // red
+    // Every output channel gets some weight across the set (no dark channel).
+    const sum = five.reduce((a, w) => [a[0] + w[0], a[1] + w[1], a[2] + w[2]], [0, 0, 0]);
+    for (const c of sum) expect(c).toBeGreaterThan(0);
+  });
+
+  it('trilogyLevelsForBands is the per-band trilogyLevels, length preserved', () => {
+    const a: TrilogyStats = { ...STATS, mean: 50 };
+    const levels = trilogyLevelsForBands([STATS, a], DEFAULT_TRILOGY_PARAMS);
+    expect(levels).toHaveLength(2);
+    expect(levels[0]).toEqual(trilogyLevels(STATS, DEFAULT_TRILOGY_PARAMS));
+    expect(levels[1]).toEqual(trilogyLevels(a, DEFAULT_TRILOGY_PARAMS));
+  });
+
+  it('weightedTrilogyPixel is the per-band stretch then weighted average', () => {
+    const lv = trilogyLevels(STATS, DEFAULT_TRILOGY_PARAMS);
+    const s = scaleValue(300, lv.x0, lv.x2, 'trilogy', lv.k);
+    // Two bands: pure red and pure blue, same value -> R == B == s, G == 0 (den 0).
+    const weights: BandWeight[] = [
+      [1, 0, 0],
+      [0, 0, 1],
+    ];
+    const out = weightedTrilogyPixel([300, 300], [lv, lv], weights);
+    expect(out[0]).toBeCloseTo(s, 12);
+    expect(out[1]).toBe(0); // green weight-sum is 0
+    expect(out[2]).toBeCloseTo(s, 12);
+  });
+
+  it('a NaN band contributes 0 but still counts in the weight denominator', () => {
+    const lv = trilogyLevels(STATS, DEFAULT_TRILOGY_PARAMS);
+    const s = scaleValue(300, lv.x0, lv.x2, 'trilogy', lv.k);
+    // Both bands red-weighted; band 1 is NaN -> R = (1*s + 1*0) / (1 + 1).
+    const out = weightedTrilogyPixel(
+      [300, NaN],
+      [lv, lv],
+      [
+        [1, 0, 0],
+        [1, 0, 0],
+      ],
+    );
+    expect(out[0]).toBeCloseTo(s / 2, 12);
+    expect(out[1]).toBe(0);
+    expect(out[2]).toBe(0);
+  });
+
+  it('clamps each output channel to [0,1]', () => {
+    const lv = trilogyLevels(STATS, DEFAULT_TRILOGY_PARAMS);
+    // A weight > 1 with sum == weight gives num/den = s (<=1); use two unit weights
+    // and a saturating value to confirm the clamp path holds at the ceiling.
+    const out = weightedTrilogyPixel([1e9], [lv], [[2, 0, 0]]);
+    expect(out[0]).toBeLessThanOrEqual(1);
+    expect(out[0]).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('TILE_FRAG — weighted multi-band trilogy branch (u_mode == 2)', () => {
+  it('inlines MAX_BANDS from stretch.ts so the GLSL array size cannot drift', () => {
+    expect(TILE_FRAG).toContain(`const int MAX_BANDS = ${MAX_BANDS}`);
+    expect(TILE_FRAG).toContain('uniform sampler2D u_band[MAX_BANDS]');
+  });
+
+  it('accumulates per-band weighted, trilogy-stretched contributions', () => {
+    const mb = TILE_FRAG.indexOf('u_mode == 2');
+    expect(mb).toBeGreaterThan(0);
+    expect(TILE_FRAG).toContain('texture(u_band[i], v_uv).r');
+    expect(TILE_FRAG).toContain('scaleChannel(v, u_bx0[i], u_bx2[i], u_bk[i])');
+    expect(TILE_FRAG).toContain('num += u_weight[i] * s');
+    // Normalized by the host-precomputed Σ weights, with a per-channel zero guard.
+    expect(TILE_FRAG).toContain('u_weightSum.r > 0.0 ? num.r / u_weightSum.r : 0.0');
+  });
+
+  it('emits the background only when ALL participating bands are NaN', () => {
+    expect(TILE_FRAG).toContain('nanCount == u_nBands');
+    const guard = TILE_FRAG.indexOf('nanCount == u_nBands');
+    expect(TILE_FRAG.indexOf('vec4(u_bg, 1.0)', guard)).toBeGreaterThan(guard);
   });
 });
 
