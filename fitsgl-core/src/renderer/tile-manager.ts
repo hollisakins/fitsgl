@@ -212,6 +212,26 @@ export function ringTiles(geom: LevelGeom, bounds: WorldBounds, margin: number):
 }
 
 /**
+ * Every tile of a level, row-major (y outer, x inner). Used to pin the fit-level
+ * "floor" grid — the coarsest level the viewer ever displays — so the zoom-out
+ * fallback never drops below fit-to-window resolution (and a cold open paints at
+ * fit resolution directly instead of the 1-tile whole-image blur). It enumerates
+ * EVERY tile of the level across the whole mosaic — but the caller picks the floor
+ * LEVEL to roughly match the fit-to-window resolution, so the level's pixel
+ * dimensions (and hence its full tile count) are on the order of the viewport, not
+ * the mosaic's native size; the count scales with the window/DPR via that choice.
+ */
+export function allLevelTiles(geom: LevelGeom): TileCoord[] {
+  const tiles: TileCoord[] = [];
+  for (let ty = 0; ty < geom.nTilesY; ty++) {
+    for (let tx = 0; tx < geom.nTilesX; tx++) {
+      tiles.push({ level: geom.z, tileX: tx, tileY: ty });
+    }
+  }
+  return tiles;
+}
+
+/**
  * Reorder visible tiles center-out: nearest to the world point `(cx, cy)` first,
  * so the area the user is looking at sharpens before the periphery (CARTA orders
  * every request batch by squared distance to its view focus point). Pure; returns
@@ -440,14 +460,23 @@ export class TileManager {
   /** Current render frame, set by the viewer at the start of each draw. */
   frame = 0;
   private destroyed = false;
+  /**
+   * Per-band GPU texture budget (max resident tiles before LRU eviction kicks in).
+   * Mutable because the viewer raises it to cover the pinned fit-level floor grid,
+   * whose size tracks the window — so the working-set headroom stays constant as
+   * the floor grows on a larger display.
+   */
+  budget: number;
 
   constructor(
     private readonly gl: WebGL2RenderingContext,
     private readonly pyramid: TilePyramid,
     private readonly geoms: Map<number, LevelGeom>,
-    readonly budget: number,
+    budget: number,
     private readonly onTileLoaded: () => void,
-  ) {}
+  ) {
+    this.budget = budget;
+  }
 
   has(level: number, tileX: number, tileY: number): boolean {
     return this.textures.has(tileKey(level, tileX, tileY));

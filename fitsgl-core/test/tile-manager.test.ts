@@ -5,6 +5,7 @@ import {
   visibleTiles,
   ringTiles,
   centerOutOrder,
+  allLevelTiles,
   coarserFallback,
   commonResidentLevel,
   finerFallback,
@@ -189,6 +190,27 @@ describe('centerOutOrder', () => {
     const ordered = centerOutOrder(input, g, 0, 0);
     expect(ordered).toEqual(input);
     expect(ordered).not.toBe(input); // returns a fresh array
+  });
+});
+
+describe('allLevelTiles (pinned fit-level floor grid)', () => {
+  it('enumerates every tile of the level, row-major, tagged with the level z', () => {
+    const g = geom({ z: 3, nTilesX: 3, nTilesY: 2 });
+    const tiles = allLevelTiles(g);
+    expect(tiles.length).toBe(3 * 2); // full grid, no gaps
+    expect(tiles.every((t) => t.level === 3)).toBe(true);
+    // Row-major: y outer, x inner.
+    expect(tiles.map((t) => `${t.tileX},${t.tileY}`)).toEqual([
+      '0,0', '1,0', '2,0', '0,1', '1,1', '2,1',
+    ]);
+    // Exactly the coordinate set covering the whole level (no dupes/omissions).
+    const keys = new Set(tiles.map((t) => `${t.tileX},${t.tileY}`));
+    expect(keys.size).toBe(6);
+  });
+
+  it('returns a single tile for a level that fits in one tile (the legacy floor)', () => {
+    const tiles = allLevelTiles(geom({ z: 5, nTilesX: 1, nTilesY: 1 }));
+    expect(tiles).toEqual([{ level: 5, tileX: 0, tileY: 0 }]);
   });
 });
 

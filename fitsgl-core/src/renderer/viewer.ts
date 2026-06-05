@@ -67,6 +67,7 @@ import { OverlayRenderer } from '../overlay/overlay-renderer.js';
 import { OverlayPopup } from '../overlay/popup.js';
 import {
   TileManager,
+  allLevelTiles,
   buildLevelGeoms,
   centerOutOrder,
   coarserFallback,
@@ -315,7 +316,19 @@ export class FitsViewer {
   /** The construction-time grid every `setSource` band must match (D7). */
   private readonly gridSpec: GridSpec;
   private readonly geoms: Map<number, LevelGeom>;
+  /** Coarsest level the PYRAMID provides (deepest z index); upper bound only. */
   private readonly maxLevel: number;
+  /**
+   * Coarsest level the VIEWER ever displays or falls back to: the level shown at
+   * the fit-to-window zoom. Zoom-out is clamped at fit, so levels coarser than
+   * this are never the target and only muddy the fallback — capping here keeps the
+   * floor no blurrier than the fit view. Recomputed in `updateZoomLimits`, so it
+   * tracks window size + DPR (`-1` until the first sizing pass primes it).
+   */
+  private displayMaxLevel = -1;
+  /** Every tile of `displayMaxLevel` — the pinned, always-resident floor grid (the
+   *  hole-free fallback). Re-enumerated by `primeFloor` when the floor level changes. */
+  private floorTiles: TileCoord[] = [];
   private readonly nativeW: number;
   private readonly nativeH: number;
   private readonly onFrame?: (info: ViewerFrameInfo) => void;
@@ -530,13 +543,9 @@ export class FitsViewer {
     );
     this.bandPyramids = norm.pyramids;
     this.bandWeights = norm.weights ?? [];
-    // Prime the coarsest level (one tile per band) so the viewer shows a whole-
-    // image low-res preview almost immediately rather than staying blank until the
-    // target level loads. Single-band uses it as the last-resort coarse-to-fine
-    // fallback (coarserFallback walks up to maxLevel); RGB additionally needs it so
-    // the common-level-hold always has a common ancestor. draw() re-acquires it
-    // every frame so it is never evicted (see the pin in draw()).
-    for (const m of this.bandManagers) m.request(this.maxLevel, 0, 0);
+    // The fit-level floor grid (the always-resident, hole-free fallback) is primed
+    // by `updateZoomLimits` once the viewport is known (`syncCanvasSize`, below),
+    // since the floor level depends on the fit zoom. It runs before the first draw.
 
     // Overlay subsystem (M3): the instanced marker renderer + a reused DOM popup.
     // The marker store/grid stay empty until the host adds markers.
@@ -821,8 +830,6 @@ export class FitsViewer {
     const next = norm.pyramids.map(
       (p) => new TileManager(this.gl, p, this.geoms, this.textureBudget, () => this.requestRender()),
     );
-    // Prime the coarsest level for the new managers (mirrors the constructor).
-    for (const m of next) m.request(this.maxLevel, 0, 0);
     const old = this.bandManagers;
     this.bandManagers = next;
     this.bandPyramids = norm.pyramids;
@@ -831,6 +838,10 @@ export class FitsViewer {
     // stale until the host re-applies a fit (the explorer does on a source swap).
     this.bandLevels = [];
     this.mode = norm.mode;
+    // Prime + budget the fit-level floor grid for the new managers (mirrors the
+    // constructor's deferred prime). The floor level is unchanged (same grid), so
+    // this re-fetches the floor on the fresh managers rather than recomputing it.
+    this.primeFloor();
     for (const m of old) m.destroy();
     this.requestRender();
   }
@@ -1108,6 +1119,43 @@ export class FitsViewer {
   private updateZoomLimits(): void {
     const fit = this.fitZoom();
     this.camera.setZoomLimits(fit, Math.max(fit, MAX_NATIVE_ZOOM * this.dpr));
+    // Cap the fallback floor at the level shown when fit-to-window. `targetLevel`
+    // sees the same perceived (CSS) zoom the draw loop selects on (see the
+    // `selectionZoom` note there), so the floor matches the coarsest level the
+    // camera can ever reach. Recomputed on every resize/DPR change, so the floor
+    // scales with the window and display resolution.
+    const selectionFit = this.hiDpiLevels ? fit : fit / this.dpr;
+    const floor = targetLevel(selectionFit, this.maxLevel);
+    if (floor !== this.displayMaxLevel) {
+      this.displayMaxLevel = floor;
+      this.primeFloor();
+    }
+  }
+
+  /**
+   * Prefetch and budget-reserve the fit-level floor grid — the coarsest level the
+   * viewer ever shows (`displayMaxLevel`). Pinning the whole level (re-acquired
+   * every frame in `draw`) guarantees a hole-free fallback no blurrier than the
+   * fit-to-window view, and makes the cold open paint at fit resolution directly
+   * rather than as a single whole-image blur. Called when the floor level changes
+   * (open / resize / DPR) and on `setSource`; `request` is a no-op for tiles that
+   * are already resident, so re-calling is cheap. The grid is the whole level, but
+   * the floor LEVEL tracks the fit zoom, so its tile count is on the order of the
+   * viewport (not the mosaic's native size); each band's budget is raised by exactly
+   * that count to keep the working-set headroom (`textureBudget`) constant as it grows.
+   */
+  private primeFloor(): void {
+    const geom = this.geoms.get(this.displayMaxLevel);
+    if (geom === undefined) {
+      this.floorTiles = [];
+      return;
+    }
+    this.floorTiles = allLevelTiles(geom);
+    const budget = this.textureBudget + this.floorTiles.length;
+    for (const m of this.bandManagers) {
+      m.budget = budget;
+      for (const t of this.floorTiles) m.request(this.displayMaxLevel, t.tileX, t.tileY);
+    }
   }
 
   /**
@@ -1243,13 +1291,13 @@ export class FitsViewer {
     // camera is moving the held level is kept and the transform resamples the
     // resident textures, so the displayed noise stays steady; the live level is
     // adopted once `cameraIdle` flips true (same idle delay that gates prefetch).
-    const liveLevel = targetLevel(selectionZoom, this.maxLevel);
+    const liveLevel = targetLevel(selectionZoom, this.displayMaxLevel);
     const resolved = resolveDisplayLevel(
       liveLevel,
       this.heldLevel,
       this.cameraIdle,
       this.deferLevelSwitch,
-      this.maxLevel,
+      this.displayMaxLevel,
     );
     const level = resolved.level;
     this.heldLevel = resolved.held;
@@ -1297,13 +1345,14 @@ export class FitsViewer {
 
       // Option A: keep the next-coarser PARENT level warm so a zoom-out lands on
       // already-resident tiles — and so any still-missing target tile falls back
-      // on a one-step-coarser ancestor — instead of snapping to the pinned
-      // whole-image overview (the coarse "blocky flash"). Prefetch the parent tiles
-      // over the viewport on the same throttle as the ring and re-acquire any
+      // on a one-step-coarser ancestor — instead of jumping straight to the pinned
+      // fit-level floor (a coarser-than-needed "blocky flash"). Prefetch the parent
+      // tiles over the viewport on the same throttle as the ring and re-acquire any
       // resident ones every frame so they survive idle/budget eviction while the
       // user lingers here. `cancelExcept` only aborts fetches at the target level,
-      // so these parent fetches are never cancelled. Skipped at the coarsest level.
-      if (level < this.maxLevel) {
+      // so these parent fetches are never cancelled. Skipped at the floor level
+      // (its tiles are already pinned, and nothing coarser is ever displayed).
+      if (level < this.displayMaxLevel) {
         const parentLevel = level + 1;
         const parentGeom = this.geoms.get(parentLevel);
         if (parentGeom !== undefined) {
@@ -1340,11 +1389,20 @@ export class FitsViewer {
       }
     }
 
-    // Pin the coarsest whole-image tile (per band) as the last-resort coarse-to-
-    // fine fallback: re-acquiring it every frame refreshes its last-visible frame
-    // so idle/budget eviction never drops it, and a fast pan into never-visited
-    // territory shows a blur rather than black. A no-op until the prime loads.
-    for (const m of this.bandManagers) m.acquire(this.maxLevel, 0, 0);
+    // Pin the whole fit-level floor grid (per band) as the last-resort coarse-to-
+    // fine fallback: re-acquiring every floor tile each frame refreshes its
+    // last-visible frame so idle/budget eviction never drops it, so a fast pan or
+    // zoom into never-visited territory always lands on fit-resolution detail (no
+    // hole, and never blurrier than the fit-to-window view). `primeFloor` does the
+    // initial fetch (and the re-fetch on a source swap); the `request` here is only
+    // a retry for a floor tile whose prime fetch failed, so it is gated on
+    // `cameraIdle` rather than re-fired (backoff-free) every interaction frame.
+    for (const m of this.bandManagers) {
+      for (const t of this.floorTiles) {
+        if (this.cameraIdle) m.request(this.displayMaxLevel, t.tileX, t.tileY);
+        m.acquire(this.displayMaxLevel, t.tileX, t.tileY);
+      }
+    }
 
     for (const m of this.bandManagers) m.evict(MAX_IDLE_FRAMES);
 
@@ -1462,7 +1520,7 @@ export class FitsViewer {
     tileY: number,
     rect: WorldRect,
   ): void {
-    const fb = coarserFallback(level, tileX, tileY, this.maxLevel, (l, x, y) => mgr.has(l, x, y));
+    const fb = coarserFallback(level, tileX, tileY, this.displayMaxLevel, (l, x, y) => mgr.has(l, x, y));
     if (fb !== null) {
       const fbEntry = mgr.acquire(fb.level, fb.tileX, fb.tileY);
       const fbGeom = this.geoms.get(fb.level);
@@ -1601,7 +1659,7 @@ export class FitsViewer {
       level,
       tileX,
       tileY,
-      this.maxLevel,
+      this.displayMaxLevel,
       (l, x, y) => {
         const hr = mr.acquire(l, x, y) !== undefined;
         const hg = mg.acquire(l, x, y) !== undefined;
@@ -1832,7 +1890,7 @@ export class FitsViewer {
       level,
       tileX,
       tileY,
-      this.maxLevel,
+      this.displayMaxLevel,
       (l, x, y) => this.acquireAllBands(l, x, y),
       level + 1,
     );
