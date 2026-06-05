@@ -3,7 +3,7 @@
 import pytest
 from astropy.io import fits
 
-from fitsgl.bands import detect_band
+from fitsgl.bands import detect_band, detect_band_from_filename
 
 
 def _hdr(**cards) -> fits.Header:
@@ -75,6 +75,62 @@ def test_acs_fallback_uses_nm_units():
     det = detect_band(_hdr(TELESCOP="HST", INSTRUME="ACS", FILTER1="CLEAR1L", FILTER2="F892N"))
     assert det is not None
     assert det.pivot_um == pytest.approx(0.892, abs=0.01)
+
+
+# --- filename fallback (detect_band_from_filename) -----------------------------
+
+# (filename, filter, instrument, telescope, is_broadband)
+_FILENAME_CASES = [
+    # The motivating case: a community NIRCam mosaic with instrument + filter in name.
+    ("mosaic_nircam_f090w_uds_30mas_v1_0_1_primer_sci.fits", "F090W", "NIRCam", "JWST", True),
+    ("mosaic_nircam_f444w_uds_30mas_v1_0_1_primer_sci.fits", "F444W", "NIRCam", "JWST", True),
+    ("mosaic_nircam_f410m_uds_30mas_v1_0_1_primer_sci.fits", "F410M", "NIRCam", "JWST", False),
+    # Bare filter, no instrument token -> recovered from the curated table (NIRCam).
+    ("f090w.fits", "F090W", "NIRCam", "JWST", True),
+    ("f150w2.fits", "F150W2", "NIRCam", "JWST", True),  # wide blocker
+    # A trailing pupil/blocker after the token (Grizli-style) is ignored.
+    ("jw_f356w-clear_i2d.fits", "F356W", "NIRCam", "JWST", True),
+    # HST instrument tokens.
+    ("acs_f814w_drz.fits", "F814W", "ACS", "HST", True),
+    # WFC3 sub-instrument recovered from whichever sub-table holds the filter.
+    ("wfc3_f160w_sci.fits", "F160W", "WFC3", "HST", True),  # F160W is WFC3/IR
+    ("wfc3_f606w_sci.fits", "F606W", "WFC3", "HST", True),  # F606W is WFC3/UVIS
+]
+
+
+@pytest.mark.parametrize("name,filt,instr,tel,broad", _FILENAME_CASES)
+def test_detect_band_from_filename(name, filt, instr, tel, broad):
+    det = detect_band_from_filename(name)
+    assert det is not None
+    assert (det.filter, det.instrument, det.telescope, det.is_broadband) == (filt, instr, tel, broad)
+    assert det.pivot_um > 0.0
+
+
+def test_filename_fallback_orders_blue_to_red():
+    blue = detect_band_from_filename("f090w.fits")
+    red = detect_band_from_filename("f444w.fits")
+    assert blue is not None and red is not None and blue.pivot_um < red.pivot_um
+
+
+def test_filename_fallback_unknown_instrument_and_filter_still_orders():
+    # A filter in no curated table: instrument stays blank, but a JWST-convention
+    # pivot is still produced so the band can be ordered.
+    det = detect_band_from_filename("mosaic_f128n_sci.fits")  # F128N is in no table
+    assert det is not None and det.instrument == "" and det.telescope == ""
+    assert det.pivot_um == pytest.approx(1.28, abs=0.02)  # JWST 0.01-µm convention
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "weight.fits",  # no filter token at all
+        "drizzle_30mas_v1_0_1.fits",  # version/scale numbers, no F-token
+        "xf090w.fits",  # not standalone (no boundary before the token)
+        "f200w_matched_to_f444w.fits",  # ambiguous: two distinct filter tokens
+    ],
+)
+def test_detect_band_from_filename_returns_none(name):
+    assert detect_band_from_filename(name) is None
 
 
 @pytest.mark.parametrize(

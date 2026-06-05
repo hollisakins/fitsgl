@@ -5,12 +5,13 @@ read each header-only to get its shape + WCS, group bands by the advisory
 ``grid_hash`` (so the scaffold can *tell the user* which bands are co-gridded and
 therefore RGB-combinable), and hand-serialize a starter ``fitsgl.toml``.
 
-Band-aware: each header is run through :func:`bands.detect_band`, so a recognized
-HST/JWST imaging file is named + labelled by its filter (``F444W`` rather than the
-filename), and init auto-picks a default RGB view when ≥3 co-gridded broadbands are
-found (reddest→r, bluest→b). Unrecognized files fall back to filename-derived names
-and a single-band default — so a non-HST/JWST or header-less mosaic is unchanged.
-The toml is the review surface; init is batch-only.
+Band-aware: each header is run through :func:`bands.detect_band` (falling back to
+:func:`bands.detect_band_from_filename` when the header carries no instrument/filter
+keywords), so a recognized HST/JWST imaging file is named + labelled by its filter
+(``F444W`` rather than the filename), and init auto-picks a default RGB view when ≥3
+co-gridded broadbands are found (reddest→r, bluest→b). Files with no detectable
+filter fall back to filename-derived names and a single-band default — so a
+non-HST/JWST mosaic is unchanged. The toml is the review surface; init is batch-only.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from pathlib import Path, PurePath
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from .bands import DetectedBand, detect_band
+from .bands import DetectedBand, detect_band, detect_band_from_filename
 from .config import sanitize_band_name
 from .dataset import grid_hash
 
@@ -157,7 +158,10 @@ def scan_directory(directory: Path) -> InitPlan:
         except Exception as e:  # noqa: BLE001 - lenient scan: skip + record, keep going
             skipped.append((path, str(e)))
             continue
-        scanned.append((path, shape, ghash, detect_band(header)))
+        # Header is authoritative; fall back to the filename when it carries no
+        # instrument/filter keywords (community mosaics often keep only WCS).
+        det = detect_band(header) or detect_band_from_filename(path.name)
+        scanned.append((path, shape, ghash, det))
 
     if not scanned:
         detail = "; ".join(f"{p.name}: {why}" for p, why in skipped)
@@ -171,7 +175,7 @@ def scan_directory(directory: Path) -> InitPlan:
     # those) with an instrument prefix so labels stay clean in the common case.
     instruments_by_filter: dict[str, set[str]] = {}
     for _, _, _, det in scanned:
-        if det is not None:
+        if det is not None and det.instrument:  # blank == filename-only, undisambiguable
             instruments_by_filter.setdefault(det.filter, set()).add(det.instrument)
     contended = {f for f, instrs in instruments_by_filter.items() if len(instrs) > 1}
 
@@ -182,7 +186,7 @@ def scan_directory(directory: Path) -> InitPlan:
     groups: dict[str, list[str]] = {}
     for path, shape, ghash, det in scanned:
         if det is not None:
-            disambiguate = det.filter in contended
+            disambiguate = bool(det.instrument) and det.filter in contended
             label = f"{det.instrument} {det.filter}" if disambiguate else det.filter
             seed = (f"{det.instrument}-{det.filter}" if disambiguate else det.filter).lower()
             name = sanitize_band_name(seed, taken)

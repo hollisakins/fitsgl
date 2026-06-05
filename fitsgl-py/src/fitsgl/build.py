@@ -30,7 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .bands import detect_band
+from .bands import detect_band, detect_band_from_filename
 from .build_pyramid import DEFAULT_SUPERTILE_BLOCKS, build_pyramid
 from .catalog import ingest_catalog
 from .config import DatasetConfig
@@ -153,8 +153,10 @@ def _detect_band_pivot(input_path: Path) -> float | None:
 
     Merges the primary header with the 2D image HDU's (JWST/HST mosaics often carry
     ``FILTER``/``INSTRUME`` in the primary while the science pixels live in an
-    extension) and runs the pure :func:`bands.detect_band`. Lenient: any read/parse
-    failure yields ``None`` (the viewer then orders that band by declaration order).
+    extension) and runs the pure :func:`bands.detect_band`, falling back to the
+    filename when the merged header has no instrument/filter keywords. Lenient: any
+    read/parse failure yields ``None`` (the viewer then orders the band by
+    declaration order).
     """
     try:
         from astropy.io import fits
@@ -169,7 +171,7 @@ def _detect_band_pivot(input_path: Path) -> float | None:
             ]
             if len(two_d) == 1:
                 merged.update(two_d[0].header)
-        det = detect_band(merged)
+        det = detect_band(merged) or detect_band_from_filename(input_path.name)
         return det.pivot_um if det is not None else None
     except Exception:  # noqa: BLE001 - pivot is an optional ordering hint; never fail the build
         return None

@@ -123,17 +123,19 @@ def test_deploy_stub_round_trips_when_uncommented(tmp_path):
 def test_render_toml_emits_label_for_sanitized_name(tmp_path):
     import warnings as w
 
-    _write_band(tmp_path / "f150w.v1.fits", seed=1)  # the '.' in the stem gets sanitized
+    # No filter token in the name (so the filename fallback stays out) -> the '.' in
+    # the stem gets sanitized into the slug, and the original is preserved as a label.
+    _write_band(tmp_path / "mymos.v1.fits", seed=1)
     plan = scan_directory(tmp_path)
     toml_text = render_toml(plan, tmp_path)
-    assert 'name = "f150w_v1"' in toml_text and 'label = "f150w.v1"' in toml_text
+    assert 'name = "mymos_v1"' in toml_text and 'label = "mymos.v1"' in toml_text
 
     toml_path = tmp_path / "fitsgl.toml"
     toml_path.write_text(toml_text)
     with w.catch_warnings(record=True) as rec:
         w.simplefilter("always")
         cfg = load_config(toml_path)
-    assert cfg.bands[0].name == "f150w_v1" and cfg.bands[0].label == "f150w.v1"
+    assert cfg.bands[0].name == "mymos_v1" and cfg.bands[0].label == "mymos.v1"
     assert not any("not URL-safe" in str(r.message) for r in rec)  # the emitted label silences it
 
 
@@ -180,10 +182,34 @@ def test_scan_single_default_when_few_broadbands(tmp_path):
 
 
 def test_scan_falls_back_to_filename_for_unknown_header(tmp_path):
-    _write_band(tmp_path / "myimage.fits", seed=1)  # no band keywords -> undetected
+    _write_band(tmp_path / "myimage.fits", seed=1)  # no keywords, no filter token -> undetected
     plan = scan_directory(tmp_path)
     assert plan.bands[0].name == "myimage" and plan.bands[0].label is None
     assert plan.default_view == {"mode": "single", "band": "myimage"}
+
+
+def test_scan_detects_filter_from_filename_when_header_is_bare(tmp_path):
+    # The motivating real-world case: community mosaics whose science extension keeps
+    # only WCS (no INSTRUME/FILTER), with the filter encoded in the filename. The band
+    # is named/labelled by its filter and a default RGB is still auto-picked.
+    names = ["mosaic_nircam_f090w_uds_30mas_v1_0_1_primer_sci",
+             "mosaic_nircam_f277w_uds_30mas_v1_0_1_primer_sci",
+             "mosaic_nircam_f444w_uds_30mas_v1_0_1_primer_sci"]
+    for i, stem in enumerate(names):
+        _write_band(tmp_path / f"{stem}.fits", seed=i + 1)  # NO header band keywords
+    plan = scan_directory(tmp_path)
+
+    by_name = {b.name: b for b in plan.bands}
+    assert set(by_name) == {"f090w", "f277w", "f444w"}  # clean filter slugs, not the long stems
+    assert by_name["f444w"].label == "F444W"
+    assert plan.default_view == {"mode": "rgb", "r": "f444w", "g": "f277w", "b": "f090w"}
+
+    toml_path = tmp_path / "fitsgl.toml"
+    toml_path.write_text(render_toml(plan, tmp_path))
+    cfg = load_config(toml_path)  # the scaffold must round-trip to valid config
+    assert cfg.viewer.mode == "rgb"
+    assert (cfg.viewer.r, cfg.viewer.g, cfg.viewer.b) == ("f444w", "f277w", "f090w")
+    assert cfg.bands[0].inputs[0].name == f"{names[0]}.fits"  # input path is preserved
 
 
 def test_scan_disambiguates_cross_instrument_collision(tmp_path):

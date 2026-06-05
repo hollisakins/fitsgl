@@ -6,6 +6,12 @@ pivot wavelength for ordering, and whether it is a broadband) — or ``None`` wh
 the header is not a recognized HST/JWST imaging band, so the caller can fall back
 to filename-derived naming.
 
+:func:`detect_band_from_filename` is the lower-confidence companion for the common
+case of a community-built mosaic whose science extension keeps only WCS (no
+``INSTRUME``/``FILTER``): it recovers the same :class:`DetectedBand` from a filter
+token embedded in the *filename* (e.g. ``..._f090w_...``). Callers try the header
+first and fall back to it.
+
 Scope is intentionally narrow for v1: HST (ACS, WFC3/UVIS, WFC3/IR) and JWST
 (NIRCam, NIRISS, MIRI imaging). ``fitsgl init`` uses this to label bands by filter
 (``F444W`` rather than the filename) and to auto-pick a default RGB view; nothing
@@ -267,6 +273,97 @@ def detect_band(header: fits.Header) -> DetectedBand | None:
     pivot = PIVOT_UM.get((lookup_key, filt))
     if pivot is None:
         pivot = _parse_pivot(lookup_key, filt)
+    return DetectedBand(
+        filter=filt,
+        instrument=instrument,
+        telescope=telescope,
+        pivot_um=pivot,
+        is_broadband=_is_broadband(filt),
+    )
+
+
+# --- Filename-based fallback (used only by detect_band_from_filename) ----------
+
+#: Instrument tokens recognized inside a filename (lowercase) -> (telescope,
+#: instrument). Their names are telescope-unique, mirroring _identify's fallback.
+_FILENAME_INSTRUMENTS: dict[str, tuple[str, str]] = {
+    "nircam": ("JWST", "NIRCam"),
+    "niriss": ("JWST", "NIRISS"),
+    "miri": ("JWST", "MIRI"),
+    "acs": ("HST", "ACS"),
+    "wfc3": ("HST", "WFC3"),
+}
+
+#: A standalone filter / instrument token in a filename — bounded by a
+#: non-alphanumeric char or the string edge (so ``_f090w_`` and ``.f090w-clear``
+#: both hit, but ``xf090w`` does not). The filter body mirrors :data:`_FILTER_RE`.
+_FILENAME_FILTER_RE = re.compile(r"(?<![a-z0-9])(f\d{3,4}(?:w2|lp|[wmnx])?)(?![a-z0-9])", re.I)
+_FILENAME_INSTR_RE = re.compile(
+    r"(?<![a-z0-9])(" + "|".join(_FILENAME_INSTRUMENTS) + r")(?![a-z0-9])", re.I
+)
+
+#: (PIVOT_UM lookup key, telescope, instrument), in the preference order used to
+#: adopt an instrument for a filename whose instrument token was absent: the first
+#: table entry holding the filter wins (modern JWST first). Cosmetic only — shared
+#: filters have near-identical pivots, and ordering is all the pivot is used for.
+_PIVOT_KEY_META: tuple[tuple[str, str, str], ...] = (
+    ("NIRCAM", "JWST", "NIRCam"),
+    ("NIRISS", "JWST", "NIRISS"),
+    ("MIRI", "JWST", "MIRI"),
+    ("WFC3/IR", "HST", "WFC3"),
+    ("ACS", "HST", "ACS"),
+    ("WFC3/UVIS", "HST", "WFC3"),
+)
+
+
+def _resolve_filter_only(filt: str) -> tuple[str, str, float]:
+    """``(telescope, instrument, pivot)`` for a filter whose instrument is unknown.
+
+    Adopts the first :data:`_PIVOT_KEY_META` entry whose table holds the filter (its
+    pivot is instrument-independent to the precision ordering needs); a filter in no
+    table keeps the JWST 0.01-µm convention for ordering and a blank instrument.
+    """
+    for lookup_key, telescope, instrument in _PIVOT_KEY_META:
+        pivot = PIVOT_UM.get((lookup_key, filt))
+        if pivot is not None:
+            return telescope, instrument, pivot
+    return "", "", _parse_pivot("NIRCAM", filt)
+
+
+def detect_band_from_filename(filename: str) -> DetectedBand | None:
+    """Best-effort band identity from a *filename* — the fallback when the header
+    carries no instrument/filter keywords.
+
+    Heuristic and lower-confidence than :func:`detect_band`: scans ``filename`` for a
+    single standalone filter token (e.g. ``f090w``) and, if present, one instrument
+    token (e.g. ``nircam``). Returns ``None`` when no — or more than one distinct —
+    filter token is found, so an ambiguous name (a PSF-matched ``f200w_to_f444w``
+    product) safely falls back to plain filename naming.
+
+    With an instrument token the pivot comes from the curated table (WFC3's
+    sub-instrument is recovered by which sub-table holds the filter); without one,
+    :func:`_resolve_filter_only` recovers it from the filter alone.
+    """
+    filts = {m.group(1).upper() for m in _FILENAME_FILTER_RE.finditer(filename)}
+    if len(filts) != 1:
+        return None
+    filt = next(iter(filts))
+
+    instrs = {m.group(1).lower() for m in _FILENAME_INSTR_RE.finditer(filename)}
+    if len(instrs) == 1:
+        telescope, instrument = _FILENAME_INSTRUMENTS[next(iter(instrs))]
+        if instrument == "WFC3":
+            lookup_key = next(
+                (k for k in ("WFC3/IR", "WFC3/UVIS") if (k, filt) in PIVOT_UM), "WFC3/UVIS"
+            )
+        else:
+            lookup_key = instrument.upper()
+        pivot = PIVOT_UM.get((lookup_key, filt))
+        if pivot is None:
+            pivot = _parse_pivot(lookup_key, filt)
+    else:
+        telescope, instrument, pivot = _resolve_filter_only(filt)
+
     return DetectedBand(
         filter=filt,
         instrument=instrument,
