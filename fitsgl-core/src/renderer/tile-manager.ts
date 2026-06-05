@@ -107,6 +107,37 @@ export function targetLevel(zoom: number, maxLevel: number): number {
 }
 
 /**
+ * Choose the pyramid level to DISPLAY this frame, deferring level switches until
+ * interaction settles (the behaviour CARTA gets from debouncing tile requests).
+ *
+ * Block-averaged coarser levels genuinely carry less noise (σ drops by 2× per
+ * level), so switching levels live mid-gesture makes the displayed noise visibly
+ * melt down as the user zooms — jarring. Instead, during an active gesture
+ * (`idle` false) we keep the previously-settled `held` level: the camera
+ * transform just resamples the resident textures (NEAREST), so the noise level
+ * stays put — decimated on zoom-out, blocky on zoom-in — until motion stops. On
+ * settle (`idle` true), with deferral off, or before any level has been held, the
+ * freshly-computed `live` level is adopted (and becomes the new held level), so
+ * the correct resolution loads and crossfades in once.
+ *
+ * The held level is clamped to `[0, maxLevel]` so a value that outlived a change
+ * in pyramid depth can never select a missing geom.
+ */
+export function resolveDisplayLevel(
+  live: number,
+  held: number | null,
+  idle: boolean,
+  defer: boolean,
+  maxLevel: number,
+): { level: number; held: number } {
+  if (defer && !idle && held !== null) {
+    const clamped = Math.max(0, Math.min(held, maxLevel));
+    return { level: clamped, held: clamped };
+  }
+  return { level: live, held: live };
+}
+
+/**
  * Tiles at `level` whose world rectangles intersect the viewport bounds.
  * Returns an empty array if the viewport does not overlap the level's imaged
  * area at all. Tiles are returned in row-major order (y outer, x inner).

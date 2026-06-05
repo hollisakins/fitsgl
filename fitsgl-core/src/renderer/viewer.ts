@@ -72,6 +72,7 @@ import {
   commonResidentLevel,
   fallbackUV,
   finerFallback,
+  resolveDisplayLevel,
   ringTiles,
   targetLevel,
   tileKey,
@@ -208,6 +209,16 @@ export interface FitsViewerOptions {
    * fallback, smoothing zoom-level switches. Default 150; set 0 to disable.
    */
   crossfadeMs?: number;
+  /**
+   * Defer pyramid-level switches until interaction settles (CARTA-style). While
+   * the camera is actively moving, the level showing when the gesture began is
+   * held and the camera just resamples the resident textures; the correct level
+   * loads once motion stops (after the same idle delay that gates prefetch). This
+   * keeps the displayed noise level steady through a zoom instead of visibly
+   * dropping as coarser, block-averaged levels fade in mid-gesture. Default
+   * `true`; set `false` to switch levels live every frame.
+   */
+  deferLevelOnInteraction?: boolean;
   /**
    * Called at the end of every drawn frame with read-only viewer state. Use it
    * to drive a telemetry HUD or a visible-data action. Avoid *unconditionally*
@@ -377,6 +388,11 @@ export class FitsViewer {
    *  it samples exactly the tiles already on screen (cache hits). */
   private lastLevel = 0;
   private lastBounds: WorldBounds | null = null;
+  /** Whether level switches are deferred until the camera settles (option). */
+  private readonly deferLevelSwitch: boolean;
+  /** Level frozen for the duration of the current gesture; null before the first
+   *  frame and whenever a fresh level should be adopted. See `resolveDisplayLevel`. */
+  private heldLevel: number | null = null;
 
   private dragging = false;
   private lastDragX = 0;
@@ -417,6 +433,7 @@ export class FitsViewer {
     this.onCursor = options.onCursor;
     this.hiDpiLevels = options.hiDpiLevels ?? false;
     this.crossfadeMs = Math.max(0, options.crossfadeMs ?? DEFAULT_CROSSFADE_MS);
+    this.deferLevelSwitch = options.deferLevelOnInteraction ?? true;
 
     // North-up: parse the z=0 WCS (world pixels are native = z=0 pixels) and
     // precompute the orientation at the image centre once — it is a fixed rigid
@@ -1197,7 +1214,20 @@ export class FitsViewer {
     // device-pixel crispness. Tile selection is grid-only, so it is identical
     // for every band and computed once.
     const selectionZoom = this.hiDpiLevels ? this.camera.zoom : this.camera.zoom / this.dpr;
-    const level = targetLevel(selectionZoom, this.maxLevel);
+    // Defer level switches mid-gesture (see `resolveDisplayLevel`): while the
+    // camera is moving the held level is kept and the transform resamples the
+    // resident textures, so the displayed noise stays steady; the live level is
+    // adopted once `cameraIdle` flips true (same idle delay that gates prefetch).
+    const liveLevel = targetLevel(selectionZoom, this.maxLevel);
+    const resolved = resolveDisplayLevel(
+      liveLevel,
+      this.heldLevel,
+      this.cameraIdle,
+      this.deferLevelSwitch,
+      this.maxLevel,
+    );
+    const level = resolved.level;
+    this.heldLevel = resolved.held;
     // Remember this frame's selection so `autoStretch` samples exactly what drew.
     this.lastLevel = level;
     this.lastBounds = bounds;

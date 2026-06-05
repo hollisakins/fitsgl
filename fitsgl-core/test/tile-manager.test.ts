@@ -7,6 +7,7 @@ import {
   coarserFallback,
   commonResidentLevel,
   finerFallback,
+  resolveDisplayLevel,
   selectEvictions,
   buildLevelGeoms,
   tileWorldRect,
@@ -44,6 +45,33 @@ describe('targetLevel', () => {
     expect(targetLevel(10, 4)).toBe(0);
     expect(targetLevel(0.001, 4)).toBe(4);
     expect(targetLevel(0, 4)).toBe(4);
+  });
+});
+
+describe('resolveDisplayLevel (defer level switch until settle)', () => {
+  it('holds the previous level while the camera moves (deferral on)', () => {
+    // Mid zoom-out: live wants a coarser level (2), but the gesture is active and
+    // level 0 was showing -> keep 0 so the resident textures just resample.
+    expect(resolveDisplayLevel(2, 0, false, true, 4)).toEqual({ level: 0, held: 0 });
+    // Mid zoom-in: live wants finer (0), held coarse 2 -> keep 2 (blocky upscale).
+    expect(resolveDisplayLevel(0, 2, false, true, 4)).toEqual({ level: 2, held: 2 });
+  });
+
+  it('adopts the live level once the camera settles', () => {
+    expect(resolveDisplayLevel(2, 0, true, true, 4)).toEqual({ level: 2, held: 2 });
+  });
+
+  it('adopts the live level on the first frame (nothing held yet)', () => {
+    expect(resolveDisplayLevel(3, null, false, true, 4)).toEqual({ level: 3, held: 3 });
+  });
+
+  it('switches live every frame when deferral is disabled', () => {
+    expect(resolveDisplayLevel(2, 0, false, false, 4)).toEqual({ level: 2, held: 2 });
+  });
+
+  it('clamps a stale held level to [0, maxLevel] (e.g. after pyramid depth changed)', () => {
+    expect(resolveDisplayLevel(0, 9, false, true, 4)).toEqual({ level: 4, held: 4 });
+    expect(resolveDisplayLevel(0, -3, false, true, 4)).toEqual({ level: 0, held: 0 });
   });
 });
 
