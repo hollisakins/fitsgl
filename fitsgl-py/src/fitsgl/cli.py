@@ -63,6 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the per-level read-back verification (a second full decode per "
         "level); use for very large mosaics where memory is the constraint.",
     )
+    pb.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Rebuild every band from scratch. By default a band already present in "
+        "the output (a complete pyramid) is reused as-is and only the viewer + "
+        "fitsgl.json are refreshed; pass this to force a full rebuild — e.g. after "
+        "changing a [build] parameter (tile_size, quantize_level, supertile_blocks).",
+    )
     site = pb.add_mutually_exclusive_group()
     site.add_argument(
         "--no-site",
@@ -175,6 +183,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             processes=args.processes,
             verify=not args.no_verify,
             with_site=not args.no_site,
+            overwrite=args.overwrite,
             on_progress=lambda m: print(m, flush=True),
         )
     except StopAndAsk as e:
@@ -188,7 +197,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
     print(f"built dataset {config.name!r} -> {result.dataset_dir}")
     for band in config.bands:
         levels = result.band_levels.get(band.name, 0)
-        print(f"  {band.name}: z=0..{levels}")
+        tag = "  (reused)" if band.name in result.reused_bands else ""
+        print(f"  {band.name}: z=0..{levels}{tag}")
+    if result.reused_bands:
+        print(
+            f"  reused {len(result.reused_bands)}/{n_bands} band(s) from a prior build "
+            "(--overwrite to rebuild)"
+        )
     view = config.viewer
     default = (
         f"rgb {view.r}/{view.g}/{view.b}"

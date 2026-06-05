@@ -89,7 +89,7 @@ def test_build_dataset_end_to_end(tmp_path):
     for band in ("f150w", "f277w", "f444w"):
         assert (ds / band / "manifest.json").is_file()
     assert (ds / "catalog.csv").is_file()
-    assert not (tmp_path / "dist" / ".demo.building").exists()  # temp swapped away
+    assert not list(ds.glob(".*.building"))  # no per-band staging left behind
 
     cfg = json.loads((ds / "fitsgl.json").read_text())
     assert cfg["schemaVersion"] == 1
@@ -309,3 +309,160 @@ def test_build_single_band_default_and_rerun(tmp_path):
     # No [viewer] -> single-band default on the first band.
     assert cfg["defaultView"] == {"mode": "single", "band": "img"}
     assert "catalog" not in cfg["dataset"]
+
+
+# ---- resume / --overwrite ---------------------------------------------------
+
+
+def _band_inode(ds, band: str) -> int:
+    """The inode of a band's z=0 level file — stable across a reuse (hardlink),
+    new after a real rebuild (a freshly-written file)."""
+    m = read_manifest(ds / band / "manifest.json")
+    return (ds / band / m.levels[0].filename).stat().st_ino
+
+
+def test_rerun_reuses_existing_band_without_rebuilding(tmp_path):
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    out_root = tmp_path / "dist"
+
+    first = build_dataset(config, out_root)
+    assert first.reused_bands == ()  # nothing to reuse on the first build
+    ino = _band_inode(first.dataset_dir, "img")
+
+    second = build_dataset(config, out_root)  # default: skip already-built bands
+    assert second.reused_bands == ("img",)
+    # The level file was hardlinked, not recompressed -> same inode survives the swap.
+    assert _band_inode(second.dataset_dir, "img") == ino
+    assert (second.dataset_dir / "fitsgl.json").is_file()  # metadata still re-emitted
+
+
+def test_overwrite_forces_full_rebuild(tmp_path):
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    out_root = tmp_path / "dist"
+
+    first = build_dataset(config, out_root)
+    ino = _band_inode(first.dataset_dir, "img")
+
+    second = build_dataset(config, out_root, overwrite=True)
+    assert second.reused_bands == ()  # --overwrite rebuilds everything
+    assert _band_inode(second.dataset_dir, "img") != ino  # freshly written file
+
+
+def test_rerun_rebuilds_band_with_missing_level_file(tmp_path):
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    out_root = tmp_path / "dist"
+
+    first = build_dataset(config, out_root)
+    m = read_manifest(first.dataset_dir / "img" / "manifest.json")
+    # A referenced level file went missing -> the band is no longer a valid cache.
+    (first.dataset_dir / "img" / m.levels[0].filename).unlink()
+
+    second = build_dataset(config, out_root)
+    assert second.reused_bands == ()  # cache invalidated -> rebuilt
+    assert (second.dataset_dir / "img" / m.levels[0].filename).is_file()  # restored
+
+
+def test_reused_band_keeps_its_stats(tmp_path):
+    _write_band(tmp_path, "img", 1)
+    config = load_config(_toml(tmp_path, [("img", "img.fits")]))
+    out_root = tmp_path / "dist"
+
+    first = build_dataset(config, out_root, with_site=False)
+    stats_before = json.loads((first.dataset_dir / "fitsgl.json").read_text())["dataset"]["bands"][0]["stats"]
+
+    second = build_dataset(config, out_root, with_site=False)
+    assert second.reused_bands == ("img",)
+    stats_after = json.loads((second.dataset_dir / "fitsgl.json").read_text())["dataset"]["bands"][0]["stats"]
+    # Carried over verbatim from the prior build — no native-level re-decode.
+    assert stats_after == stats_before
+    assert "histogram" in stats_after and "trilogy" in stats_after
+
+
+def test_partial_build_resumes_unbuilt_band(tmp_path):
+    # Two bands; pre-build only the first, then run the full build: the first is
+    # reused, the second is built fresh.
+    _write_band(tmp_path, "a", 1)
+    _write_band(tmp_path, "b", 2)
+    config = load_config(_toml(tmp_path, [("a", "a.fits"), ("b", "b.fits")]))
+    out_root = tmp_path / "dist"
+
+    single = load_config(_toml(tmp_path, [("a", "a.fits")]))
+    pre = build_dataset(single, out_root, with_site=False)
+    ino_a = _band_inode(pre.dataset_dir, "a")
+
+    result = build_dataset(config, out_root, with_site=False)
+    assert result.reused_bands == ("a",)
+    assert _band_inode(result.dataset_dir, "a") == ino_a  # band a reused
+    assert (result.dataset_dir / "b" / "manifest.json").is_file()  # band b built
+    cfg = json.loads((result.dataset_dir / "fitsgl.json").read_text())
+    assert [b["name"] for b in cfg["dataset"]["bands"]] == ["a", "b"]
+
+
+def test_interrupted_build_keeps_completed_bands(tmp_path, monkeypatch):
+    # The motivating case: cancel a build partway through, then resume. A band that
+    # finished before the interrupt must survive on disk so the re-run skips it.
+    import fitsgl.build as build_mod
+
+    _write_band(tmp_path, "a", 1)
+    _write_band(tmp_path, "b", 2)
+    config = load_config(_toml(tmp_path, [("a", "a.fits"), ("b", "b.fits")]))
+    out_root = tmp_path / "dist"
+
+    real_build_pyramid = build_mod.build_pyramid
+
+    def flaky(inputs, **kw):  # simulate a Ctrl-C while the second band compresses
+        from pathlib import Path
+
+        if Path(kw["output_dir"]).name == ".b.building":
+            raise KeyboardInterrupt
+        return real_build_pyramid(inputs, **kw)
+
+    monkeypatch.setattr(build_mod, "build_pyramid", flaky)
+    with pytest.raises(KeyboardInterrupt):
+        build_dataset(config, out_root, with_site=False)
+
+    ds = out_root / "demo"
+    # Band a finished and was promoted -> durable; band b and the dataset config never landed.
+    assert (ds / "a" / "manifest.json").is_file()
+    assert not (ds / "b" / "manifest.json").exists()
+    assert not (ds / "fitsgl.json").exists()
+
+    # Resume with a working builder: a is reused, b is built, the dataset completes.
+    monkeypatch.setattr(build_mod, "build_pyramid", real_build_pyramid)
+    result = build_dataset(config, out_root, with_site=False)
+    assert result.reused_bands == ("a",)
+    assert (ds / "b" / "manifest.json").is_file()
+    assert (ds / "fitsgl.json").is_file()
+    assert not list(ds.glob(".*.building"))  # staging swept on the resume
+
+
+def test_removed_band_is_pruned_on_rebuild(tmp_path):
+    # Dropping a band from the config removes its dir on the next build (the old
+    # whole-dataset swap did this implicitly; in-place builds prune explicitly).
+    _write_band(tmp_path, "a", 1)
+    _write_band(tmp_path, "b", 2)
+    out_root = tmp_path / "dist"
+    build_dataset(load_config(_toml(tmp_path, [("a", "a.fits"), ("b", "b.fits")])), out_root, with_site=False)
+    assert (out_root / "demo" / "b" / "manifest.json").is_file()
+
+    result = build_dataset(load_config(_toml(tmp_path, [("a", "a.fits")])), out_root, with_site=False)
+    assert result.reused_bands == ("a",)
+    assert not (out_root / "demo" / "b").exists()  # orphaned band pruned
+    cfg = json.loads((out_root / "demo" / "fitsgl.json").read_text())
+    assert [b["name"] for b in cfg["dataset"]["bands"]] == ["a"]
+
+
+def test_overwrite_cli_flag_threads_through(tmp_path):
+    from fitsgl.cli import main
+
+    _write_band(tmp_path, "img", 1)
+    toml = _toml(tmp_path, [("img", "img.fits")])
+    out = tmp_path / "dist"
+    assert main(["build", "-c", str(toml), "-o", str(out)]) == 0
+    ino = _band_inode(out / "demo", "img")
+    # Re-run with --overwrite: the band is rebuilt (new inode), not reused.
+    assert main(["build", "-c", str(toml), "-o", str(out), "--overwrite"]) == 0
+    assert _band_inode(out / "demo", "img") != ino
