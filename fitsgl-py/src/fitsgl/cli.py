@@ -618,8 +618,10 @@ def _cmd_deploy_workspace(args: argparse.Namespace) -> int:
             return 1
 
     n = len(selected)
-    succeeded: list[tuple[FieldRef, str]] = []  # fields that deployed without error
-    failures: list[tuple[str, str]] = []
+    uploaded: list[tuple[FieldRef, str]] = []  # fields whose bytes uploaded (verify aside)
+    aborted: list[str] = []
+    upload_failed: list[tuple[str, str]] = []  # DeployError on a field (or the root)
+    verify_failed: list[str] = []  # uploaded fine, but the live post-deploy verify failed
     for i, (ref, dsname) in enumerate(selected, 1):
         dc = field_deploy_config(ws, ref, dsname)
         print(f"\n[{i}/{n}] field {dsname} -> {dc.public_url}", flush=True)
@@ -640,35 +642,44 @@ def _cmd_deploy_workspace(args: argparse.Namespace) -> int:
             )
         except DeployError as e:
             print(f"  fitsgl deploy: {dsname}: {e}", file=sys.stderr)
-            failures.append((dsname, str(e)))
+            upload_failed.append((dsname, str(e)))
             continue
         if result.aborted:
             print(f"  {dsname}: aborted (declined)")
+            aborted.append(dsname)
             continue
-        # A field counts as cleanly deployed only if its post-deploy verify passed
-        # (or was skipped) — a verify failure must keep it out of the collection card
-        # set + the "deployed" count, not just be noted.
-        if result.verify_report is not None and not result.verify_report.ok():
-            failures.append((dsname, "post-deploy verify reported failures"))
-        else:
-            succeeded.append((ref, dsname))
+        # The bytes are in the bucket. Verify is a separate, environment-dependent
+        # check of the LIVE CDN (Range/MIME/the .fits.fz Cache Rule); surface its
+        # report — print it in full on any failure/warning so the cause is visible
+        # (this is what the single-dataset path does), a one-liner when clean.
+        uploaded.append((ref, dsname))
+        rep = result.verify_report
+        if rep is not None:
+            if rep.failures or rep.warnings:
+                print(format_report(rep))
+            else:
+                print(f"  ✓ verify passed ({len(rep.checks)} checks)")
+            if not rep.ok():
+                verify_failed.append(dsname)
 
-    # Collection landing page: refresh + deploy ONLY on a fully clean full deploy. A
-    # subset deploy leaves it alone (so it can't drop a field that wasn't rebuilt
-    # locally); a dry-run only previews. We refresh from `succeeded` (DP6/P0-6), but
-    # ONLY when every field landed cleanly — otherwise a transient failure would PUT a
-    # shrunken/empty collection.json over the live, populated landing page, dropping
-    # fields whose tiles are still served. On any failure we leave the root untouched.
+    # Collection landing page: refresh + deploy on a FULL deploy where every selected
+    # field's bytes UPLOADED (no upload error, none declined). Gated on upload, NOT
+    # verify: a verify failure means the bytes are in the bucket but the live CDN check
+    # failed — a setup item (Cache Rule / custom-domain) that affects the landing page
+    # too, reported + failing the command, but it must not block publishing the index.
+    # Still guarded so a half-failed run never clobbers the live collection.json with a
+    # shrunken one. A subset deploy leaves the root alone; a dry-run only previews.
+    all_uploaded = len(uploaded) == n
     if args.field is not None:
         print("\nnote: subset deploy — the collection landing page was not refreshed "
               "(run a full `fitsgl deploy -w ...`, or `fitsgl index`, to update it)")
     elif args.dry_run:
         print("\ndry run: would also emit + deploy the collection landing page")
-    elif succeeded and not failures:
+    elif all_uploaded:
         coll = ws.collection
         cname = coll.name if coll is not None else ws.name
         ctitle = coll.title if coll is not None else ws.title
-        field_specs = [(field_prefix(ref, dsname), args.out / dsname, ref.title) for ref, dsname in succeeded]
+        field_specs = [(field_prefix(ref, dsname), args.out / dsname, ref.title) for ref, dsname in uploaded]
         try:
             emit_collection(
                 args.out, name=cname, title=ctitle, field_specs=field_specs,
@@ -678,20 +689,34 @@ def _cmd_deploy_workspace(args: argparse.Namespace) -> int:
             deploy_collection_root(args.out, root_config, target, purger=purger, max_workers=concurrency)
         except (DeployError, FileNotFoundError) as e:
             print(f"fitsgl deploy: collection root: {e}", file=sys.stderr)
-            failures.append(("<collection>", str(e)))
+            upload_failed.append(("<collection>", str(e)))
     else:
-        print("\nnote: some fields failed/declined — left the collection landing page unchanged "
-              "(re-run a full `fitsgl deploy -w ...` once all fields succeed, or run `fitsgl index`)")
+        print("\nnote: some fields did not upload (failed/declined) — left the collection landing "
+              "page unchanged (re-run a full `fitsgl deploy -w ...` once all fields upload, or `fitsgl index`)")
 
-    verb = "would deploy" if args.dry_run else "deployed"
-    count = len(selected) if args.dry_run else len(succeeded)
+    verb = "would deploy" if args.dry_run else "uploaded"
+    count = len(selected) if args.dry_run else len(uploaded)
+    extra = []
+    if upload_failed:
+        extra.append(f"{len(upload_failed)} failed")
+    if verify_failed:
+        extra.append(f"{len(verify_failed)} verify-failed")
+    if aborted:
+        extra.append(f"{len(aborted)} declined")
     print(
         f"\nworkspace {'dry run' if args.dry_run else 'deploy'} ({ws.deploy.bucket!r}): {count}/{n} field(s) {verb}"
-        + (f", {len(failures)} with errors" if failures else "")
+        + (" — " + ", ".join(extra) if extra else "")
     )
-    for dsname, msg in failures:
+    for dsname, msg in upload_failed:
         print(f"  {dsname}: ERROR — {msg}")
-    return 1 if failures else 0
+    if verify_failed:
+        print(f"  verify failed (uploaded, but the live check did not pass): {', '.join(verify_failed)}")
+        print(
+            "  → the bytes are deployed; this is usually the one-time `.fits.fz` Cache Rule / "
+            "custom-domain setup. Re-run `fitsgl verify <public_url>` for the per-check detail "
+            "(see docs/r2-setup.md)."
+        )
+    return 1 if (upload_failed or verify_failed) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
