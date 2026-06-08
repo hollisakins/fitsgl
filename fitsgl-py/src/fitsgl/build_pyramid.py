@@ -27,7 +27,6 @@ from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
-from astropy.nddata import block_reduce
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 
@@ -89,22 +88,48 @@ def n_levels(shape: tuple[int, int], tile_size: int = FPACK_TILE_SIZE) -> int:
     return int(math.ceil(math.log2(maxdim / tile_size)))
 
 
+#: Target pixels per native row-strip when block-averaging a level. ``np.nanmean``
+#: copies its input (``_replace_nan``), so reducing a whole multi-GB level at once
+#: allocates ~2× the array — the dominant peak that OOMs a large mosaic (a single
+#: COSMOS-scale level's nanmean copy is ~30 GiB, ×N parallel level workers). Reducing
+#: in factor-aligned strips bounds that transient to ~this many float32 px (~256 MB)
+#: per worker, regardless of mosaic size, with a bit-identical result.
+_DOWNSAMPLE_STRIP_PIXELS = 64_000_000
+
+
 def _downsample(data: np.ndarray, factor: int) -> np.ndarray:
     """Block-average by an integer factor, ignoring NaNs.
 
-    ``block_reduce`` trims any non-divisible remainder from the end of each
-    axis, which keeps the corner-origin WCS valid. Fully-NaN blocks reduce to
-    NaN (the expected RuntimeWarning is suppressed).
+    Trims any non-divisible remainder from the end of each axis (keeping the
+    corner-origin WCS valid) and reduces fully-NaN blocks to NaN — identical to
+    ``block_reduce(data, factor, func=np.nanmean)``, but computed in factor-aligned
+    row-strips so a multi-GB level never materializes a full-image ``np.nanmean``
+    copy (the allocation that OOMs a large mosaic). Each output pixel's block lies
+    wholly within one strip, so the strided result is bit-identical to reducing the
+    whole array at once. The expected all-NaN-block RuntimeWarning is suppressed.
     """
     if factor == 1:
         # No copy: pass the (copy-on-write memmap) native array straight through.
         # Nothing downstream mutates it, and avoiding a full copy matters at z=0,
         # where the array can be many GB.
         return np.asarray(data, dtype=np.float32)
+    h, w = data.shape
+    out_h, out_w = h // factor, w // factor  # trim the non-divisible remainder
+    out = np.empty((out_h, out_w), dtype=np.float32)
+    if out_h == 0 or out_w == 0:
+        return out
+    cols = out_w * factor  # trimmed native width
+    # Output rows per strip, sized so the materialized native strip (rows*factor ×
+    # cols) stays near the target pixel budget; at least one output row.
+    rows_per_strip = max(1, _DOWNSAMPLE_STRIP_PIXELS // (factor * cols))
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        reduced = block_reduce(data, factor, func=np.nanmean)
-    return reduced.astype(np.float32)
+        warnings.simplefilter("ignore", category=RuntimeWarning)  # all-NaN block -> NaN
+        for r0 in range(0, out_h, rows_per_strip):
+            r1 = min(r0 + rows_per_strip, out_h)
+            strip = np.asarray(data[r0 * factor : r1 * factor, :cols], dtype=np.float32)
+            blocks = strip.reshape(r1 - r0, factor, out_w, factor)
+            out[r0:r1] = np.nanmean(blocks, axis=(1, 3))
+    return out
 
 
 def _scale_wcs(wcs: WCS, factor: int) -> WCS:

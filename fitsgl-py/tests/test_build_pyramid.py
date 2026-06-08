@@ -278,6 +278,36 @@ def test_downsample_preserves_all_nan_block():
     assert np.isnan(r[0, 0])
 
 
+@pytest.mark.parametrize("factor", [2, 3, 4])
+def test_downsample_matches_block_reduce(factor):
+    """The streamed reduction must be bit-identical to astropy's whole-array
+    block_reduce(np.nanmean) — including the trim and partial-NaN blocks."""
+    from astropy.nddata import block_reduce
+
+    rng = np.random.default_rng(7)
+    a = rng.normal(size=(53, 47)).astype(np.float32)  # non-divisible by any factor
+    a[3:5, 10:12] = np.nan  # a partial-NaN block
+    a[20:24, 20:24] = np.nan  # a fully-NaN block (factor 2/4)
+    expected = block_reduce(a, factor, func=np.nanmean).astype(np.float32)
+    got = _downsample(a, factor)
+    np.testing.assert_array_equal(got, expected)  # exact, NaN positions included
+
+
+def test_downsample_streaming_matches_single_strip(monkeypatch):
+    """Forcing many tiny strips (a low pixel budget) yields the same result as one
+    strip — exercises the chunk-boundary logic that bounds large-mosaic memory."""
+    rng = np.random.default_rng(11)
+    a = rng.normal(size=(64, 40)).astype(np.float32)
+    a[::7] = np.nan
+    full = _downsample(a, 2)  # default huge budget → one strip
+    import importlib
+
+    mod = importlib.import_module("fitsgl.build_pyramid")  # the module (not the re-exported fn)
+    monkeypatch.setattr(mod, "_DOWNSAMPLE_STRIP_PIXELS", 1)  # one output row/strip
+    chunked = _downsample(a, 2)
+    np.testing.assert_array_equal(chunked, full)
+
+
 # --------------------------------------------------------------------------- #
 # RGB registration prerequisite (M4, roadmap Risk #7): same native shape ->
 # identical per-level tiling, so three same-grid bands composite under one
