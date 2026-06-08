@@ -19,6 +19,7 @@ from typing import Callable
 from .build import build_dataset, write_site
 from .build_pyramid import StopAndAsk
 from .config import load_config
+from .demo import DEMO_RGB, build_demo
 from .deploy import CloudflarePurge, DeployError, R2Target, deploy_dataset
 from .env_file import load_env_file
 from .deploy_plan import DeployDiff
@@ -86,6 +87,40 @@ def build_parser() -> argparse.ArgumentParser:
         "refresh after rebuilding the viewer app (other build flags are ignored).",
     )
 
+    pdm = sub.add_parser(
+        "demo",
+        help="Generate a synthetic dataset, build it (data + viewer), and optionally serve it.",
+    )
+    pdm.add_argument(
+        "-o",
+        "--out",
+        type=Path,
+        default=Path("dist"),
+        help="Output root; the dataset is written to <out>/<name>/ (default: ./dist).",
+    )
+    pdm.add_argument("--name", default="demo", help="Dataset name = output subdirectory (default: demo).")
+    pdm.add_argument(
+        "--size", type=int, default=512, help="Square mosaic edge length in pixels (default: 512)."
+    )
+    pdm.add_argument("--no-catalog", action="store_true", help="Skip the overlay marker catalog.")
+    pdm.add_argument(
+        "--serve",
+        action="store_true",
+        help="Serve the dataset over HTTP once it is built (blocks until Ctrl-C).",
+    )
+    pdm.add_argument(
+        "-p", "--port", type=int, default=8000, help="Port for --serve (default 8000; 0 = pick a free port)."
+    )
+    pdm.add_argument(
+        "--processes",
+        type=int,
+        default=None,
+        help="Worker processes for level building (default: auto, one per level capped at cpu count).",
+    )
+    pdm.add_argument(
+        "--no-verify", action="store_true", help="Skip the per-level read-back verification."
+    )
+
     ps = sub.add_parser("serve", help="Serve a built dataset directory over HTTP with byte-range support.")
     ps.add_argument("dataset_dir", type=Path, help="Dataset directory to serve (e.g. dist/<name>).")
     ps.add_argument("-p", "--port", type=int, default=8000, help="Port (default 8000; 0 = pick a free port).")
@@ -150,6 +185,42 @@ def _cmd_init(args: argparse.Namespace) -> int:
     else:
         print(f"  default view: single ({dv.get('band', plan.bands[0].name)})")
     print(f"wrote {path} — review it (tweak [viewer], add a catalog), then run `fitsgl build`")
+    return 0
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    if args.size < 1:
+        print("fitsgl demo: --size must be >= 1", file=sys.stderr)
+        return 2
+    if args.processes is not None and args.processes < 1:
+        print("fitsgl demo: --processes must be >= 1", file=sys.stderr)
+        return 2
+    try:
+        result = build_demo(
+            args.out,
+            name=args.name,
+            size=args.size,
+            with_catalog=not args.no_catalog,
+            processes=args.processes,
+            verify=not args.no_verify,
+            on_progress=lambda m: print(m, flush=True),
+        )
+    except StopAndAsk as e:
+        print(f"fitsgl demo: STOP: {e}", file=sys.stderr)
+        return 3
+    except (FileNotFoundError, ValueError) as e:
+        print(f"fitsgl demo: {e}", file=sys.stderr)
+        return 2
+
+    print(f"built demo dataset {args.name!r} -> {result.dataset_dir}")
+    print(
+        f"  {len(result.band_levels)} bands, default view: rgb trilogy "
+        f"({DEMO_RGB['r']}/{DEMO_RGB['g']}/{DEMO_RGB['b']})"
+    )
+    print(f"  config: {result.config_path}")
+    if args.serve:
+        return serve(result.dataset_dir, port=args.port)
+    print(f"  preview it: fitsgl serve {result.dataset_dir}  (then open the printed URL)")
     return 0
 
 
@@ -345,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_init(args)
     if args.command == "build":
         return _cmd_build(args)
+    if args.command == "demo":
+        return _cmd_demo(args)
     if args.command == "serve":
         return _cmd_serve(args)
     if args.command == "verify":

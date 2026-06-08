@@ -20,7 +20,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties } from 'react';
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+} from 'react';
 
 import { FitsViewer } from './index.js';
 import type { FitsViewerCore, FitsViewerHandle } from './index.js';
@@ -325,7 +329,180 @@ function weightSwatch(w: BandWeight): string {
   return `rgb(${c(w[0])},${c(w[1])},${c(w[2])})`;
 }
 
-const round2 = (x: number): number => Math.round(x * 100) / 100;
+/** Clamp a float weight to [0,1]; non-finite collapses to 0. */
+const clamp01 = (v: number): number => (Number.isFinite(v) ? (v < 0 ? 0 : v > 1 ? 1 : v) : 0);
+/** A [0,1] weight as its displayed integer percent 0..100 (tolerant of un-snapped Rainbow values). */
+const pctOf = (v: number): number => Math.round(clamp01(v) * 100);
+/** Snap a raw float to the 1% grid so the displayed integer percent is always exact. */
+const snap01 = (v: number): number => Math.round(clamp01(v) * 100) / 100;
+
+/**
+ * `Knob` — a compact audio-plugin-style rotary control for a [0,1] weight.
+ *
+ * Vertical drag (up = increase) over ~170px spans the full range; an SVG 270°
+ * gauge arc (gap at the bottom) fills clockwise in the channel color with a
+ * pointer notch at the current angle, and the integer percent (0..100) sits in
+ * the center. Drag and keys snap to 1% so the shown integer is exact;
+ * externally-set continuous values (e.g. Rainbow) still render via `Math.round`
+ * and fill the arc proportionally. Fully controlled — no internal value state —
+ * so an external write (Rainbow) is reflected immediately and exactly.
+ */
+function Knob({
+  value,
+  color,
+  label,
+  onChange,
+}: {
+  value: number;
+  color: string;
+  label: string;
+  onChange: (next: number) => void;
+}): JSX.Element {
+  const SIZE = 30;
+  const STROKE = 3.5;
+  const RADIUS = (SIZE - STROKE) / 2;
+  const CENTER = SIZE / 2;
+  const START_DEG = 225; // lower-left, measured clockwise from 12 o'clock
+  const SWEEP_DEG = 270; // 90° dead-zone gap at the bottom
+  const TRAVEL_PX = 170; // vertical px spanning the full 0..1 range
+  const STEP = 0.01;
+
+  // Drag origin: start clientY + start value + last emitted snapped value.
+  const drag = useRef<{ y: number; v: number; last: number } | null>(null);
+
+  const frac = clamp01(value); // arc fill fraction, tolerant of un-snapped input
+  const percent = pctOf(value);
+
+  const polar = useCallback(
+    (deg: number): [number, number] => {
+      const a = ((deg - 90) * Math.PI) / 180;
+      return [CENTER + RADIUS * Math.cos(a), CENTER + RADIUS * Math.sin(a)];
+    },
+    [CENTER, RADIUS],
+  );
+
+  const arcPath = useCallback(
+    (f: number): string => {
+      const span = SWEEP_DEG * Math.max(f, 0.0001);
+      const [x0, y0] = polar(START_DEG);
+      const [x1, y1] = polar(START_DEG + span);
+      const large = span > 180 ? 1 : 0;
+      return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${RADIUS} ${RADIUS} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+    },
+    [polar, RADIUS],
+  );
+
+  const trackPath = arcPath(1);
+  const fillPath = arcPath(frac);
+  const [nx, ny] = polar(START_DEG + SWEEP_DEG * frac);
+
+  // Emit a raw float, snapped to 1%; dedupe within a drag to cut React churn.
+  const emit = useCallback(
+    (raw: number): void => {
+      const next = snap01(raw);
+      const d = drag.current;
+      if (d !== null) {
+        if (next === d.last) return;
+        d.last = next;
+      }
+      onChange(next);
+    },
+    [onChange],
+  );
+
+  const onPointerDown = useCallback(
+    (e: ReactPointerEvent<SVGSVGElement>): void => {
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      e.currentTarget.focus(); // leave it keyboard-focused for immediate Arrow nudging
+      drag.current = { y: e.clientY, v: clamp01(value), last: snap01(value) };
+    },
+    [value],
+  );
+
+  const onPointerMove = useCallback(
+    (e: ReactPointerEvent<SVGSVGElement>): void => {
+      const d = drag.current;
+      if (d === null) return;
+      const dy = d.y - e.clientY; // up is positive
+      const gain = e.shiftKey ? TRAVEL_PX * 4 : TRAVEL_PX; // Shift = 4x fine trim
+      emit(d.v + dy / gain);
+    },
+    [emit],
+  );
+
+  const endDrag = useCallback((e: ReactPointerEvent<SVGSVGElement>): void => {
+    drag.current = null;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  }, []);
+
+  const onKeyDown = useCallback(
+    (e: ReactKeyboardEvent<SVGSVGElement>): void => {
+      const coarse = e.shiftKey ? 0.05 : STEP;
+      let next: number;
+      switch (e.key) {
+        case 'ArrowUp':
+        case 'ArrowRight':
+          next = value + coarse;
+          break;
+        case 'ArrowDown':
+        case 'ArrowLeft':
+          next = value - coarse;
+          break;
+        case 'PageUp':
+          next = value + 0.1;
+          break;
+        case 'PageDown':
+          next = value - 0.1;
+          break;
+        case 'Home':
+          next = 0;
+          break;
+        case 'End':
+          next = 1;
+          break;
+        default:
+          return;
+      }
+      e.preventDefault();
+      onChange(snap01(next));
+    },
+    [value, onChange],
+  );
+
+  return (
+    <svg
+      className="fgl-knob"
+      width={SIZE}
+      height={SIZE}
+      viewBox={`0 0 ${SIZE} ${SIZE}`}
+      role="slider"
+      tabIndex={0}
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={percent}
+      aria-valuetext={`${percent}%`}
+      style={{ '--knob-color': color } as CSSProperties}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onKeyDown={onKeyDown}
+    >
+      <circle className="fgl-knob-well" cx={CENTER} cy={CENTER} r={RADIUS} />
+      <path className="fgl-knob-track" d={trackPath} strokeWidth={STROKE} />
+      {frac > 0 ? <path className="fgl-knob-fill" d={fillPath} strokeWidth={STROKE} /> : null}
+      <circle className="fgl-knob-notch" cx={nx.toFixed(2)} cy={ny.toFixed(2)} r={1.6} />
+      <text className="fgl-knob-num" x={CENTER} y={CENTER} dominantBaseline="central" textAnchor="middle">
+        {percent}
+      </text>
+    </svg>
+  );
+}
 
 /**
  * Faithful-trilogy weight matrix: every co-gridded band in the active group, each
@@ -362,7 +539,7 @@ function TrilogyWeightMatrix({
   };
 
   const editWeight = (name: string, ch: 0 | 1 | 2, value: number): void => {
-    const v = Number.isFinite(value) ? Math.max(0, value) : 0;
+    const v = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
     const cur = trilogyComposite(state);
     const idx = cur.findIndex((e) => e.band === name);
     const prev = idx >= 0 ? cur[idx].weight : state.weights[name] ?? [0, 0, 0];
@@ -405,15 +582,12 @@ function TrilogyWeightMatrix({
               {b.label ?? b.name}
             </span>
             {([0, 1, 2] as const).map((ch) => (
-              <input
+              <Knob
                 key={ch}
-                type="number"
-                className="fgl-winp"
-                min={0}
-                step={0.05}
-                value={round2(w[ch])}
-                aria-label={`${b.label ?? b.name} ${'RGB'[ch]} weight`}
-                onChange={(e) => editWeight(b.name, ch, Number(e.target.value))}
+                value={w[ch]}
+                color={CH_COLOR[(['r', 'g', 'b'] as const)[ch]]}
+                label={`${b.label ?? b.name} ${'RGB'[ch]} weight`}
+                onChange={(next) => editWeight(b.name, ch, next)}
               />
             ))}
           </div>
@@ -1081,15 +1255,27 @@ const STYLE_CSS = `
 .fgl-wmx{display:flex;flex-direction:column;gap:5px;margin-bottom:11px;}
 .fgl-wmx-head{display:flex;align-items:center;justify-content:space-between;gap:8px;}
 .fgl-wmx-cap{font-size:9px;color:var(--dim);letter-spacing:.1em;text-transform:uppercase;}
-.fgl-wmx-cols,.fgl-wrow{display:grid;grid-template-columns:14px 1fr 32px 32px 32px;gap:4px;align-items:center;}
+.fgl-wmx-cols,.fgl-wrow{display:grid;grid-template-columns:14px 1fr 34px 34px 34px;gap:4px;align-items:center;}
 .fgl-wmx-hd{font-size:8.5px;text-align:center;letter-spacing:.04em;}
 .fgl-wrow.off{opacity:.5;}
 .fgl-wswatch{width:9px;height:9px;border-radius:2px;border:1px solid rgba(0,0,0,.4);display:inline-block;margin-right:5px;vertical-align:middle;}
 .fgl-wlbl{font-size:9.5px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .fgl-wchk{cursor:pointer;margin:0;}
-.fgl-winp{width:100%;background:var(--inset);border:1px solid var(--line2);border-radius:3px;color:var(--text);
-  font-family:var(--mono);font-size:9.5px;padding:3px 1px;text-align:center;font-variant-numeric:tabular-nums;}
-.fgl-winp:focus{outline:none;border-color:var(--gold-d);}
+.fgl-knob{display:block;margin:0 auto;cursor:ns-resize;touch-action:none;outline:none;overflow:visible;
+  -webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;}
+.fgl-knob-well{fill:var(--inset);stroke:var(--line);stroke-width:1;}
+.fgl-knob-track{fill:none;stroke:var(--line2);stroke-linecap:round;}
+.fgl-knob-fill{fill:none;stroke:var(--knob-color);stroke-linecap:round;
+  filter:drop-shadow(0 0 1.5px var(--knob-color));}
+.fgl-knob-notch{fill:var(--knob-color);stroke:var(--inset);stroke-width:.6;}
+.fgl-knob-num{fill:var(--text);font-family:var(--mono);font-size:9px;font-variant-numeric:tabular-nums;
+  letter-spacing:-.02em;pointer-events:none;user-select:none;}
+.fgl-knob:hover .fgl-knob-track{stroke:var(--gold-d);}
+.fgl-knob:focus-visible .fgl-knob-well{stroke:var(--gold);}
+.fgl-knob:focus-visible .fgl-knob-num{fill:var(--gold);}
+/* Dimmed (off) rows already get opacity .5 from .fgl-wrow.off; also kill the
+   channel glow so a dimmed knob reads as flat/inactive, not lit. */
+.fgl-wrow.off .fgl-knob-fill{filter:none;}
 .fgl-rainbow{background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
   font-size:9px;letter-spacing:.1em;text-transform:uppercase;padding:4px 9px;border-radius:4px;cursor:pointer;}
 .fgl-rainbow:hover{border-color:var(--gold-d);color:var(--gold);}
