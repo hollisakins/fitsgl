@@ -18,14 +18,24 @@ from typing import Callable
 
 from .build import build_dataset, write_site
 from .build_pyramid import StopAndAsk
-from .config import load_config
+from .collection import emit_collection
+from .config import DeployConfig, load_config, read_dataset_name
 from .demo import DEMO_RGB, build_demo
-from .deploy import CloudflarePurge, DeployError, R2Target, deploy_dataset
+from .deploy import CloudflarePurge, DeployError, R2Target, deploy_collection_root, deploy_dataset
 from .env_file import load_env_file
 from .deploy_plan import DeployDiff
 from .init_scaffold import scan_directory, write_scaffold
 from .serve import serve
 from .verify import format_report, verify_deployment
+from .workspace import (
+    FieldRef,
+    WorkspaceConfig,
+    field_deploy_config,
+    field_prefix,
+    load_workspace,
+    select_fields,
+    validate_workspace_fields,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,13 +46,29 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("dir", nargs="?", type=Path, default=Path("."), help="Directory to scan (default: cwd).")
     pi.add_argument("--force", action="store_true", help="Overwrite an existing fitsgl.toml.")
 
-    pb = sub.add_parser("build", help="Build a dataset directory from a fitsgl.toml.")
-    pb.add_argument(
+    pb = sub.add_parser("build", help="Build a dataset directory from a fitsgl.toml (or a whole workspace).")
+    bsrc = pb.add_mutually_exclusive_group()
+    bsrc.add_argument(
         "-c",
         "--config",
         type=Path,
         default=Path("fitsgl.toml"),
-        help="Path to the fitsgl.toml (default: ./fitsgl.toml).",
+        help="Path to a single fitsgl.toml (default: ./fitsgl.toml). Mutually exclusive with -w.",
+    )
+    bsrc.add_argument(
+        "-w",
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Path to a fitsgl.workspace.toml; builds every [[field]] in it (a shared [deploy] "
+        "block + references to per-field fitsgl.toml). Use --field to subset.",
+    )
+    pb.add_argument(
+        "--field",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="With -w: build only this field (its prefix; repeatable). Default: all fields.",
     )
     pb.add_argument(
         "-o",
@@ -138,8 +164,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Promote warnings (cold edge cache, oversized objects) to failures — for CI.",
     )
 
-    pd = sub.add_parser("deploy", help="Push a built dataset to Cloudflare R2 and purge the edge.")
-    pd.add_argument("-c", "--config", type=Path, default=Path("fitsgl.toml"), help="Path to the fitsgl.toml (default: ./fitsgl.toml).")
+    pd = sub.add_parser("deploy", help="Push a built dataset (or a whole workspace) to Cloudflare R2 and purge the edge.")
+    dsrc = pd.add_mutually_exclusive_group()
+    dsrc.add_argument("-c", "--config", type=Path, default=Path("fitsgl.toml"), help="Path to a single fitsgl.toml (default: ./fitsgl.toml). Mutually exclusive with -w.")
+    dsrc.add_argument(
+        "-w", "--workspace", type=Path, default=None,
+        help="Path to a fitsgl.workspace.toml; deploys every [[field]] (one shared [deploy], one "
+        "bucket, one prefix per field) plus the collection landing page. Use --field to subset.",
+    )
+    pd.add_argument("--field", action="append", default=None, metavar="NAME", help="With -w: deploy only this field (its prefix; repeatable). Default: all fields.")
     pd.add_argument("-o", "--out", type=Path, default=Path("dist"), help="Output root holding <dataset.name>/ (default: ./dist).")
     pd.add_argument("--dry-run", action="store_true", help="Print the upload/delete/purge plan; make no writes.")
     pd.add_argument("--no-verify", action="store_true", help="Skip the post-deploy contract check against the live URL.")
@@ -158,6 +191,13 @@ def build_parser() -> argparse.ArgumentParser:
         "file (default: a .env next to the fitsgl.toml, if present). Real environment variables "
         "take precedence over the file.",
     )
+
+    px = sub.add_parser(
+        "index",
+        help="Emit the collection landing page (collection.json + picker viewer) for a workspace.",
+    )
+    px.add_argument("-w", "--workspace", type=Path, default=Path("fitsgl.workspace.toml"), help="Path to the fitsgl.workspace.toml (default: ./fitsgl.workspace.toml).")
+    px.add_argument("-o", "--out", type=Path, default=Path("dist"), help="Output root holding the built field dirs (default: ./dist).")
     return p
 
 
@@ -294,6 +334,98 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_workspace_validated(path: Path) -> tuple[WorkspaceConfig, list[str]]:
+    """Load + cross-validate a workspace; return it with each field's peeked dataset
+    name. Peeking ``[dataset].name`` (not a full ``load_config``) means validation
+    never stats any band's FITS input, so a subset build/deploy needs only the
+    selected fields' inputs. Raises FileNotFoundError / ValueError on any problem."""
+    ws = load_workspace(path)
+    names = [read_dataset_name(ref.config_path) for ref in ws.fields]
+    validate_workspace_fields(ws, names)
+    return ws, names
+
+
+def _cmd_build_workspace(args: argparse.Namespace) -> int:
+    if args.processes is not None and args.processes < 1:
+        print("fitsgl build: --processes must be >= 1", file=sys.stderr)
+        return 2
+    try:
+        ws, names = _load_workspace_validated(args.workspace)
+        selected = select_fields(ws, args.field, names)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"fitsgl build: {e}", file=sys.stderr)
+        return 2
+
+    n = len(selected)
+    ok: list[str] = []
+    failures: list[tuple[str, str]] = []
+    for i, (ref, dsname) in enumerate(selected, 1):
+        print(f"\n[{i}/{n}] field {dsname}  ({ref.config_path})", flush=True)
+        try:
+            child = load_config(ref.config_path)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  fitsgl build: {dsname}: {e}", file=sys.stderr)
+            failures.append((dsname, str(e)))
+            continue
+        if child.deploy is not None and ws.deploy is not None:
+            print(
+                f"  note: {ref.config_path.name} has its own [deploy]; the workspace [deploy] "
+                "(shared bucket + derived public_url) overrides it under -w.",
+                file=sys.stderr,
+            )
+        try:
+            if args.site_only:
+                write_site(child, args.out, on_progress=lambda m: print(f"  {m}", flush=True))
+            else:
+                build_dataset(
+                    child,
+                    args.out,
+                    processes=args.processes,
+                    verify=not args.no_verify,
+                    with_site=not args.no_site,
+                    overwrite=args.overwrite,
+                    on_progress=lambda m: print(f"  {m}", flush=True),
+                )
+            ok.append(dsname)
+        except StopAndAsk as e:
+            print(f"  fitsgl build: {dsname}: STOP: {e}", file=sys.stderr)
+            failures.append((dsname, str(e)))
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  fitsgl build: {dsname}: {e}", file=sys.stderr)
+            failures.append((dsname, str(e)))
+
+    print(f"\nworkspace build: {len(ok)}/{n} field(s) ok" + (f", {len(failures)} failed" if failures else ""))
+    for dsname, msg in failures:
+        print(f"  {dsname}: FAILED — {msg}")
+    return 1 if failures else 0
+
+
+def _cmd_index(args: argparse.Namespace) -> int:
+    try:
+        ws, names = _load_workspace_validated(args.workspace)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"fitsgl index: {e}", file=sys.stderr)
+        return 2
+    coll = ws.collection
+    name = coll.name if coll is not None else ws.name
+    title = coll.title if coll is not None else ws.title
+    field_specs = [
+        (field_prefix(ref, dsname), args.out / dsname, ref.title) for ref, dsname in zip(ws.fields, names)
+    ]
+    try:
+        result = emit_collection(
+            args.out, name=name, title=title, field_specs=field_specs,
+            on_progress=lambda m: print(m, flush=True),
+        )
+    except FileNotFoundError as e:
+        print(f"fitsgl index: {e}", file=sys.stderr)
+        return 2
+    print(f"wrote collection landing page -> {result.staging_dir} ({len(result.fields)} field(s))")
+    if result.skipped:
+        print(f"  skipped (not built): {', '.join(result.skipped)}")
+    return 0
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     try:
         report = verify_deployment(args.url, origin=args.origin)
@@ -410,12 +542,169 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_deploy_workspace(args: argparse.Namespace) -> int:
+    if args.concurrency is not None and args.concurrency < 1:
+        print("fitsgl deploy: --concurrency must be >= 1", file=sys.stderr)
+        return 2
+    try:
+        ws, names = _load_workspace_validated(args.workspace)
+        selected = select_fields(ws, args.field, names)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"fitsgl deploy: {e}", file=sys.stderr)
+        return 2
+    if ws.deploy is None:
+        print(
+            "fitsgl deploy: the workspace has no [deploy] table — add one with bucket/endpoint/base_url "
+            "(see docs/workspace-design.md)",
+            file=sys.stderr,
+        )
+        return 2
+    if not selected:
+        print("fitsgl deploy: no fields selected", file=sys.stderr)
+        return 2
+
+    # Pre-flight: every selected field must be built before we touch the network.
+    missing = [dsname for _, dsname in selected if not (args.out / dsname / "fitsgl.json").is_file()]
+    if missing:
+        print(f"fitsgl deploy: not built: {', '.join(missing)} — run `fitsgl build -w ...` first", file=sys.stderr)
+        return 2
+
+    concurrency = args.concurrency if args.concurrency is not None else ws.deploy.concurrency
+    # A DeployConfig holding just the workspace-shared bits (prefix "" + base_url): it
+    # sources the single R2 target/purger AND is the collection-root deploy config.
+    root_config = DeployConfig(
+        bucket=ws.deploy.bucket,
+        endpoint=ws.deploy.endpoint,
+        public_url=ws.deploy.base_url.rstrip("/"),
+        zone_id=ws.deploy.zone_id,
+        prefix="",
+        viewer_origin=ws.deploy.viewer_origin,
+        tile_max_age=ws.deploy.tile_max_age,
+        swr_grace=ws.deploy.swr_grace,
+        concurrency=concurrency,
+    )
+
+    # Credentials from a .env once, relative to the workspace toml dir.
+    env_path = args.env_file if args.env_file is not None else ws.config_dir / ".env"
+    if args.env_file is not None and not env_path.is_file():
+        print(f"fitsgl deploy: --env-file not found: {env_path}", file=sys.stderr)
+        return 2
+    try:
+        applied = load_env_file(env_path)
+    except OSError as e:
+        print(f"fitsgl deploy: could not read {env_path}: {e}", file=sys.stderr)
+        return 2
+    if applied:
+        print(f"loaded {', '.join(applied)} from {env_path}", flush=True)
+
+    # One target + purger for the shared bucket/zone (each field's DeployConfig only
+    # varies prefix/public_url, which deploy_dataset reads from its config arg).
+    try:
+        target = R2Target.from_config(root_config, concurrency=concurrency)
+        purger = CloudflarePurge.from_config(root_config)
+    except DeployError as e:
+        print(f"fitsgl deploy: {e}", file=sys.stderr)
+        return 2
+    if purger is None and not args.dry_run:
+        print("fitsgl deploy: note: no zone_id/CLOUDFLARE_API_TOKEN → the edge purge will be skipped", file=sys.stderr)
+
+    # Bucket CORS once for the shared bucket (skipped on dry-run / site-only).
+    if not args.dry_run and not args.site_only:
+        try:
+            target.put_cors([ws.deploy.viewer_origin], ["GET", "HEAD"], ["range"])
+            print(f"set CORS (origin {ws.deploy.viewer_origin}) on bucket {ws.deploy.bucket!r}", flush=True)
+        except DeployError as e:
+            print(f"fitsgl deploy: {e}", file=sys.stderr)
+            return 1
+
+    n = len(selected)
+    succeeded: list[tuple[FieldRef, str]] = []  # fields that deployed without error
+    failures: list[tuple[str, str]] = []
+    for i, (ref, dsname) in enumerate(selected, 1):
+        dc = field_deploy_config(ws, ref, dsname)
+        print(f"\n[{i}/{n}] field {dsname} -> {dc.public_url}", flush=True)
+        confirm = None if (args.yes or args.dry_run) else _confirm_deploy(dc.bucket)
+        try:
+            result = deploy_dataset(
+                args.out / dsname,
+                dc,
+                target,
+                purger=purger,
+                dry_run=args.dry_run,
+                run_verify=not args.no_verify,
+                site_only=args.site_only,
+                set_cors=False,
+                max_workers=concurrency,
+                confirm=confirm,
+                on_progress=lambda m: print(f"  {m}", flush=True),
+            )
+        except DeployError as e:
+            print(f"  fitsgl deploy: {dsname}: {e}", file=sys.stderr)
+            failures.append((dsname, str(e)))
+            continue
+        if result.aborted:
+            print(f"  {dsname}: aborted (declined)")
+            continue
+        # A field counts as cleanly deployed only if its post-deploy verify passed
+        # (or was skipped) — a verify failure must keep it out of the collection card
+        # set + the "deployed" count, not just be noted.
+        if result.verify_report is not None and not result.verify_report.ok():
+            failures.append((dsname, "post-deploy verify reported failures"))
+        else:
+            succeeded.append((ref, dsname))
+
+    # Collection landing page: refresh + deploy ONLY on a fully clean full deploy. A
+    # subset deploy leaves it alone (so it can't drop a field that wasn't rebuilt
+    # locally); a dry-run only previews. We refresh from `succeeded` (DP6/P0-6), but
+    # ONLY when every field landed cleanly — otherwise a transient failure would PUT a
+    # shrunken/empty collection.json over the live, populated landing page, dropping
+    # fields whose tiles are still served. On any failure we leave the root untouched.
+    if args.field is not None:
+        print("\nnote: subset deploy — the collection landing page was not refreshed "
+              "(run a full `fitsgl deploy -w ...`, or `fitsgl index`, to update it)")
+    elif args.dry_run:
+        print("\ndry run: would also emit + deploy the collection landing page")
+    elif succeeded and not failures:
+        coll = ws.collection
+        cname = coll.name if coll is not None else ws.name
+        ctitle = coll.title if coll is not None else ws.title
+        field_specs = [(field_prefix(ref, dsname), args.out / dsname, ref.title) for ref, dsname in succeeded]
+        try:
+            emit_collection(
+                args.out, name=cname, title=ctitle, field_specs=field_specs,
+                on_progress=lambda m: print(f"  {m}", flush=True),
+            )
+            print(f"\ndeploying collection landing page ({len(field_specs)} field(s)) -> {ws.deploy.base_url}", flush=True)
+            deploy_collection_root(args.out, root_config, target, purger=purger, max_workers=concurrency)
+        except (DeployError, FileNotFoundError) as e:
+            print(f"fitsgl deploy: collection root: {e}", file=sys.stderr)
+            failures.append(("<collection>", str(e)))
+    else:
+        print("\nnote: some fields failed/declined — left the collection landing page unchanged "
+              "(re-run a full `fitsgl deploy -w ...` once all fields succeed, or run `fitsgl index`)")
+
+    verb = "would deploy" if args.dry_run else "deployed"
+    count = len(selected) if args.dry_run else len(succeeded)
+    print(
+        f"\nworkspace {'dry run' if args.dry_run else 'deploy'} ({ws.deploy.bucket!r}): {count}/{n} field(s) {verb}"
+        + (f", {len(failures)} with errors" if failures else "")
+    )
+    for dsname, msg in failures:
+        print(f"  {dsname}: ERROR — {msg}")
+    return 1 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # --field only makes sense under -w; reject it on the single-dataset path rather
+    # than silently ignoring a (possibly mistyped) selector.
+    if args.command in ("build", "deploy") and args.field is not None and args.workspace is None:
+        print(f"fitsgl {args.command}: --field requires -w/--workspace", file=sys.stderr)
+        return 2
     if args.command == "init":
         return _cmd_init(args)
     if args.command == "build":
-        return _cmd_build(args)
+        return _cmd_build_workspace(args) if args.workspace is not None else _cmd_build(args)
     if args.command == "demo":
         return _cmd_demo(args)
     if args.command == "serve":
@@ -423,7 +712,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "verify":
         return _cmd_verify(args)
     if args.command == "deploy":
-        return _cmd_deploy(args)
+        return _cmd_deploy_workspace(args) if args.workspace is not None else _cmd_deploy(args)
+    if args.command == "index":
+        return _cmd_index(args)
     return 1
 
 

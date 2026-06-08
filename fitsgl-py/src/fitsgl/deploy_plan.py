@@ -269,16 +269,18 @@ def build_deploy_manifest(
     ``dataset_name`` defaults to the directory's name. ``include`` (if given) keeps
     only files whose dataset-relative path it accepts — used by a ``--site-only``
     deploy to manifest just the viewer files *without* hashing the GB-scale tiles.
-    Raises ``FileNotFoundError`` if the directory is missing or has no
-    ``fitsgl.json`` (i.e. it is not a built dataset — run ``fitsgl build`` first).
-    Files are returned sorted by path.
+    Raises ``FileNotFoundError`` if the directory is missing or holds neither a
+    ``fitsgl.json`` (a built dataset) nor a ``collection.json`` (a collection root —
+    see ``fitsgl index``); i.e. it is not a deployable thing. Files are returned
+    sorted by path.
     """
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.is_dir():
         raise FileNotFoundError(f"not a directory: {dataset_dir}")
-    if not (dataset_dir / "fitsgl.json").is_file():
+    if not (dataset_dir / "fitsgl.json").is_file() and not (dataset_dir / "collection.json").is_file():
         raise FileNotFoundError(
-            f"no fitsgl.json in {dataset_dir} — not a built dataset; run `fitsgl build` first"
+            f"no fitsgl.json or collection.json in {dataset_dir} — not a built dataset or "
+            "collection root; run `fitsgl build` / `fitsgl index` first"
         )
     name = dataset_name if dataset_name is not None else dataset_dir.name
 

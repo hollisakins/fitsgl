@@ -724,3 +724,84 @@ def test_cli_deploy_missing_explicit_env_file_errors(tmp_path, capsys):
     rc = main(["deploy", "-c", str(toml), "-o", str(out), "--env-file", str(tmp_path / "nope.env"), "--yes"])
     assert rc == 2
     assert "--env-file not found" in capsys.readouterr().err
+
+
+# ---------------------------------------------------- set_cors + collection root
+
+
+def make_collection_root(tmp_path):
+    """An out/ root holding a staged .collection/ + a couple of field subdirs."""
+    out = tmp_path / "dist"
+    coll = out / ".collection"
+    coll.mkdir(parents=True)
+    (coll / "collection.json").write_text(
+        json.dumps({"schemaVersion": 1, "collection": {"name": "s"}, "fields": [{"name": "cosmos"}]})
+    )
+    (coll / "index.html").write_text("<!doctype html><script src=./assets/index-abc.js></script>")
+    (coll / "assets").mkdir()
+    (coll / "assets" / "index-abc.js").write_text("console.log(1)")
+    # copy_viewer_into drops a .build-info.json dotfile into the staging dir; the
+    # dot-segment skip in _iter_dataset_files must keep it OUT of the upload.
+    (coll / ".build-info.json").write_text('{"schemaVersion": 1}')
+    # field subdirs that must NOT be uploaded by the root deploy
+    for f in ("cosmos", "egs"):
+        d = out / f
+        d.mkdir()
+        (d / "fitsgl.json").write_text('{"schemaVersion": 1, "dataset": {"name": "%s"}}' % f)
+        (d / f"{f}_z0.fits.fz").write_bytes(b"tile")
+    return out
+
+
+def test_deploy_dataset_set_cors_false_skips_cors(tmp_path):
+    root = make_dataset(tmp_path)
+    t = FakeTarget()
+    result = deploy_dataset(root, cfg(), t, set_cors=False, run_verify=False)
+    assert t.cors is None
+    assert not any(op[0] == "cors" for op in t.ops)
+    # uploads + ledger still happen
+    assert result.uploaded
+    assert any(op[0] == "put_bytes" and op[1] == DEPLOY_MANIFEST_NAME for op in t.ops)
+
+
+def test_deploy_dataset_default_sets_cors(tmp_path):
+    root = make_dataset(tmp_path)
+    t = FakeTarget()
+    deploy_dataset(root, cfg(), t, run_verify=False)
+    assert t.cors is not None
+    assert sum(1 for op in t.ops if op[0] == "cors") == 1
+
+
+def test_build_deploy_manifest_accepts_collection_json(tmp_path):
+    d = tmp_path / "root"
+    d.mkdir()
+    (d / "collection.json").write_text('{"schemaVersion": 1, "fields": []}')
+    (d / "index.html").write_text("<html>")
+    m = build_deploy_manifest(d)
+    assert {f.path for f in m.files} == {"collection.json", "index.html"}
+
+
+def test_build_deploy_manifest_requires_fitsgl_or_collection(tmp_path):
+    d = tmp_path / "root"
+    d.mkdir()
+    (d / "random.txt").write_text("x")
+    with pytest.raises(FileNotFoundError, match="no fitsgl.json or collection.json"):
+        build_deploy_manifest(d)
+
+
+def test_deploy_collection_root_uploads_only_root_files(tmp_path):
+    from fitsgl.deploy import deploy_collection_root
+
+    out = make_collection_root(tmp_path)
+    t = FakeTarget()
+    result = deploy_collection_root(out, cfg(prefix="ignored", public_url="https://data.example.org"), t)
+    uploaded = sorted(k for k in t.objects if k != DEPLOY_MANIFEST_NAME)
+    assert uploaded == ["assets/index-abc.js", "collection.json", "index.html"]
+    # nothing from the field subdirs, and the .build-info.json dotfile is skipped
+    assert not any("cosmos/" in k or "egs/" in k for k in t.objects)
+    assert not any(".build-info" in k for k in t.objects)
+    # prefix forced to "" -> keys are bare; ledger at the bucket root
+    assert DEPLOY_MANIFEST_NAME in t.objects
+    # the root never sets CORS (the workspace does it once) and never purges (no tiles)
+    assert t.cors is None
+    assert result.purged == []
+    assert result.verify_report is None  # run_verify is forced off

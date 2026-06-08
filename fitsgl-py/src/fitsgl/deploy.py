@@ -31,10 +31,11 @@ import os
 import urllib.error
 import urllib.request
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
+from .collection import COLLECTION_STAGING_DIR
 from .config import DeployConfig  # re-exported below; config.py owns the parsed structure
 from .deploy_plan import (
     CLASS_POINTER,
@@ -54,7 +55,8 @@ from .verify import VerifyReport, verify_deployment
 
 __all__ = [
     "DeployConfig", "DeployError", "DeployResult", "DeployTarget", "Purger",
-    "R2Target", "CloudflarePurge", "deploy_dataset", "object_key", "public_url_for",
+    "R2Target", "CloudflarePurge", "deploy_dataset", "deploy_collection_root",
+    "object_key", "public_url_for",
 ]
 
 #: CORS headers the embedder's ranged fetch needs to read (mirrors ``serve.py``).
@@ -217,6 +219,7 @@ def deploy_dataset(
     dry_run: bool = False,
     run_verify: bool = True,
     site_only: bool = False,
+    set_cors: bool = True,
     max_workers: int = DEFAULT_UPLOAD_CONCURRENCY,
     verify_fn: Callable[[str], VerifyReport] | None = None,
     confirm: Callable[[DeployDiff], bool] | None = None,
@@ -230,7 +233,10 @@ def deploy_dataset(
     files (``index.html`` + ``assets/``) — hashing only those, and merging their
     entries into the prior ledger so the data files' entries are preserved.
     ``confirm`` (if given) is called with the computed diff before any writes; return
-    ``False`` to abort. ``max_workers`` is how many files upload at once (a barrier
+    ``False`` to abort. ``set_cors`` (default True) sets bucket CORS once per call; a
+    workspace deploy passes ``False`` for every field and sets CORS once itself for
+    the shared bucket, avoiding N redundant ``put_bucket_cors`` calls. ``max_workers``
+    is how many files upload at once (a barrier
     separates the tile group from the pointer/asset group, so a higher value never
     races a manifest ahead of its tiles). ``run_verify`` runs the post-deploy
     contract check (``verify_fn`` overrides the checker — tests inject a fake to avoid
@@ -288,8 +294,9 @@ def deploy_dataset(
         result.deleted.append(path)
 
     # Bucket CORS (DP8) — R2 rejects AllowedHeaders ["*"], so list "range" explicitly.
-    # Skipped for --site-only: it's a viewer refresh, not a data-access change.
-    if not site_only:
+    # Skipped for --site-only (a viewer refresh, not a data-access change) and when
+    # set_cors=False (a workspace deploy sets it once for the shared bucket itself).
+    if not site_only and set_cors:
         log(f"set CORS (origin {config.viewer_origin})")
         target.put_cors([config.viewer_origin], ["GET", "HEAD"], ["range"])
 
@@ -328,6 +335,51 @@ def deploy_dataset(
         result.verify_report = vfn(config.public_url)
 
     return result
+
+
+def deploy_collection_root(
+    out_root: str | Path,
+    config: DeployConfig,
+    target: DeployTarget,
+    *,
+    purger: Purger | None = None,
+    dry_run: bool = False,
+    max_workers: int = DEFAULT_UPLOAD_CONCURRENCY,
+    confirm: Callable[[DeployDiff], bool] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> DeployResult:
+    """Deploy the collection landing page to bucket prefix "".
+
+    Targets the staged ``out_root/.collection/`` dir (``collection.json`` +
+    ``index.html`` + ``assets/`` — see :func:`collection.emit_collection`), forcing
+    ``prefix=""`` so those files land at the bucket root next to (not inside) every
+    field's prefix. A thin wrapper over :func:`deploy_dataset`:
+
+    * ``.collection/`` holds no field subdirs, so the ``rglob`` walk stays tiny — no
+      double-upload of field tiles, no ``include`` predicate needed.
+    * ``set_cors=False`` — a workspace deploy sets bucket CORS once for the shared
+      bucket itself; the root must not re-set it.
+    * ``run_verify=False`` — the root has ``collection.json``, not ``fitsgl.json``,
+      which the data-contract verifier expects; the per-field deploys verify the data.
+      Its ``diff.purge`` is always empty (no tiles; ``index.html``/``collection.json``
+      are ``no-cache`` pointers, ``assets/*`` immutable), so a missing zone/token is
+      harmless here.
+    """
+    staging = Path(out_root) / COLLECTION_STAGING_DIR
+    root_config = replace(config, prefix="")  # the collection root IS prefix ""
+    return deploy_dataset(
+        staging,
+        root_config,
+        target,
+        purger=purger,
+        dry_run=dry_run,
+        run_verify=False,
+        site_only=False,
+        set_cors=False,
+        max_workers=max_workers,
+        confirm=confirm,
+        on_progress=on_progress,
+    )
 
 
 def _fetch_remote_manifest(
