@@ -199,6 +199,7 @@ def _stub_deploy(monkeypatch, target, *, fail_prefix=None, verify_fail_prefix=No
     which field prefixes the collection refresh was built from.
     """
     from fitsgl.deploy import DeployError
+    from fitsgl.verify import FAIL, VerifyReport
 
     calls = {"deploy": [], "emit": 0, "root": 0, "target_built": 0, "emit_specs": None}
 
@@ -210,13 +211,6 @@ def _stub_deploy(monkeypatch, target, *, fail_prefix=None, verify_fail_prefix=No
     monkeypatch.setattr(cli.CloudflarePurge, "from_config", classmethod(lambda cls, c: None))
     monkeypatch.setattr(cli, "load_env_file", lambda p: [])
 
-    class FakeVerify:
-        def __init__(self, ok):
-            self._ok = ok
-
-        def ok(self):
-            return self._ok
-
     fail_set = set(fail_prefix or ())
     verify_fail_set = set(verify_fail_prefix or ())
 
@@ -224,7 +218,10 @@ def _stub_deploy(monkeypatch, target, *, fail_prefix=None, verify_fail_prefix=No
         calls["deploy"].append((config.prefix, config.public_url, kw.get("set_cors")))
         if config.prefix in fail_set:
             raise DeployError(f"boom {config.prefix}")
-        report = FakeVerify(ok=False) if config.prefix in verify_fail_set else None
+        report = None
+        if config.prefix in verify_fail_set:  # a real VerifyReport so format_report works
+            report = VerifyReport(base_url=config.public_url)
+            report.add("Range → 206", FAIL, "host ignored Range")
         return DeployResult(diff=DeployDiff(), dry_run=kw.get("dry_run", False), verify_report=report)
 
     def fake_emit(out_root, *, name, title, field_specs, on_progress=None):
@@ -343,12 +340,16 @@ def test_deploy_partial_failure_leaves_collection_untouched(tmp_path, monkeypatc
     assert calls["emit"] == 0 and calls["root"] == 0
 
 
-def test_deploy_verify_failure_excludes_field_and_skips_root(tmp_path, monkeypatch):
+def test_deploy_verify_failure_still_publishes_collection_but_exits_1(tmp_path, monkeypatch):
+    # A verify failure means the bytes uploaded but the LIVE check failed (a CDN/setup
+    # issue) — the field still belongs in the collection, which must still publish; the
+    # command exits 1 to flag the problem.
     ws, out = _deploy_workspace(tmp_path)
     calls = _stub_deploy(monkeypatch, FakeTarget(), verify_fail_prefix={"egs"})
     rc = cli.main(["deploy", "-w", str(ws), "-o", str(out), "--yes"])
-    assert rc == 1  # a verify failure is a failure
-    assert calls["emit"] == 0 and calls["root"] == 0  # not a clean full deploy → root untouched
+    assert rc == 1  # verify failure flags the command
+    assert calls["emit"] == 1 and calls["root"] == 1  # but all fields uploaded → root published
+    assert calls["emit_specs"] == ["cosmos", "egs"]  # incl. the verify-failed (but uploaded) field
 
 
 def test_deploy_dry_run_summary_says_would_deploy(tmp_path, monkeypatch, capsys):
