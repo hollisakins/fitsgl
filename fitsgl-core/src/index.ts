@@ -155,3 +155,9 @@ export type {
   FitsglBandStats,
   FitsglDefaultView,
 } from './fitsgl-config.js';
+
+// The collection contract (`collection.json`): the multi-field landing-page index
+// emitted at the deploy root, sibling of `fitsgl.json`. The viewer probes it to
+// render a field picker; `fitsgl index` (the producer CLI) emits it.
+export { validateCollection, loadCollection, COLLECTION_SCHEMA_VERSION } from './collection.js';
+export type { Collection, CollectionField } from './collection.js';

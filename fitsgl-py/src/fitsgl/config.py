@@ -35,7 +35,7 @@ STRETCH_MODES = ("linear", "log", "asinh", "trilogy")
 #: Band names that would collide with a top-level output file/dir in the dataset
 #: directory, so they are refused (a band becomes a subdirectory named for it).
 #: ``index``/``assets`` are the bundled SSG viewer's files; ``fitsgl`` is ``fitsgl.json``.
-RESERVED_BAND_NAMES = frozenset({"dataset", "catalog", "fitsgl", "index", "assets", "deploy", "embed"})
+RESERVED_BAND_NAMES = frozenset({"dataset", "catalog", "fitsgl", "index", "assets", "deploy", "embed", "collection"})
 
 #: Characters not allowed in a band's on-disk/URL slug (everything else -> ``_``).
 _UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
@@ -269,6 +269,26 @@ def load_config(path: str | Path) -> DatasetConfig:
         config_dir=config_dir,
         deploy=deploy,
     )
+
+
+def read_dataset_name(path: str | Path) -> str:
+    """Read just ``[dataset].name`` from a ``fitsgl.toml`` without resolving inputs.
+
+    A cheap peek the workspace layer uses to default a field's prefix and resolve
+    ``--field`` selectors *without* statting every band's FITS input (which the eager
+    :func:`load_config` does), so a subset build/deploy needs only the selected
+    fields' inputs present. Raises ``FileNotFoundError`` if the file is missing,
+    ``ValueError`` if ``[dataset].name`` is absent or blank.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"fitsgl.toml not found: {path}")
+    with path.open("rb") as f:
+        raw = tomllib.load(f)
+    ds = raw.get("dataset")
+    _require(isinstance(ds, dict), "missing or invalid [dataset] table")
+    assert isinstance(ds, dict)
+    return _as_str(ds, "name", "[dataset].name")
 
 
 def _parse_deploy(raw: object) -> DeployConfig | None:
