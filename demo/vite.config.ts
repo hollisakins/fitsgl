@@ -67,7 +67,7 @@ const rangeMiddleware: Connect.NextHandleFunction = (req, res, next) => {
   // the real browser-cache path: the browser stores tile bytes but revalidates
   // each load, so a rebuilt pyramid (new ETag) is re-fetched while unchanged
   // tiles return 304 (no body). Production uses `immutable` + versioned paths
-  // instead — see notes/phase4.md "Production deployment (R2 + Cloudflare)".
+  // instead — see docs/r2-setup.md.
   res.setHeader('Cache-Control', 'no-cache');
 
   // Conditional revalidation: if the cached copy is still current, 304 with no

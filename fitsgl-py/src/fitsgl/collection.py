@@ -10,7 +10,7 @@ whole multi-field tree — and so the leading dot keeps it invisible to
 Everything here is pure logic over the local filesystem (it reads each field's built
 ``fitsgl.json`` + first band ``manifest.json`` to enrich a card, never the network);
 the only side effect beyond writing ``collection.json`` is copying the vendored
-viewer via :func:`site.copy_viewer_into`. See ``docs/workspace-design.md``.
+viewer via :func:`site.copy_viewer_into`.
 """
 
 from __future__ import annotations

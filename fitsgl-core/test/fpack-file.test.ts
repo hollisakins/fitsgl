@@ -145,7 +145,7 @@ describe('FpackFile.getTile', () => {
 });
 
 describe('FpackFile split fetch/decode (cache seam)', () => {
-  // The persistent tile cache (multi-tier-cache plan, P2) caches the COMPRESSED
+  // The persistent tile cache caches the COMPRESSED
   // bytes and decodes them later via the static decodeTile. The split path must be
   // bit-identical to getTile — the decode is a pure function of (bytes, params),
   // so cached bytes must decode the same as freshly-fetched ones.

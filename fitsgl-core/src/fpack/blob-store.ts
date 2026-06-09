@@ -1,6 +1,6 @@
 /**
  * Persistent compressed-tile cache — the "disk" tier of the
- * GPU < RAM < disk hierarchy (see docs/multi-tier-cache-plan.md).
+ * GPU < RAM < disk hierarchy.
  *
  * A `BlobStore` is a string-keyed persistent map of a tile's COMPRESSED bytes.
  * Decode runs downstream of it, so the stored bytes are identical whether they

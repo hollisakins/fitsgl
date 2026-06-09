@@ -2,7 +2,7 @@
 
 Walks a built dataset directory and classifies every file into a *cache class*
 (tile / pointer / asset), assigning each the ``Content-Type`` and
-``Cache-Control`` it must be served with (``docs/deploy-design.md`` §4/§6). The
+``Cache-Control`` it must be served with. The
 result is a :class:`DeployManifest` — both the wire description of what to upload
 and the ledger that the *next* deploy diffs against to upload only what changed
 (DP6).
@@ -12,7 +12,7 @@ them) but never touches the network, boto3, or Cloudflare. That keeps the
 correctness-critical classification + diff fully unit-testable on fixtures; the
 I/O lives in ``deploy.py`` / ``verify.py``.
 
-Two facts from the supertile format (``docs/supertile-design.md``) shape the diff,
+Two facts from the supertile format shape the diff,
 and the original deploy design predates both:
 
 * A pyramid level is no longer one ``.fits.fz`` but a *set* of supertile files, so
@@ -36,7 +36,7 @@ from typing import Callable
 
 from .serve import content_type_for  # single source of MIME truth (matches `fitsgl serve`)
 
-#: The ledger file's name + schema version (``docs/deploy-design.md`` §6).
+#: The ledger file's name + schema version.
 DEPLOY_MANIFEST_NAME = "deploy-manifest.json"
 DEPLOY_MANIFEST_SCHEMA = 1
 
@@ -133,7 +133,7 @@ class DeployFile:
     size: int
 
     def to_dict(self) -> dict:
-        # camelCase + JSON keyword `class` (matches docs/deploy-design.md §6).
+        # camelCase + JSON keyword `class`.
         return {
             "path": self.path,
             "class": self.cls,

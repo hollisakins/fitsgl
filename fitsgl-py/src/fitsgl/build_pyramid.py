@@ -39,12 +39,12 @@ FPACK_TILE_SIZE = 256
 #: (a standalone ``.fits.fz`` each). Chosen so even worst-case (lossless-fallback,
 #: ~160 KB/tile) supertiles stay under the 512 MB CDN edge-cache limit; on real
 #: noise-dominated data (~47 KB/tile) files are ~100 MB. Tunable; to be locked
-#: empirically against real COSMOS-Web tiles (docs/supertile-design.md §8).
+#: empirically against real COSMOS-Web tiles.
 DEFAULT_SUPERTILE_BLOCKS = 48
 
 #: Hard ceiling per emitted ``.fits.fz``: Cloudflare's max cacheable object size on
 #: Free/Pro/Business plans. A supertile over this is a build error (reduce the block
-#: size) rather than a silently-uncacheable file. See docs/supertile-design.md.
+#: size) rather than a silently-uncacheable file.
 EDGE_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 
 #: Lossy quantization level applied to every RICE_1 level. q=8 preserves source
@@ -520,7 +520,7 @@ def build_pyramid(
         Max render-tiles per side per supertile file (``K``, default 48). A level
         whose tile grid exceeds ``K`` in either dim is split into ``K×K``-tile
         supertiles so each ``.fits.fz`` stays edge-cacheable; smaller levels emit a
-        single file (byte-identical to the old layout). See docs/supertile-design.md.
+        single file (byte-identical to the old layout).
     size_budget_bytes
         Hard per-file ceiling (default 512 MB). A supertile over this raises rather
         than shipping a silently-uncacheable file; lower ``supertile_blocks`` if hit.

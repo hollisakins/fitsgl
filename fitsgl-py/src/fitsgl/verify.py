@@ -5,7 +5,7 @@ hard-rejects a ``200`` to a ranged request → a blank viewer, *late* and confus
 This checker fetches a deployed dataset's own files and asserts the §2 contract
 directly from response headers — and because it is a Python CLI, not a browser, it
 reads every header without the CORS limits that constrain an in-page HUD, so it is
-the authoritative HIT-vs-silent-origin-bypass probe (``docs/deploy-design.md`` §5.2).
+the authoritative HIT-vs-silent-origin-bypass probe.
 
 Severity is tiered (DP7/§8): **correctness** checks (Range→``206``, MIME types,
 ``fitsgl.json`` loads, the CORS preflight) **fail** the command (non-zero exit); the
@@ -47,12 +47,12 @@ SKIP = "skip"
 #: Edge ``CF-Cache-Status`` values that mean the tile was edge-served (good).
 _CACHED_STATUSES = frozenset({"HIT", "STALE", "UPDATING", "REVALIDATED"})
 
-#: The §4.4 Cache Rule recipe, printed when a coarse tile is uncached.
+#: The Cache Rule recipe, printed when a coarse tile is uncached.
 _CACHE_RULE_HINT = (
     "tiles are not edge-cached — `.fits.fz` is NOT on Cloudflare's default "
     "cacheable-extension allowlist. Add ONE Cache Rule on the zone: match Hostname "
     "+ URI path ends with `.fits.fz` → 'Eligible for cache', Edge TTL 'respect "
-    "origin' (see docs/deploy-design.md §4.4)."
+    "origin' (see docs/r2-setup.md)."
 )
 
 
@@ -454,7 +454,7 @@ def _check_object_sizes(
             WARN,
             f"{len(over)} of {len(level.supertiles)} supertile(s) exceed the 512 MB edge cap "
             f"(largest {worst_path} = {worst_size / mib:.0f} MB) → origin-served, not edge-accelerated. "
-            "Lower [build].supertile_blocks so each chunk stays under the cap (docs/supertile-design.md).",
+            "Lower [build].supertile_blocks so each chunk stays under the cap.",
             kind="perf",
         )
     else:

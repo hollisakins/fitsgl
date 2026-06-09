@@ -1,4 +1,4 @@
-"""Tests for pre-tiled input assembly (placed_tiles.py) — docs/supertile-design.md slice 3.
+"""Tests for pre-tiled input assembly (placed_tiles.py).
 
 Tiles are made by cropping one base mosaic and shifting only CRPIX, so they share a
 grid (CTYPE/CRVAL/CD) and integer phase — exactly the COSMOS-Web case. Assembling

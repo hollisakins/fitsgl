@@ -2,7 +2,7 @@
 
 This is the I/O half of deployment; the pure classify/diff logic lives in
 ``deploy_plan.py``. The orchestration (:func:`deploy_dataset`) runs the
-``docs/deploy-design.md`` §5.1 flow:
+deploy flow:
 
 1. **classify** the dataset dir → a local :class:`DeployManifest` (slice 1).
 2. **diff** it against the previously-deployed ledger fetched from the bucket

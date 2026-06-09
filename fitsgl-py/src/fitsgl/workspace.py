@@ -12,7 +12,7 @@ Invariant preserved: one field = one child ``fitsgl.toml`` = one prefix = one le
 structure + the prefix/public_url derivation; it stays **lazy** — it validates
 structure and resolves child paths but does not call :func:`config.load_config`
 (which stats every band's FITS input), so a subset build/deploy needs only the
-selected fields' inputs present. See ``docs/workspace-design.md``.
+selected fields' inputs present.
 """
 
 from __future__ import annotations

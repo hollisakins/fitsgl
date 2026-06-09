@@ -331,7 +331,7 @@ def test_same_native_shape_bands_share_per_level_geometry(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Supertiles (chunking) — docs/supertile-design.md slice 2
+# Supertiles (chunking)
 # --------------------------------------------------------------------------- #
 def test_supertile_partition_disjoint_cover():
     # A grid that fits in one block is the degenerate single supertile.

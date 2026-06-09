@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # v2 adds per-level `supertiles[]` (a level chunked under the CDN object-size limit,
-# or parsed from a pre-tiled input mosaic — see docs/supertile-design.md). A level
+# or parsed from a pre-tiled input mosaic). A level
 # read without `supertiles` (legacy v1) is shimmed to one full-grid supertile, and a
 # single-supertile level is the degenerate, common case.
 MANIFEST_VERSION = 2

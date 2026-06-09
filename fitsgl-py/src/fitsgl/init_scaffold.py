@@ -344,7 +344,7 @@ def render_toml(plan: InitPlan, config_dir: Path) -> str:
         "# Secrets are NOT set here — put R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY (and",
         "# CLOUDFLARE_API_TOKEN for the edge purge) in your shell or a git-ignored .env",
         "# next to this file. See docs/r2-setup.md.",
-        "# [deploy]                 # `fitsgl deploy` target — Cloudflare R2 (see docs/deploy-design.md §5.3)",
+        "# [deploy]                 # `fitsgl deploy` target — Cloudflare R2 (see docs/r2-setup.md)",
         '# target = "r2"',
         '# bucket = "my-bucket"',
         '# endpoint = "https://<account-id>.r2.cloudflarestorage.com"',

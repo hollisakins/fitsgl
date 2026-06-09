@@ -100,7 +100,7 @@ function markerTooltip(m: ResolvedMarker): string {
 }
 
 // Client-side cache sizes. Two layers protect against re-work when you pan back
-// onto a tile (see notes/phase4.md "Reducing fetched bytes"):
+// onto a tile:
 //   - GPU_TEXTURE_BUDGET: decoded R32F textures kept resident on the GPU. A tile
 //     still on the GPU draws with no getTile call at all (no fetch, no decode).
 //   - DECODED_TILE_CACHE: decoded Float32Arrays kept in JS heap. A GPU-evicted

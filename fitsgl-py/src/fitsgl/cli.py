@@ -463,7 +463,7 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     if config.deploy is None:
         print(
             "fitsgl deploy: no [deploy] table in the config — add one with bucket/endpoint/"
-            "public_url (see docs/deploy-design.md §5.3)",
+            "public_url (see docs/r2-setup.md)",
             file=sys.stderr,
         )
         return 2
@@ -555,7 +555,7 @@ def _cmd_deploy_workspace(args: argparse.Namespace) -> int:
     if ws.deploy is None:
         print(
             "fitsgl deploy: the workspace has no [deploy] table — add one with bucket/endpoint/base_url "
-            "(see docs/workspace-design.md)",
+            "(see docs/cli.md)",
             file=sys.stderr,
         )
         return 2

@@ -10,7 +10,7 @@
 /**
  * One supertile: a standalone `.fits.fz` holding a contiguous rectangle of a
  * level's render-tiles. A v1 level is one supertile covering the whole grid; a v2
- * level (a chunked or pre-tiled level — see docs/supertile-design.md) carries a
+ * level (a chunked or pre-tiled level) carries a
  * disjoint list that paves the grid. The file's tiles are addressed *local* to the
  * supertile, so `tile_origin` (the one fact the `.fits.fz` cannot self-supply) maps
  * a global tile to its local position.
@@ -56,7 +56,7 @@ export interface Manifest {
  * Per-pyramid manifest schema versions this client can read. **v1** = one
  * `.fits.fz` file per level. **v2** = each level carries a `supertiles[]` list (a
  * level chunked under the CDN object-size limit, or parsed from a pre-tiled input
- * mosaic — see docs/supertile-design.md). v1 and version-less manifests are read
+ * mosaic). v1 and version-less manifests are read
  * by synthesizing a single supertile per level, so every existing pyramid keeps
  * working with no migration (decision D9). `SUPPORTED_MANIFEST_VERSION` is the
  * latest the producer writes; both 1 and 2 are accepted.

@@ -18,8 +18,9 @@ It assumes you have a Cloudflare account and a domain managed by Cloudflare, and
 rough sense of what object storage is. Most R2 users will already know these steps;
 this just removes the guesswork and flags the one step that's easy to miss.
 
-> The design rationale behind these choices lives in `deploy-design.md` (§2 the host
-> contract, §4 the caching model, §5.3 the config). This is the operational how-to.
+> The deploy invariants (the host contract, the caching model, push-then-purge) are
+> summarized in `../CLAUDE.md`, and the `[deploy]` config fields are documented in
+> `cli.md`. This is the operational how-to.
 
 ---
 
@@ -221,8 +222,8 @@ as you like. To refresh just the viewer after re-vendoring (no data re-upload):
 
 Cloudflare's edge won't cache a single object larger than **512 MB** (on
 Free/Pro/Business plans). FitsGL avoids this automatically: the build chunks every
-pyramid level into **supertiles** that each stay under the cap (see
-`supertile-design.md`), so on a default build no `.fits.fz` exceeds it and every
+pyramid level into **supertiles** that each stay under the cap, so on a default
+build no `.fits.fz` exceeds it and every
 tile is edge-cacheable.
 
 You may see **Cache Reserve** suggested for "large objects." It does **not** raise
