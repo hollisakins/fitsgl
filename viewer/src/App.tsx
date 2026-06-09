@@ -8,8 +8,27 @@ import {
   type Collection,
   type FitsglConfig,
   type ResolvedMarker,
+  type TilePyramidOptions,
+  type WorkerLike,
 } from '@fitsgl/core';
+import DecodeWorker from '@fitsgl/core/worker?worker';
 import { CollectionPicker } from './CollectionPicker.js';
+
+/**
+ * Decode-worker wiring. The core's default factory does
+ * `new Worker(new URL('../worker.js', import.meta.url))`, which resolves against
+ * the BUILT chunk's URL — a file that doesn't exist in this bundled site, which
+ * is why this app historically passed `useWorker: false` and decoded every tile
+ * on the main thread (the single biggest source of pan/zoom jank). Importing the
+ * worker through Vite's `?worker` instead makes Vite emit it as its own chunk
+ * and hand back a constructor with the correct URL in both dev and build, under
+ * any deploy subpath (relative `base`). The cast mirrors the core's own
+ * `as WorkerLike` (a real Worker satisfies the protocol at runtime; only its
+ * `onmessage` parameter type is wider). Module scope: one stable options object.
+ */
+const TILE_OPTIONS: TilePyramidOptions = {
+  workerFactory: (): WorkerLike => new DecodeWorker() as WorkerLike,
+};
 
 /**
  * Resolve what this page is. A deploy ROOT (bucket prefix "") ships a
@@ -75,7 +94,7 @@ export function App() {
   return (
     <FitsExplorer
       config={state.config}
-      tileOptions={{ useWorker: false }}
+      tileOptions={TILE_OPTIONS}
       markerTooltip={tooltip}
       onError={(e) => setError(e instanceof Error ? e.message : String(e))}
     />

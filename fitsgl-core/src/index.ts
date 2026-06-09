@@ -23,6 +23,12 @@ export type { Manifest, LevelInfo, SupertileInfo, SupertileMatch } from './manif
 // High-level tile access (façade) + a custom-fetch hook for hosts.
 export { TilePyramid } from './fpack/tile-source.js';
 export type { TilePyramidOptions } from './fpack/tile-source.js';
+// `WorkerLike` is already part of the public surface via
+// `TilePyramidOptions.workerFactory`; exporting the name lets a bundler host
+// type its factory (e.g. a Vite `?worker` constructor) without indexed-access
+// gymnastics. A real `Worker` satisfies it with a cast (its `onmessage` takes
+// the wider `MessageEvent`), matching the core's own default factory.
+export type { WorkerLike } from './fpack/worker-protocol.js';
 export { httpRangeFetch } from './fpack/fpack-file.js';
 export type { RangeFetcher } from './fpack/fpack-file.js';
 

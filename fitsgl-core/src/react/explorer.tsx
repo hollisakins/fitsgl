@@ -19,7 +19,7 @@
  *    `./explorer-state` so it tests under Node.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
@@ -753,8 +753,15 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const [state, setState] = useState<ExplorerState>(() => defaultExplorerState(bands, initialView));
   const [collapsed, setCollapsed] = useState(false);
   const [readyTick, setReadyTick] = useState(0);
-  const [cursor, setCursor] = useState<CursorInfo | null>(null);
-  const [frame, setFrame] = useState<ViewerFrameInfo | null>(null);
+  // Cursor + zoom readouts update on every pointer-move / zoom frame. They are
+  // deliberately NOT React state here: routing them through the explorer's state
+  // re-rendered the entire control panel per animation frame during interaction,
+  // stealing main-thread time from the render loop. Instead they live in a
+  // mutable store and only the `<StatusReadout>` leaf subscribes (same reasoning
+  // as the imperative stretch sliders — see the header comment).
+  const readoutRef = useRef<ReadoutStore | null>(null);
+  if (readoutRef.current === null) readoutRef.current = createReadoutStore();
+  const readout = readoutRef.current;
   const [limits, setLimits] = useState<Record<string, { min: number; max: number }>>({});
   const [histos, setHistos] = useState<Record<string, BandHistogram>>(() => precomputedHistos(bands));
   const [markers, setMarkers] = useState<MarkerInput[]>(Array.isArray(catalogSource) ? catalogSource : []);
@@ -913,16 +920,26 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   }, [getViewer, state.mode, state.band, state.rgb.r, state.rgb.g, state.rgb.b, state.stretch, applyTrilogyFromStats]);
 
   const onFrame = (info: ViewerFrameInfo): void => {
-    setFrame((prev) =>
-      prev !== null && prev.level === info.level && prev.zoom === info.zoom && prev.northUp === info.northUp
-        ? prev
-        : info,
-    );
+    // Same change-guard the old setState had: a pan (level/zoom/northUp all
+    // unchanged) doesn't touch the readout at all.
+    const prev = readout.frame;
+    if (prev === null || prev.level !== info.level || prev.zoom !== info.zoom || prev.northUp !== info.northUp) {
+      readout.frame = info;
+      emitReadout(readout);
+    }
     if (needSeedRef.current) {
       needSeedRef.current = false;
       void seed();
     }
   };
+
+  const onCursor = useCallback(
+    (info: CursorInfo | null): void => {
+      readout.cursor = info;
+      emitReadout(readout);
+    },
+    [readout],
+  );
 
   const setLimit = (bandName: string, min: number, max: number, role?: Role): void => {
     setLimits((prev) => ({ ...prev, [bandName]: { min, max } }));
@@ -949,7 +966,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
           hiDpiLevels={props.hiDpiLevels}
           markerTooltip={props.markerTooltip}
           onMarkerClick={props.onMarkerClick}
-          onCursor={setCursor}
+          onCursor={onCursor}
           onFrame={onFrame}
           onReady={() => setReadyTick((t) => t + 1)}
           onError={props.onError}
@@ -1147,20 +1164,62 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
           <b>{state.stretch}</b>
         </span>
         <span className="fgl-spacer" />
-        <span className="fgl-item coord">
-          <i>α</i>
-          <b>{cursor !== null && cursor.ra !== null ? formatRA(cursor.ra) : '—'}</b>
-        </span>
-        <span className="fgl-item coord">
-          <i>δ</i>
-          <b>{cursor !== null && cursor.dec !== null ? formatDec(cursor.dec) : '—'}</b>
-        </span>
-        <span className="fgl-item">
-          <i>zoom</i>
-          <b>{frame !== null ? `${frame.zoom.toFixed(2)}×` : '—'}</b>
-        </span>
+        <StatusReadout store={readout} />
       </div>
     </div>
+  );
+}
+
+/**
+ * Mutable holder for the per-frame status readouts (cursor sky position + zoom).
+ * The explorer's `onCursor`/`onFrame` callbacks write into it and bump `version`;
+ * only `<StatusReadout>` subscribes, so a pointer move or zoom frame re-renders
+ * that one leaf instead of reconciling the whole control panel at frame rate.
+ */
+interface ReadoutStore {
+  cursor: CursorInfo | null;
+  frame: ViewerFrameInfo | null;
+  version: number;
+  listeners: Set<() => void>;
+}
+
+function createReadoutStore(): ReadoutStore {
+  return { cursor: null, frame: null, version: 0, listeners: new Set() };
+}
+
+function emitReadout(store: ReadoutStore): void {
+  store.version++;
+  for (const l of store.listeners) l();
+}
+
+/** The α/δ/zoom status-bar cells — the only subtree that updates per frame. */
+function StatusReadout({ store }: { store: ReadoutStore }): JSX.Element {
+  useSyncExternalStore(
+    (onChange) => {
+      store.listeners.add(onChange);
+      return (): void => {
+        store.listeners.delete(onChange);
+      };
+    },
+    () => store.version,
+    () => 0,
+  );
+  const { cursor, frame } = store;
+  return (
+    <>
+      <span className="fgl-item coord">
+        <i>α</i>
+        <b>{cursor !== null && cursor.ra !== null ? formatRA(cursor.ra) : '—'}</b>
+      </span>
+      <span className="fgl-item coord">
+        <i>δ</i>
+        <b>{cursor !== null && cursor.dec !== null ? formatDec(cursor.dec) : '—'}</b>
+      </span>
+      <span className="fgl-item">
+        <i>zoom</i>
+        <b>{frame !== null ? `${frame.zoom.toFixed(2)}×` : '—'}</b>
+      </span>
+    </>
   );
 }
 

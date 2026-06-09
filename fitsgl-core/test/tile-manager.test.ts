@@ -343,6 +343,29 @@ describe('finerFallback (zoom-out, overlays resident finer detail)', () => {
     expect(finerFallback(1, 2, 1, () => false)).toBeNull();
   });
 
+  it('caps the walk at maxDepth levels below the target (per-frame cost bound)', () => {
+    // Only z=0 detail is resident under target (3,0,0) — three levels down, past
+    // the default depth cap of 2, so it is NOT surfaced (the coarse base covers).
+    const loaded = new Set<string>();
+    for (let x = 0; x <= 7; x++) for (let y = 0; y <= 7; y++) loaded.add(tileKey(0, x, y));
+    const probe = (l: number, x: number, y: number): boolean => loaded.has(tileKey(l, x, y));
+    expect(finerFallback(3, 0, 0, probe)).toBeNull();
+    // An explicit deeper cap restores the exhaustive walk.
+    const fb = finerFallback(3, 0, 0, probe, 3);
+    expect(fb?.level).toBe(0);
+    expect(fb?.tiles).toHaveLength(64);
+  });
+
+  it('never probes deeper than maxDepth (call-count bound)', () => {
+    let calls = 0;
+    const probe = (): boolean => {
+      calls++;
+      return false;
+    };
+    expect(finerFallback(6, 0, 0, probe)).toBeNull();
+    expect(calls).toBe(4 + 16); // depth 1 + depth 2, nothing deeper
+  });
+
   it('returns null at the finest level (z=0 has no descendants)', () => {
     expect(finerFallback(0, 5, 3, () => true)).toBeNull();
   });
