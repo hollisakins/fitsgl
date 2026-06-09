@@ -456,6 +456,11 @@ export default FitsViewerComponent;
 // imports it) is evaluated by this re-export.
 export { FitsExplorer } from './explorer.js';
 export type { FitsExplorerProps } from './explorer.js';
+// The decorative boot/placeholder overlay (a `children` of `<FitsViewer>`); the
+// batteries-included `<FitsExplorer>` wires it up itself, but a bare-`<FitsViewer>`
+// host can drop it in too.
+export { FitsLoadingField } from './loading-field.js';
+export type { FitsLoadingFieldProps, FitsLoadingFieldHandle } from './loading-field.js';
 export {
   defaultExplorerState,
   deriveViewerConfig,

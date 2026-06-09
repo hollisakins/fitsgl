@@ -28,6 +28,9 @@ import type {
 
 import { FitsViewer } from './index.js';
 import type { FitsViewerCore, FitsViewerHandle } from './index.js';
+// Imported directly (not via ./index.js) to avoid a load-order TDZ — index.tsx
+// re-exports this binding *after* the `./explorer` re-export it pulls in here.
+import { FitsLoadingField } from './loading-field.js';
 import {
   COLORMAP_NAMES,
   STRETCH_MODES,
@@ -66,7 +69,7 @@ import {
   type ExplorerDefaultView,
   type ExplorerState,
 } from './explorer-state.js';
-import { viewSignature } from './plan.js';
+import { bandsSignature, viewSignature } from './plan.js';
 
 const CH_COLOR = { r: '#ff6b6b', g: '#56d089', b: '#5c8cff' } as const;
 type Role = 'r' | 'g' | 'b';
@@ -753,6 +756,10 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const [state, setState] = useState<ExplorerState>(() => defaultExplorerState(bands, initialView));
   const [collapsed, setCollapsed] = useState(false);
   const [readyTick, setReadyTick] = useState(0);
+  // The decorative boot overlay: shown until the first frame draws, replayed when
+  // the band set reloads (a band change tears down the viewer + refetches pyramids,
+  // so the canvas goes blank), and dismissed on a load error so it never sticks.
+  const [loading, setLoading] = useState(true);
   // Cursor + zoom readouts update on every pointer-move / zoom frame. They are
   // deliberately NOT React state here: routing them through the explorer's state
   // re-rendered the entire control panel per animation frame during interaction,
@@ -775,6 +782,14 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   }, [bands]);
 
   const viewerConfig = useMemo(() => deriveViewerConfig(bands, state), [bands, state]);
+
+  // Replay the boot overlay whenever the band set changes (the only config delta
+  // that reloads pyramids + rebuilds the viewer — view/stretch/colormap tweaks are
+  // live setters that keep the canvas painted). `onFrame` clears it on the next draw.
+  const bandsKey = bandsSignature(viewerConfig);
+  useEffect(() => {
+    setLoading(true);
+  }, [bandsKey]);
 
   // Fetch a catalog URL into markers (a pre-parsed array is used as-is).
   useEffect(() => {
@@ -931,6 +946,9 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
       needSeedRef.current = false;
       void seed();
     }
+    // First real pixels are on screen — hand off from the placeholder. Guarded so a
+    // steady pan/zoom stream doesn't churn state (setState bails on an equal value).
+    if (loading) setLoading(false);
   };
 
   const onCursor = useCallback(
@@ -969,8 +987,12 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
           onCursor={onCursor}
           onFrame={onFrame}
           onReady={() => setReadyTick((t) => t + 1)}
-          onError={props.onError}
+          onError={(e) => {
+            setLoading(false);
+            props.onError?.(e);
+          }}
         >
+          <FitsLoadingField active={loading} />
           <div className={`fgl-win${collapsed ? ' collapsed' : ''}`}>
             <div className="fgl-win-head" onClick={() => setCollapsed((c) => !c)}>
               <span className="fgl-win-ttl">Display</span>
