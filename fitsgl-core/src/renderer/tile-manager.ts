@@ -318,12 +318,26 @@ export interface FinerCoverage {
 }
 
 /**
+ * Default depth cap for `finerFallback`: how many levels below the target the
+ * walk may probe. Each step down quadruples the descendant probes (4ᵏ at depth
+ * k), so an uncapped walk costs O(4^level) `isLoaded` calls per missing tile —
+ * and the viewer runs it every frame for every missing/fading tile, which at
+ * coarse levels over a cold region is tens of thousands of map lookups per
+ * frame. Depth 2 bounds it at 4 + 16 = 20 probes per tile. Detail more than two
+ * levels finer is NEAREST-decimated ≥4× on screen anyway (visually ~the coarse
+ * base), and the pinned floor keeps the frame hole-free regardless.
+ */
+export const FINER_FALLBACK_MAX_DEPTH = 2;
+
+/**
  * Finer-level fallback (the zoom-OUT counterpart of `coarserFallback`). When a
  * target tile is not yet resident, the FINER level the user just left is often
  * still GPU-resident and covers the same world area at higher resolution — far
- * better than upscaling a coarse ancestor. Walks DOWN from `level - 1` toward 0
- * and returns the NEAREST finer level that has ANY resident descendant of the
- * target, together with the subset of its 2ᵏ×2ᵏ descendant block that is resident.
+ * better than upscaling a coarse ancestor. Walks DOWN from `level - 1` toward
+ * `level - maxDepth` (clamped at 0; see `FINER_FALLBACK_MAX_DEPTH` for why the
+ * walk is capped) and returns the NEAREST finer level that has ANY resident
+ * descendant of the target, together with the subset of its 2ᵏ×2ᵏ descendant
+ * block that is resident.
  *
  * Coverage is deliberately PARTIAL: the caller draws a coarse ancestor as a base
  * first (always hole-free, thanks to the pinned coarsest tile) and then overlays
@@ -341,8 +355,10 @@ export function finerFallback(
   tileX: number,
   tileY: number,
   isLoaded: (level: number, tileX: number, tileY: number) => boolean,
+  maxDepth: number = FINER_FALLBACK_MAX_DEPTH,
 ): FinerCoverage | null {
-  for (let fl = level - 1; fl >= 0; fl--) {
+  const floor = Math.max(0, level - maxDepth);
+  for (let fl = level - 1; fl >= floor; fl--) {
     const n = 2 ** (level - fl);
     const bx = tileX * n;
     const by = tileY * n;

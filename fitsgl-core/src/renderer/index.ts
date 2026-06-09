@@ -76,6 +76,7 @@ export {
   coarserFallback,
   commonResidentLevel,
   finerFallback,
+  FINER_FALLBACK_MAX_DEPTH,
   selectEvictions,
   buildLevelGeoms,
   tileWorldRect,
