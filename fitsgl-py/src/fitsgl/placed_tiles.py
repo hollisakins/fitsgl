@@ -253,8 +253,11 @@ def assemble_placed_tiles(
     native = np.lib.format.open_memmap(out_npy, mode="w+", dtype=np.float32, shape=(H, W))
     native[:] = np.nan
     # `best` (owner squared-distance) is the only extra full-grid buffer; memmap it so
-    # peak RAM stays ~one tile rather than another full mosaic.
-    best_fd, best_path = tempfile.mkstemp(suffix="_bestdist.npy")
+    # peak RAM stays ~one tile rather than another full mosaic. Colocate it with
+    # `out_npy` (the large output volume) rather than the default $TMPDIR — on compute
+    # nodes /tmp is often a small or RAM-backed tmpfs, and a multi-GB memmap there
+    # SIGBUSes when the filesystem can't back the pages.
+    best_fd, best_path = tempfile.mkstemp(suffix="_bestdist.npy", dir=Path(out_npy).parent)
     os.close(best_fd)
     try:
         best = np.lib.format.open_memmap(best_path, mode="w+", dtype=np.float32, shape=(H, W))
