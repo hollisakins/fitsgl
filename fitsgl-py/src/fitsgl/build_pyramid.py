@@ -24,6 +24,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from astropy.io import fits
@@ -31,6 +32,9 @@ from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 
 from .manifest import LevelInfo, Manifest, SupertileInfo, write_manifest
+
+if TYPE_CHECKING:
+    from .placed_tiles import GridFrame
 
 #: fpack-internal tile size; the unit of HTTP byte ranges the browser requests.
 FPACK_TILE_SIZE = 256
@@ -442,6 +446,15 @@ def _build_level(task: _LevelTask) -> dict:
         # un-chunked level stays byte-identical to the old one-file-per-level output.
         sub = np.ascontiguousarray(level[y0:y1, x0:x1])
 
+        # An all-NaN supertile carries no data (a band covering only a subset of its
+        # co-gridded group's footprint, or a survey's irregular corner). Drop it: it
+        # is omitted from the manifest and never shipped; `resolveSupertile` returns
+        # undefined for its tiles and the client falls back to a coarser level whose
+        # supertile does cover the region (with NaN), which the shader renders as
+        # background. `fpack_tile_count` stays the FULL grid, so tile math is unchanged.
+        if bool(np.all(np.isnan(sub))):
+            continue
+
         if single:
             filename = f"{task.stem}_z{task.z}.fits.fz"
             sub_header = level_header
@@ -466,6 +479,13 @@ def _build_level(task: _LevelTask) -> dict:
             )
         supertiles.append(
             SupertileInfo(filename=filename, tile_origin=[tx0, ty0], tile_count=[snx, sny])
+        )
+
+    if not supertiles:
+        # Every block was all-NaN — the band has no finite pixels at this level (and,
+        # since coarser levels only gain coverage, nowhere). A misconfigured band.
+        raise RuntimeError(
+            f"z={task.z}: level is entirely NaN (no finite data) — check the band's inputs."
         )
 
     level_info = LevelInfo(
@@ -496,6 +516,7 @@ def build_pyramid(
     size_budget_bytes: int = EDGE_CACHE_LIMIT_BYTES,
     processes: int | None = None,
     verify: bool = True,
+    grid_frame: "GridFrame | None" = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> Manifest:
     """Build a multi-resolution fpacked pyramid from one FITS mosaic.
@@ -531,6 +552,12 @@ def build_pyramid(
         quantization tolerance). Default True; set False to skip the second full
         decode per level on very large mosaics where memory is the constraint (the
         cheap heap-overflow header check still runs).
+    grid_frame
+        Optional shared :class:`placed_tiles.GridFrame`. When set, the input is
+        placed onto that frame's reference + extent (NaN-padded if it covers only a
+        subset) so this band co-grids with the others in its group; a single input
+        is routed through the placement path too. ``None`` keeps each band on its own
+        grid (the default).
     on_progress
         Optional callback invoked with human-readable progress lines (input read,
         levels building, each level as it completes). Defaults to silent.
@@ -560,7 +587,7 @@ def build_pyramid(
     # peak memory and is what makes a large build thrash; the page-cache-backed
     # mmap shares ONE copy. Freed from the parent here, then unlinked when done.
     native_npy = output_dir / "_native.npy"
-    if len(input_paths) == 1:
+    if len(input_paths) == 1 and grid_frame is None:
         report(f"reading {input_paths[0].name} …")
         data, header = _read_input(input_paths[0])
         native_h, native_w = int(data.shape[0]), int(data.shape[1])
@@ -568,14 +595,16 @@ def build_pyramid(
         del data
         source_file = input_paths[0].name
     else:
-        # Pre-tiled input: place the tiles onto one virtual native grid first, then
-        # tile it exactly like a single mosaic. (Lazy import breaks the import cycle.)
+        # Pre-tiled input (or a single input padded onto a shared grid frame): place
+        # the tiles onto one virtual native grid first, then tile it exactly like a
+        # single mosaic. (Lazy import breaks the import cycle.)
         from .placed_tiles import assemble_placed_tiles
 
         header, (native_h, native_w) = assemble_placed_tiles(
-            input_paths, native_npy, on_progress=report
+            input_paths, native_npy, frame=grid_frame, on_progress=report
         )
-        source_file = f"{stem} ({len(input_paths)} tiles)"
+        n = len(input_paths)
+        source_file = f"{stem} ({n} tile{'s' if n != 1 else ''})"
     report(f"read {native_h}×{native_w} mosaic")
 
     N = n_levels((native_h, native_w), tile_size)

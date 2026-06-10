@@ -258,6 +258,7 @@ input = "mosaics/cosmos_f150w_*.fits"   # glob: several pre-tiled tiles onto one
 quantize_level = 8               # RICE_1 quantization (default 8; display-only)
 tile_size = 256                  # fpack-internal tile size (default 256)
 # supertile_blocks = 48          # render-tiles per side per .fits.fz file (default 48)
+# shared_grid = true             # co-grid bands of differing footprint (default on)
 
 [viewer]
 default = "rgb"                  # "single" | "rgb"
@@ -277,9 +278,17 @@ Key notes, verified against the parser:
   band's `name` (or its original toml name) and must resolve to a known band.
 - `[viewer].stretch` must be one of `linear | log | asinh | trilogy`. `colormap`
   applies to single-band mode only.
-- `[build]` keys are all integers; `quantize_level` and `tile_size` must be
+- `[build]` numeric keys are integers; `quantize_level` and `tile_size` must be
   positive, `supertile_blocks ≥ 1`. Changing any of these requires `fitsgl build
   --overwrite`.
+- `[build].shared_grid` (boolean, default `true`) co-grids bands that share a WCS
+  but cover different tile footprints — e.g. F444W over 20 tiles, F410M over 18 —
+  onto one grid, NaN-padding the smaller ones so they composite in RGB. It is a
+  no-op unless bands actually differ, and only the under-covered bands are
+  rebuilt; supertiles over a band's uncovered region are never shipped. A
+  footprint change (a band added/removed/resized) rebuilds the affected bands
+  automatically (no `--overwrite` needed). Set `false` to keep each band on its
+  own grid.
 - A `name` that isn't URL-safe is slugged automatically (with a warning unless
   you set an explicit `label`).
 

@@ -87,6 +87,10 @@ class BuildSpec:
     #: Max render-tiles per side per supertile file. ``None`` → the builder's default
     #: (``build_pyramid.DEFAULT_SUPERTILE_BLOCKS``); set to override.
     supertile_blocks: int | None = None
+    #: Co-grid bands that share a WCS but cover different tile footprints onto one
+    #: shared grid (NaN-padding the smaller ones) so they composite in RGB. On by
+    #: default; a no-op unless bands actually differ. Set ``false`` to disable.
+    shared_grid: bool = True
 
 
 @dataclass
@@ -347,6 +351,10 @@ def _parse_build(raw: object) -> BuildSpec:
             v = raw[key]
             _require(isinstance(v, int) and not isinstance(v, bool), f"[build].{key} must be an integer")
             setattr(out, key, v)
+    if "shared_grid" in raw:
+        sg = raw["shared_grid"]
+        _require(isinstance(sg, bool), "[build].shared_grid must be a boolean")
+        out.shared_grid = sg
     _require(out.quantize_level > 0, "[build].quantize_level must be positive")
     _require(out.tile_size > 0, "[build].tile_size must be positive")
     _require(
