@@ -34,8 +34,10 @@ from .bands import detect_band, detect_band_from_filename
 from .build_pyramid import DEFAULT_SUPERTILE_BLOCKS, build_pyramid
 from .catalog import ingest_catalog
 from .config import DatasetConfig
+from .dataset import grid_hash
 from .fitsgl_config import build_fitsgl_config, default_view_dict
 from .manifest import Manifest, read_manifest
+from .placed_tiles import GridFrame, plan_grid_frames
 from .site import copy_viewer_into
 from .stats import compute_band_histogram, compute_band_trilogy_stats
 
@@ -51,13 +53,19 @@ class BuildResult:
     reused_bands: tuple[str, ...] = ()  # bands reused from a prior build (not rebuilt)
 
 
-def _band_cache_valid(band_dir: Path) -> Manifest | None:
+def _band_cache_valid(band_dir: Path, frame: GridFrame | None = None) -> Manifest | None:
     """Return the cached manifest if ``band_dir`` is a complete, reusable build, else None.
 
     A band is reusable when its ``manifest.json`` loads and every supertile file it
     references is present. ``build_pyramid`` writes ``manifest.json`` last, so its mere
     presence already implies a finished band; the file-existence sweep additionally
     guards against a hand-deleted or partially-synced level file.
+
+    With ``frame`` (the shared grid this band must now sit on), the cached band's z=0
+    ``grid_hash`` must still match the frame's. A footprint change — a band added,
+    removed, or resized that grew the co-gridded group's union — flips the expected
+    hash, so the stale band is rebuilt onto the new shared grid rather than silently
+    left at the old shape (which would break the RGB composite).
     """
     manifest_path = band_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -72,6 +80,14 @@ def _band_cache_valid(band_dir: Path) -> Manifest | None:
         for st in level.supertiles:
             if not (band_dir / st.filename).is_file():
                 return None
+    if frame is not None:
+        z0 = next((lvl for lvl in manifest.levels if lvl.z == 0), None)
+        if z0 is None:
+            return None
+        want = grid_hash(dict(frame.global_header()), frame.shape)
+        got = grid_hash(z0.wcs, manifest.native_shape)
+        if want != got:
+            return None
     return manifest
 
 
@@ -226,11 +242,20 @@ def build_dataset(
     # reused band never re-decodes its native level just to recompute them.
     prev_stats = {} if overwrite else _load_prev_band_stats(dataset_dir / "fitsgl.json")
     total = len(config.bands)
-    for i, band in enumerate(config.bands, 1):
+    # Plan the shared grid across all bands up front (header-only, cheap): a band that
+    # co-grids with another but covers a smaller footprint gets a GridFrame to be
+    # NaN-padded onto, so the bands composite in RGB. None where a band already
+    # defines the grid (the superset) or has no co-gridded sibling — built as-is.
+    frames: list[GridFrame | None] = (
+        plan_grid_frames([band.inputs for band in config.bands])
+        if config.build.shared_grid
+        else [None] * total
+    )
+    for i, (band, frame) in enumerate(zip(config.bands, frames), 1):
         final = dataset_dir / band.name
         multi = len(band.inputs) > 1
         src_desc = f"{len(band.inputs)} tiles" if multi else band.inputs[0].name
-        cached = None if overwrite else _band_cache_valid(final)
+        cached = None if overwrite else _band_cache_valid(final, frame)
         if cached is not None:
             log(f"[{i}/{total}] band {band.name}  (reused — already built; pass --overwrite to rebuild)")
             manifest = cached
@@ -243,9 +268,9 @@ def build_dataset(
             manifest = build_pyramid(
                 band.inputs,
                 output_dir=staging,
-                # Multi-tile bands get clean {slug}_z… filenames; single-input keeps
-                # its file-stem default (unchanged output).
-                stem=band.name if multi else None,
+                # Multi-tile (or shared-grid-padded) bands get clean {slug}_z… filenames;
+                # a plain single-input band keeps its file-stem default (unchanged output).
+                stem=band.name if (multi or frame is not None) else None,
                 tile_size=config.build.tile_size,
                 quantize_level=config.build.quantize_level,
                 supertile_blocks=(
@@ -255,6 +280,7 @@ def build_dataset(
                 ),
                 processes=processes,
                 verify=verify,
+                grid_frame=frame,
                 on_progress=lambda m: log(f"    {m}"),
             )
             # Promote only now that build_pyramid has written the manifest: the band

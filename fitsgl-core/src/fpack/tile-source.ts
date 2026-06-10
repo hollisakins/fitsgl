@@ -112,6 +112,20 @@ export class TileEngine {
   }
 
   /**
+   * Whether a supertile of level `z` covers global tile (tileX, tileY) — pure, no
+   * IO. False for an out-of-grid tile AND for an in-grid tile that no supertile
+   * paves (a gap: a band built on a shared grid it only partly covers, or a
+   * survey's irregular corner, ships no all-NaN supertile there). Callers use it
+   * to skip requesting a tile that will never resolve, instead of fetching it and
+   * handling the `getTile` rejection every frame.
+   */
+  hasTile(level: number, tileX: number, tileY: number): boolean {
+    const lvl = this.manifest.levels.find((l) => l.z === level);
+    if (lvl === undefined) return false;
+    return resolveSupertile(lvl, tileX, tileY) !== undefined;
+  }
+
+  /**
    * Resolve a global tile to the supertile file that holds it plus its
    * supertile-local coordinates, opening (and memoizing) that `FpackFile`. For a
    * v1 / single-supertile level this is the whole level file and local == global.
@@ -310,6 +324,12 @@ export class TilePyramid {
 
   getManifest(): Manifest {
     return this.engine.getManifest();
+  }
+
+  /** Whether a supertile of level `z` covers (tileX, tileY); see `TileEngine.hasTile`. */
+  hasTile(level: number, tileX: number, tileY: number): boolean {
+    if (this.destroyed) return false;
+    return this.engine.hasTile(level, tileX, tileY);
   }
 
   async getTile(

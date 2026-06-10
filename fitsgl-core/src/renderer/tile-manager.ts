@@ -516,6 +516,9 @@ export class TileManager {
   warmLevel(level: number, tileX: number, tileY: number): void {
     const key = tileKey(level, tileX, tileY);
     if (this.warmed.has(key) || this.textures.has(key) || this.inflight.has(key)) return;
+    // No supertile covers this tile (a gap in a partly-covered shared grid): nothing
+    // to warm, and prefetching would just fail.
+    if (!this.pyramid.hasTile(level, tileX, tileY)) return;
     this.warmed.add(key);
     this.pyramid.prefetchTileIndex(level, tileX, tileY).catch(() => {
       this.warmed.delete(key);
@@ -528,6 +531,11 @@ export class TileManager {
     if (this.textures.has(key) || this.inflight.has(key)) return;
     const geom = this.geoms.get(level);
     if (geom === undefined) return;
+    // No supertile covers this tile — a gap in a band that only partly covers its
+    // shared grid (or a survey's irregular edge). Treat it as permanently absent:
+    // skip the fetch so the caller's coarser/RGB fallback handles the hole, instead
+    // of re-issuing a doomed request (and logging) every frame.
+    if (!this.pyramid.hasTile(level, tileX, tileY)) return;
     this.inflight.add(key);
     const controller = new AbortController();
     this.fetches.set(key, { controller, level });

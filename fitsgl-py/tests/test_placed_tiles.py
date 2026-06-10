@@ -12,8 +12,19 @@ import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
 
+from fitsgl.build import _band_cache_valid
 from fitsgl.build_pyramid import StopAndAsk, build_pyramid, estimate_noise
+from fitsgl.dataset import grid_hash
+from fitsgl.placed_tiles import GridFrame, plan_grid_frames
 from fitsgl.synthetic import generate_synthetic_mosaic
+
+
+def _z0(manifest):
+    return next(lvl for lvl in manifest.levels if lvl.z == 0)
+
+
+def _grid_hash(manifest):
+    return grid_hash(_z0(manifest).wcs, manifest.native_shape)
 
 
 def _crop_tile(base_img, base_hdr, y0, y1, x0, x1):
@@ -109,6 +120,94 @@ def test_rejects_subpixel_phase(tmp_path):
     _write(pb, b_img, b_hdr)
     with pytest.raises(StopAndAsk, match="integer|phase"):
         build_pyramid([pa, pb], output_dir=tmp_path / "out")
+
+
+def test_plan_grid_frames_groups_by_footprint(tmp_path):
+    """The superset band gets None; a strict-subset co-gridded band gets the union frame."""
+    base, hdr, _ = generate_synthetic_mosaic(shape=(256, 256), seed=10, nan_fraction=0.0)
+    base = base.astype(np.float32)
+    a_img, a_hdr = _crop_tile(base, hdr, 0, 256, 0, 256)  # full footprint
+    b_img, b_hdr = _crop_tile(base, hdr, 0, 128, 0, 128)  # top-left subset
+    pa, pb = tmp_path / "A.fits", tmp_path / "B.fits"
+    _write(pa, a_img, a_hdr)
+    _write(pb, b_img, b_hdr)
+
+    frames = plan_grid_frames([[pa], [pb]])
+    assert frames[0] is None  # A already covers the union → built as-is
+    assert isinstance(frames[1], GridFrame)
+    assert frames[1].shape == (256, 256)  # B padded up to A's footprint
+
+
+def test_plan_grid_frames_solo_and_distinct_grids_get_none(tmp_path):
+    """A lone band, and bands on genuinely different grids, are never force-framed."""
+    base, hdr, _ = generate_synthetic_mosaic(shape=(128, 128), seed=11, nan_fraction=0.0)
+    base = base.astype(np.float32)
+    a_img, a_hdr = _crop_tile(base, hdr, 0, 128, 0, 128)
+    b_img, b_hdr = _crop_tile(base, hdr, 0, 128, 0, 128)
+    b_hdr["CRVAL1"] = float(b_hdr["CRVAL1"]) + 0.5  # a different reference point → different grid
+    pa, pb = tmp_path / "A.fits", tmp_path / "B.fits"
+    _write(pa, a_img, a_hdr)
+    _write(pb, b_img, b_hdr)
+
+    assert plan_grid_frames([[pa]]) == [None]  # solo band
+    assert plan_grid_frames([[pa], [pb]]) == [None, None]  # distinct grids → separate groups
+
+
+def test_partial_coverage_cogrids_and_skips_empty_supertiles(tmp_path):
+    """A band covering a subset of the shared grid is NaN-padded so it co-grids with
+    the full band, and the supertiles over its uncovered region are not shipped."""
+    base, hdr, _ = generate_synthetic_mosaic(shape=(256, 256), seed=12, nan_fraction=0.0)
+    base = base.astype(np.float32)
+    a_img, a_hdr = _crop_tile(base, hdr, 0, 256, 0, 256)  # full
+    b_img, b_hdr = _crop_tile(base, hdr, 0, 128, 0, 128)  # top-left 2x2 render-tiles only
+    pa, pb = tmp_path / "A.fits", tmp_path / "B.fits"
+    _write(pa, a_img, a_hdr)
+    _write(pb, b_img, b_hdr)
+
+    frames = plan_grid_frames([[pa], [pb]])
+    # tile_size=64, supertile_blocks=1 → one supertile per render-tile, so an
+    # uncovered render-tile is a droppable all-NaN supertile.
+    ma = build_pyramid([pa], output_dir=tmp_path / "a", stem="A", tile_size=64, supertile_blocks=1)
+    mb = build_pyramid(
+        [pb], output_dir=tmp_path / "b", stem="B", tile_size=64, supertile_blocks=1,
+        grid_frame=frames[1],
+    )
+
+    # Co-gridded: identical native shape AND identical advisory grid hash (one group).
+    assert ma.native_shape == mb.native_shape == [256, 256]
+    assert _grid_hash(ma) == _grid_hash(mb)
+
+    za, zb = _z0(ma), _z0(mb)
+    # The level's TOTAL grid is unchanged (tile math is identical for both bands)…
+    assert za.fpack_tile_count == zb.fpack_tile_count == [4, 4]
+    # …but B ships only the 2x2 = 4 covered supertiles; A ships all 16.
+    assert len(za.supertiles) == 16
+    assert len(zb.supertiles) == 4
+    covered = {(st.tile_origin[0], st.tile_origin[1]) for st in zb.supertiles}
+    assert covered == {(0, 0), (1, 0), (0, 1), (1, 1)}
+
+
+def test_shared_grid_cache_invalidates_on_footprint_change(tmp_path):
+    """A cached band is reusable only while its grid still matches the planned frame;
+    a frame whose footprint grew (a band added/resized the union) forces a rebuild."""
+    base, hdr, _ = generate_synthetic_mosaic(shape=(256, 256), seed=13, nan_fraction=0.0)
+    base = base.astype(np.float32)
+    a_img, a_hdr = _crop_tile(base, hdr, 0, 256, 0, 256)
+    b_img, b_hdr = _crop_tile(base, hdr, 0, 128, 0, 128)
+    pa, pb = tmp_path / "A.fits", tmp_path / "B.fits"
+    _write(pa, a_img, a_hdr)
+    _write(pb, b_img, b_hdr)
+
+    frame_b = plan_grid_frames([[pa], [pb]])[1]
+    assert frame_b is not None
+    outb = tmp_path / "b"
+    build_pyramid([pb], output_dir=outb, stem="B", grid_frame=frame_b)
+
+    # Same frame → cached band is reused.
+    assert _band_cache_valid(outb, frame_b) is not None
+    # A larger frame (the union grew) → the cached band's grid_hash no longer matches.
+    bigger = GridFrame(frame_b.signature, frame_b.ref_crpix, (512, 512), frame_b.template_header)
+    assert _band_cache_valid(outb, bigger) is None
 
 
 def test_single_element_list_matches_scalar(tmp_path):

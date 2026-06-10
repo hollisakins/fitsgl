@@ -40,6 +40,7 @@ const TILE_LEN = 256 * 256;
 function fakePyramid(): TilePyramid {
   return {
     getTile: () => Promise.resolve(new Float32Array(TILE_LEN)),
+    hasTile: () => true,
   } as unknown as TilePyramid;
 }
 
@@ -102,6 +103,7 @@ describe('TileManager upload queue (P4 throttling)', () => {
         calls++;
         return Promise.resolve(new Float32Array(TILE_LEN));
       },
+      hasTile: () => true,
     } as unknown as TilePyramid;
     const { gl } = fakeGl();
     const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
@@ -129,6 +131,31 @@ describe('TileManager upload queue (P4 throttling)', () => {
     expect(mgr.flushUploads(8)).toBe(0);
     expect(created()).toBe(0);
   });
+
+  it('does not fetch a tile no supertile covers (gap in a partly-covered grid)', async () => {
+    let calls = 0;
+    // hasTile is false only for the gap tile (0,1); every other tile is covered.
+    const pyramid = {
+      getTile: () => {
+        calls++;
+        return Promise.resolve(new Float32Array(TILE_LEN));
+      },
+      hasTile: (_l: number, x: number, y: number) => !(x === 0 && y === 1),
+    } as unknown as TilePyramid;
+    const { gl } = fakeGl();
+    const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
+    mgr.frame = 1;
+
+    mgr.request(0, 0, 1); // the gap → must NOT fetch (no doomed request / per-frame storm)
+    await settle();
+    expect(calls).toBe(0);
+    expect(mgr.acquire(0, 0, 1)).toBeUndefined();
+
+    mgr.request(0, 1, 1); // a covered tile → fetches normally
+    await settle();
+    expect(calls).toBe(1);
+    mgr.destroy();
+  });
 });
 
 describe('TileManager.warmLevel (speculative index prefetch)', () => {
@@ -140,6 +167,7 @@ describe('TileManager.warmLevel (speculative index prefetch)', () => {
         warms++;
         return Promise.resolve();
       },
+      hasTile: () => true,
     } as unknown as TilePyramid;
     const { gl } = fakeGl();
     const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
@@ -178,6 +206,7 @@ describe('TileManager request cancellation (P6a)', () => {
           // otherwise never resolves
         });
       },
+      hasTile: () => true,
     } as unknown as TilePyramid;
     return { pyramid, calls: () => calls };
   }
