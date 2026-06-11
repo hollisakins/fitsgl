@@ -418,10 +418,17 @@ def _build_level(task: _LevelTask) -> dict:
     common, un-chunked case (a single ``{stem}_z{z}.fits.fz``, byte-identical to the
     pre-supertile layout). Returns a LevelInfo dict.
 
-    The native array is read via a copy-on-write memory-map of the shared ``.npy``
-    (mode ``c``), so every level worker shares one copy through the OS page cache.
+    The native array is read via a **read-only** memory-map of the shared ``.npy``
+    (mode ``r``), so every level worker shares one copy through the OS page cache.
+    Read-only (``MAP_SHARED``/``PROT_READ``) is deliberate over copy-on-write
+    (``mode="c"``): nothing here mutates ``native`` (``_downsample`` only reads it,
+    copying each supertile out via ``ascontiguousarray``), and under strict overcommit
+    (``vm.overcommit_memory=2``) a copy-on-write mapping reserves its FULL size as
+    commit charge per worker even though no page is ever written — N workers × a
+    multi-GB mosaic blows the commit limit and OOMs at ``mmap()``. A read-only mapping
+    charges nothing.
     """
-    native = np.load(task.native_npy, mmap_mode="c")
+    native = np.load(task.native_npy, mmap_mode="r")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
