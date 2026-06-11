@@ -11,7 +11,9 @@ from dataclasses import dataclass
 
 import pytest
 
+from fitsgl import build as build_mod
 from fitsgl import cli
+from fitsgl import deploy as deploy_mod
 from fitsgl.deploy import DeployResult
 from fitsgl.deploy_plan import DeployDiff
 
@@ -81,8 +83,8 @@ def _stub_build(monkeypatch):
     """Monkeypatch load_config + build_dataset; return the call recorder."""
     calls = {"build": [], "site": []}
     monkeypatch.setattr(cli, "load_config", lambda p: FakeChild(name=p.parent.name))
-    monkeypatch.setattr(cli, "build_dataset", lambda child, out, **kw: calls["build"].append((child.name, kw)))
-    monkeypatch.setattr(cli, "write_site", lambda child, out, **kw: calls["site"].append(child.name))
+    monkeypatch.setattr(build_mod, "build_dataset", lambda child, out, **kw: calls["build"].append((child.name, kw)))
+    monkeypatch.setattr(build_mod, "write_site", lambda child, out, **kw: calls["site"].append(child.name))
     return calls
 
 
@@ -127,7 +129,7 @@ def test_build_continue_on_failure(tmp_path, monkeypatch):
             raise ValueError("bad mosaic")
         built.append(child.name)
 
-    monkeypatch.setattr(cli, "build_dataset", flaky)
+    monkeypatch.setattr(build_mod, "build_dataset", flaky)
     rc = cli.main(["build", "-w", str(tmp_path / "fitsgl.workspace.toml")])
     assert rc == 1  # a field failed
     assert built == ["egs"]  # but the other still built
@@ -207,8 +209,8 @@ def _stub_deploy(monkeypatch, target, *, fail_prefix=None, verify_fail_prefix=No
         calls["target_built"] += 1
         return target
 
-    monkeypatch.setattr(cli.R2Target, "from_config", classmethod(fake_target_factory))
-    monkeypatch.setattr(cli.CloudflarePurge, "from_config", classmethod(lambda cls, c: None))
+    monkeypatch.setattr(deploy_mod.R2Target, "from_config", classmethod(fake_target_factory))
+    monkeypatch.setattr(deploy_mod.CloudflarePurge, "from_config", classmethod(lambda cls, c: None))
     monkeypatch.setattr(cli, "load_env_file", lambda p: [])
 
     fail_set = set(fail_prefix or ())
@@ -228,9 +230,9 @@ def _stub_deploy(monkeypatch, target, *, fail_prefix=None, verify_fail_prefix=No
         calls["emit"] += 1
         calls["emit_specs"] = [p for p, _, _ in field_specs]
 
-    monkeypatch.setattr(cli, "deploy_dataset", fake_deploy)
+    monkeypatch.setattr(deploy_mod, "deploy_dataset", fake_deploy)
     monkeypatch.setattr(cli, "emit_collection", fake_emit)
-    monkeypatch.setattr(cli, "deploy_collection_root", lambda *a, **k: calls.__setitem__("root", calls["root"] + 1))
+    monkeypatch.setattr(deploy_mod, "deploy_collection_root", lambda *a, **k: calls.__setitem__("root", calls["root"] + 1))
     return calls
 
 
@@ -391,7 +393,7 @@ def test_build_subset_does_not_stat_unselected_inputs(tmp_path, monkeypatch):
     )
     built = []
     # load_config is NOT stubbed: the real input-statting loader runs for selected fields.
-    monkeypatch.setattr(cli, "build_dataset", lambda child, out, **kw: built.append(child.name))
+    monkeypatch.setattr(build_mod, "build_dataset", lambda child, out, **kw: built.append(child.name))
     rc = cli.main(["build", "-w", str(tmp_path / "fitsgl.workspace.toml"), "--field", "egs", "-o", str(tmp_path / "dist")])
     assert rc == 0  # cosmos's missing input was never stat'd → validation/load stayed lazy
     assert built == ["egs"]

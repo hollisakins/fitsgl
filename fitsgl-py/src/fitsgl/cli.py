@@ -16,15 +16,15 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from .build import build_dataset, write_site
-from .build_pyramid import StopAndAsk
+# Only light, stdlib-backed modules are imported at module load so the CLI starts
+# instantly. The heavy modules — build/build_pyramid (astropy + numpy), demo,
+# deploy (boto3), init_scaffold (astropy) — are imported lazily inside the one
+# command that needs each, so `fitsgl index`/`serve`/`verify`/`--help` never pay
+# for dependencies they don't touch. (See also the lazy fitsgl/__init__.py.)
 from .collection import emit_collection
 from .config import DeployConfig, load_config, read_dataset_name
-from .demo import DEMO_RGB, build_demo
-from .deploy import CloudflarePurge, DeployError, R2Target, deploy_collection_root, deploy_dataset
 from .env_file import load_env_file
 from .deploy_plan import DeployDiff
-from .init_scaffold import scan_directory, write_scaffold
 from .serve import serve
 from .verify import format_report, verify_deployment
 from .workspace import (
@@ -202,6 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    print(f"fitsgl init: scanning {args.dir}…", flush=True)
+    from .init_scaffold import scan_directory, write_scaffold
+
     try:
         plan = scan_directory(args.dir)
         path = write_scaffold(plan, args.dir, force=args.force)
@@ -235,6 +238,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     if args.processes is not None and args.processes < 1:
         print("fitsgl demo: --processes must be >= 1", file=sys.stderr)
         return 2
+    print("fitsgl demo: generating synthetic dataset…", flush=True)
+    from .build_pyramid import StopAndAsk
+    from .demo import DEMO_RGB, build_demo
+
     try:
         result = build_demo(
             args.out,
@@ -276,6 +283,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
     if args.processes is not None and args.processes < 1:
         print("fitsgl build: --processes must be >= 1", file=sys.stderr)
         return 2
+    print(f"fitsgl build: loading {args.config}…", flush=True)
+    from .build import build_dataset, write_site
+    from .build_pyramid import StopAndAsk
+
     try:
         config = load_config(args.config)
     except (FileNotFoundError, ValueError) as e:
@@ -349,6 +360,10 @@ def _cmd_build_workspace(args: argparse.Namespace) -> int:
     if args.processes is not None and args.processes < 1:
         print("fitsgl build: --processes must be >= 1", file=sys.stderr)
         return 2
+    print(f"fitsgl build: loading workspace {args.workspace}…", flush=True)
+    from .build import build_dataset, write_site
+    from .build_pyramid import StopAndAsk
+
     try:
         ws, names = _load_workspace_validated(args.workspace)
         selected = select_fields(ws, args.field, names)
@@ -401,6 +416,7 @@ def _cmd_build_workspace(args: argparse.Namespace) -> int:
 
 
 def _cmd_index(args: argparse.Namespace) -> int:
+    print(f"fitsgl index: loading workspace {args.workspace}…", flush=True)
     try:
         ws, names = _load_workspace_validated(args.workspace)
     except (FileNotFoundError, ValueError) as e:
@@ -455,6 +471,9 @@ def _confirm_deploy(bucket: str) -> Callable[[DeployDiff], bool]:
 
 
 def _cmd_deploy(args: argparse.Namespace) -> int:
+    print(f"fitsgl deploy: loading {args.config}…", flush=True)
+    from .deploy import CloudflarePurge, DeployError, R2Target, deploy_dataset
+
     try:
         config = load_config(args.config)
     except (FileNotFoundError, ValueError) as e:
@@ -546,6 +565,15 @@ def _cmd_deploy_workspace(args: argparse.Namespace) -> int:
     if args.concurrency is not None and args.concurrency < 1:
         print("fitsgl deploy: --concurrency must be >= 1", file=sys.stderr)
         return 2
+    print(f"fitsgl deploy: loading workspace {args.workspace}…", flush=True)
+    from .deploy import (
+        CloudflarePurge,
+        DeployError,
+        R2Target,
+        deploy_collection_root,
+        deploy_dataset,
+    )
+
     try:
         ws, names = _load_workspace_validated(args.workspace)
         selected = select_fields(ws, args.field, names)

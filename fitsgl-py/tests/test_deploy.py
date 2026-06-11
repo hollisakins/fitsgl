@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import fitsgl.deploy as deploy_mod
 from fitsgl.deploy import (
     CloudflarePurge,
     DeployConfig,
@@ -563,8 +564,8 @@ def test_cli_deploy_full_run_with_stubbed_target(tmp_path, monkeypatch):
 
     toml, out = _project(tmp_path)
     ft = FakeTarget()
-    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: ft)}))
-    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    monkeypatch.setattr(deploy_mod, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: ft)}))
+    monkeypatch.setattr(deploy_mod, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
     rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify"])
     assert rc == 0
     assert "fitsgl.json" in ft.objects and DEPLOY_MANIFEST_NAME in ft.objects  # uploaded + ledger written
@@ -580,10 +581,10 @@ def test_cli_concurrency_flag_flows_to_target_and_orchestration(tmp_path, monkey
         seen["pool_concurrency"] = concurrency
         return FakeTarget()
 
-    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(from_config)}))
-    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    monkeypatch.setattr(deploy_mod, "R2Target", type("R2", (), {"from_config": classmethod(from_config)}))
+    monkeypatch.setattr(deploy_mod, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
     monkeypatch.setattr(
-        cli, "deploy_dataset",
+        deploy_mod, "deploy_dataset",
         lambda *a, **k: seen.__setitem__("max_workers", k["max_workers"]) or DeployResult(diff=DeployDiff(), dry_run=False),
     )
     assert cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify", "-j", "12"]) == 0
@@ -604,8 +605,8 @@ def test_cli_deploy_dry_run_makes_no_writes(tmp_path, monkeypatch, capsys):
 
     toml, out = _project(tmp_path)
     ft = FakeTarget()
-    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: ft)}))
-    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    monkeypatch.setattr(deploy_mod, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: ft)}))
+    monkeypatch.setattr(deploy_mod, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
     rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--dry-run"])
     assert rc == 0
     assert "dry run" in capsys.readouterr().out
@@ -616,12 +617,12 @@ def test_cli_deploy_exits_1_on_verify_failure(tmp_path, monkeypatch):
     import fitsgl.cli as cli
 
     toml, out = _project(tmp_path)
-    monkeypatch.setattr(cli, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: FakeTarget())}))
-    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    monkeypatch.setattr(deploy_mod, "R2Target", type("R2", (), {"from_config": classmethod(lambda cls, c, **_kw: FakeTarget())}))
+    monkeypatch.setattr(deploy_mod, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
     bad = VerifyReport(base_url="https://u/cosmos-web")
     bad.add("Range → 206", FAIL, "host ignores Range")
     monkeypatch.setattr(
-        cli, "deploy_dataset",
+        deploy_mod, "deploy_dataset",
         lambda *a, **k: DeployResult(diff=DeployDiff(), dry_run=False, verify_report=bad),
     )
     assert cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes"]) == 1  # verify failure → exit 1
@@ -674,8 +675,8 @@ def test_cli_deploy_loads_dotenv_next_to_config(tmp_path, monkeypatch, capsys):
     (tmp_path / ".env").write_text("R2_ACCESS_KEY_ID=ak\nR2_SECRET_ACCESS_KEY=sk\n")
 
     seen: dict[str, str | None] = {}
-    monkeypatch.setattr(cli, "R2Target", _capture_creds_target(seen))
-    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    monkeypatch.setattr(deploy_mod, "R2Target", _capture_creds_target(seen))
+    monkeypatch.setattr(deploy_mod, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
 
     rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify"])
     assert rc == 0
@@ -692,8 +693,8 @@ def test_cli_deploy_shell_env_wins_over_dotenv(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("R2_ACCESS_KEY_ID=from-file\nR2_SECRET_ACCESS_KEY=sk\n")
 
     seen: dict[str, str | None] = {}
-    monkeypatch.setattr(cli, "R2Target", _capture_creds_target(seen))
-    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    monkeypatch.setattr(deploy_mod, "R2Target", _capture_creds_target(seen))
+    monkeypatch.setattr(deploy_mod, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
 
     cli.main(["deploy", "-c", str(toml), "-o", str(out), "--yes", "--no-verify"])
     assert seen["ak"] == "from-shell"  # real env wins; the .env only filled the absent key
@@ -710,8 +711,8 @@ def test_cli_deploy_custom_env_file_flag(tmp_path, monkeypatch):
     custom.write_text("R2_ACCESS_KEY_ID=ak2\nR2_SECRET_ACCESS_KEY=sk2\n")
 
     seen: dict[str, str | None] = {}
-    monkeypatch.setattr(cli, "R2Target", _capture_creds_target(seen))
-    monkeypatch.setattr(cli, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
+    monkeypatch.setattr(deploy_mod, "R2Target", _capture_creds_target(seen))
+    monkeypatch.setattr(deploy_mod, "CloudflarePurge", type("CF", (), {"from_config": classmethod(lambda cls, c: None)}))
 
     rc = cli.main(["deploy", "-c", str(toml), "-o", str(out), "--env-file", str(custom), "--yes", "--no-verify"])
     assert rc == 0 and seen == {"ak": "ak2", "sk": "sk2"}
