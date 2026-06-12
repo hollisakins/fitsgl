@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+import tempfile
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -66,6 +68,75 @@ SUBTRACTIVE_DITHER_2 = 2
 #: deterministic (reproducible builds) and distinct per level/filter, as the FITS
 #: tiled-compression convention recommends.
 DITHER_SEED_CHECKSUM = -1
+
+#: Basename of the transient native array every level worker memory-maps.
+NATIVE_NPY_NAME = "_native.npy"
+
+#: Require this much more free space than the array needs before staging it in
+#: scratch -- leaves headroom for the ``.npy`` header and filesystem slack, and
+#: (the real reason) keeps a RAM-backed tmpfs off its hard edge, where a ``w+``
+#: memmap page-fault would SIGBUS rather than raise.
+_SCRATCH_HEADROOM = 1.1
+
+
+def _scratch_dir() -> Path | None:
+    """Opt-in node-local scratch for the transient native/bestdist memmaps.
+
+    Honours ``$FITSGL_SCRATCH`` first, then ``$TMPDIR``. Returns ``None`` when
+    neither names an existing directory, which keeps the original behaviour of
+    colocating the transient with the (possibly networked) output volume.
+    """
+    for var in ("FITSGL_SCRATCH", "TMPDIR"):
+        val = os.environ.get(var)
+        if val and os.path.isdir(val):
+            return Path(val)
+    return None
+
+
+def _choose_npy_dir(
+    output_dir: Path, est_bytes: int, report: Callable[[str], None]
+) -> Path:
+    """Pick where the transient native array (and, when pre-tiling, bestdist) live.
+
+    Prefer node-local scratch (``$FITSGL_SCRATCH``/``$TMPDIR``) when it has
+    comfortably more free space than the array needs. On a networked output volume
+    the level workers' strided, read-only ``mmap`` of this file is the build's
+    dominant I/O cost, and it is far cheaper from local disk; the file is unlinked
+    at the end, so nothing extra is ever copied to the slow output volume.
+
+    The free-space check is also what makes scratch *safe* on a RAM-backed tmpfs --
+    if the pages provably fit, the ``w+`` memmap cannot SIGBUS -- which is why the
+    builder historically pinned these arrays to the output volume. When scratch is
+    unset, resolves to the output volume, or is too small, fall back to the output
+    dir, so this never turns a build that used to pass into one that fails.
+
+    Returns a freshly-created, unique scratch subdirectory (so concurrent builds
+    sharing one ``$TMPDIR`` never collide on the fixed ``_native.npy`` name); the
+    caller is responsible for removing it. Returns ``output_dir`` unchanged on
+    fallback.
+    """
+    scratch = _scratch_dir()
+    if scratch is None:
+        return output_dir
+    try:
+        if scratch.resolve() == output_dir.resolve():
+            return output_dir
+        free = shutil.disk_usage(scratch).free
+    except OSError:
+        return output_dir
+    needed = int(est_bytes * _SCRATCH_HEADROOM)
+    if free < needed:
+        report(
+            f"scratch {scratch} has only {free // (1 << 20)} MiB free for a "
+            f"~{needed // (1 << 20)} MiB native array — keeping it on the output volume"
+        )
+        return output_dir
+    try:
+        staged = Path(tempfile.mkdtemp(prefix="fitsgl-native-", dir=scratch))
+    except OSError:
+        return output_dir
+    report(f"staging native array in scratch {staged} ({free // (1 << 20)} MiB free)")
+    return staged
 
 
 class StopAndAsk(Exception):
@@ -593,11 +664,11 @@ def build_pyramid(
     # method, pickling the full mosaic per level is O(levels × mosaic) of IPC +
     # peak memory and is what makes a large build thrash; the page-cache-backed
     # mmap shares ONE copy. Freed from the parent here, then unlinked when done.
-    native_npy = output_dir / "_native.npy"
     if len(input_paths) == 1 and grid_frame is None:
         report(f"reading {input_paths[0].name} …")
         data, header = _read_input(input_paths[0])
         native_h, native_w = int(data.shape[0]), int(data.shape[1])
+        native_npy = _choose_npy_dir(output_dir, data.nbytes, report) / NATIVE_NPY_NAME
         np.save(native_npy, data)
         del data
         source_file = input_paths[0].name
@@ -607,8 +678,8 @@ def build_pyramid(
         # single mosaic. (Lazy import breaks the import cycle.)
         from .placed_tiles import assemble_placed_tiles
 
-        header, (native_h, native_w) = assemble_placed_tiles(
-            input_paths, native_npy, frame=grid_frame, on_progress=report
+        header, (native_h, native_w), native_npy = assemble_placed_tiles(
+            input_paths, output_dir, frame=grid_frame, on_progress=report
         )
         n = len(input_paths)
         source_file = f"{stem} ({n} tile{'s' if n != 1 else ''})"
@@ -668,5 +739,10 @@ def build_pyramid(
         )
         write_manifest(output_dir / "manifest.json", manifest)
     finally:
-        native_npy.unlink(missing_ok=True)
+        # Drop the transient native array. When it was staged in a private scratch
+        # subdir (not the output dir), remove the whole subdir so nothing leaks.
+        if native_npy.parent != output_dir:
+            shutil.rmtree(native_npy.parent, ignore_errors=True)
+        else:
+            native_npy.unlink(missing_ok=True)
     return manifest

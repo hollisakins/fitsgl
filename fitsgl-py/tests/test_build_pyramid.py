@@ -6,8 +6,11 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 from fitsgl.build_pyramid import (
+    NATIVE_NPY_NAME,
     StopAndAsk,
+    _choose_npy_dir,
     _downsample,
+    _scratch_dir,
     _supertile_blocks,
     build_pyramid,
     estimate_noise,
@@ -428,3 +431,93 @@ def test_off_by_one_native_shape_diverges_per_level(tmp_path):
     # Off-by-one native height trims to different per-level shapes -- which is why
     # composite compatibility requires EXACT shape, not just matching WCS.
     assert [lvl.shape for lvl in ma.levels] != [lvl.shape for lvl in mb.levels]
+
+
+# --------------------------------------------------------------------------- #
+# Scratch ($TMPDIR / $FITSGL_SCRATCH) staging of the transient _native.npy.
+# The free-space check guards against a too-small (e.g. tmpfs) scratch.
+# --------------------------------------------------------------------------- #
+def test_scratch_dir_honors_env_precedence(tmp_path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    tmpdir = tmp_path / "tmp"
+    scratch.mkdir()
+    tmpdir.mkdir()
+    monkeypatch.setenv("FITSGL_SCRATCH", str(scratch))
+    monkeypatch.setenv("TMPDIR", str(tmpdir))
+    assert _scratch_dir() == scratch  # FITSGL_SCRATCH wins over TMPDIR
+
+    monkeypatch.delenv("FITSGL_SCRATCH")
+    assert _scratch_dir() == tmpdir   # falls back to TMPDIR
+
+    monkeypatch.delenv("TMPDIR")
+    assert _scratch_dir() is None     # neither set -> colocate with output
+
+
+def test_scratch_dir_ignores_nonexistent_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("FITSGL_SCRATCH", str(tmp_path / "does-not-exist"))
+    monkeypatch.delenv("TMPDIR", raising=False)
+    assert _scratch_dir() is None
+
+
+def test_choose_npy_dir_uses_scratch_when_room(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    scratch = tmp_path / "scratch"
+    out.mkdir()
+    scratch.mkdir()
+    monkeypatch.setenv("FITSGL_SCRATCH", str(scratch))
+    monkeypatch.delenv("TMPDIR", raising=False)
+    chosen = _choose_npy_dir(out, est_bytes=1024, report=lambda _m: None)
+    # A fresh, unique subdir under scratch (not the output dir, not scratch itself).
+    assert chosen != out
+    assert chosen.parent == scratch
+    assert chosen.is_dir()
+    assert chosen.name.startswith("fitsgl-native-")
+
+
+def test_choose_npy_dir_falls_back_when_scratch_too_small(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    scratch = tmp_path / "scratch"
+    out.mkdir()
+    scratch.mkdir()
+    monkeypatch.setenv("FITSGL_SCRATCH", str(scratch))
+    monkeypatch.delenv("TMPDIR", raising=False)
+    # Pretend scratch is nearly full: 1 KiB free, ask for 1 GiB.
+    import shutil
+
+    fake = type("U", (), {"total": 0, "used": 0, "free": 1024})()
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: fake)
+    msgs: list[str] = []
+    chosen = _choose_npy_dir(out, est_bytes=1 << 30, report=msgs.append)
+    assert chosen == out
+    assert any("keeping it on the output volume" in m for m in msgs)
+
+
+def test_choose_npy_dir_no_scratch_uses_output(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.delenv("FITSGL_SCRATCH", raising=False)
+    monkeypatch.delenv("TMPDIR", raising=False)
+    assert _choose_npy_dir(out, est_bytes=1024, report=lambda _m: None) == out
+
+
+def test_build_with_scratch_matches_and_leaves_no_litter(tmp_path, monkeypatch):
+    """Building via scratch is functionally identical and cleans up after itself."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    image, header, _ = generate_synthetic_mosaic(shape=(512, 512), seed=7)
+    src = tmp_path / "m.fits"
+    fits.PrimaryHDU(data=image, header=header).writeto(src, overwrite=True)
+
+    monkeypatch.delenv("FITSGL_SCRATCH", raising=False)
+    monkeypatch.delenv("TMPDIR", raising=False)
+    base = build_pyramid(src, output_dir=tmp_path / "out_base")
+
+    monkeypatch.setenv("FITSGL_SCRATCH", str(scratch))
+    scratched = build_pyramid(src, output_dir=tmp_path / "out_scratch")
+
+    # Same pyramid either way.
+    assert base.native_shape == scratched.native_shape
+    assert [lvl.shape for lvl in base.levels] == [lvl.shape for lvl in scratched.levels]
+    # Transient never lands in (or lingers in) the output dir, and scratch is swept.
+    assert not (tmp_path / "out_scratch" / NATIVE_NPY_NAME).exists()
+    assert list(scratch.iterdir()) == []

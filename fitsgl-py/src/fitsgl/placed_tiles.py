@@ -28,7 +28,13 @@ import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from .build_pyramid import StopAndAsk, _has_distortion, _read_input
+from .build_pyramid import (
+    NATIVE_NPY_NAME,
+    StopAndAsk,
+    _choose_npy_dir,
+    _has_distortion,
+    _read_input,
+)
 
 #: Max |fractional pixel| an inter-tile offset may have and still count as integer
 #: phase. Above this, tiles are sub-pixel-shifted and would need resampling.
@@ -177,16 +183,18 @@ def plan_grid_frames(
 
 def assemble_placed_tiles(
     paths: Sequence[str | Path],
-    out_npy: str | Path,
+    output_dir: str | Path,
     *,
     frame: GridFrame | None = None,
     on_progress: Callable[[str], None] | None = None,
-) -> tuple[fits.Header, tuple[int, int]]:
+) -> tuple[fits.Header, tuple[int, int], Path]:
     """Place overlapping input tiles onto one virtual global grid.
 
-    Writes the assembled native array to ``out_npy`` (a ``.npy`` memmap) and returns
-    ``(global_header, (H, W))``. Raises ``StopAndAsk`` if the tiles do not share a
-    grid or are sub-pixel-shifted.
+    Writes the assembled native array as a ``.npy`` memmap and returns
+    ``(global_header, (H, W), native_npy)``, where ``native_npy`` is the actual path
+    written (under ``output_dir``, or node-local scratch when it has room — see
+    :func:`_choose_npy_dir`). Raises ``StopAndAsk`` if the tiles do not share a grid
+    or are sub-pixel-shifted.
 
     With ``frame`` (a shared :class:`GridFrame`, from :func:`plan_grid_frames`), the
     tiles are placed onto that frame's reference + extent instead of this band's own
@@ -250,14 +258,15 @@ def assemble_placed_tiles(
 
     report(f"assembling {H}×{W} grid from {len(paths)} tiles …")
 
+    # `native` plus the `best` owner-distance buffer below are two full-grid float32
+    # arrays; size the scratch decision for both. `_choose_npy_dir` keeps them on the
+    # output volume unless scratch provably has room (so a RAM-backed tmpfs can't
+    # SIGBUS the `w+` memmap), and colocates `best` with `native` automatically.
+    npy_dir = _choose_npy_dir(Path(output_dir), 2 * H * W * 4, report)
+    out_npy = npy_dir / NATIVE_NPY_NAME
     native = np.lib.format.open_memmap(out_npy, mode="w+", dtype=np.float32, shape=(H, W))
     native[:] = np.nan
-    # `best` (owner squared-distance) is the only extra full-grid buffer; memmap it so
-    # peak RAM stays ~one tile rather than another full mosaic. Colocate it with
-    # `out_npy` (the large output volume) rather than the default $TMPDIR — on compute
-    # nodes /tmp is often a small or RAM-backed tmpfs, and a multi-GB memmap there
-    # SIGBUSes when the filesystem can't back the pages.
-    best_fd, best_path = tempfile.mkstemp(suffix="_bestdist.npy", dir=Path(out_npy).parent)
+    best_fd, best_path = tempfile.mkstemp(suffix="_bestdist.npy", dir=npy_dir)
     os.close(best_fd)
     try:
         best = np.lib.format.open_memmap(best_path, mode="w+", dtype=np.float32, shape=(H, W))
@@ -281,4 +290,4 @@ def assemble_placed_tiles(
     finally:
         Path(best_path).unlink(missing_ok=True)
     del native  # flush the assembled grid to disk
-    return global_header, (H, W)
+    return global_header, (H, W), out_npy

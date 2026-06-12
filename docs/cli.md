@@ -116,6 +116,18 @@ fitsgl build -o build/ --overwrite
 fitsgl build --site-only          # just refresh index.html + assets/
 ```
 
+**Scratch space on networked filesystems.** While building a band, the full-size
+native mosaic is staged to a `.npy` that every level worker memory-maps; on a
+networked output volume (NFS/Lustre) those strided `mmap` reads are the build's
+dominant I/O cost. Set `FITSGL_SCRATCH` (or rely on `TMPDIR`) to a node-local
+disk and the builder stages that transient there instead — provided it has room.
+It first checks free space (the native array needs ~`4·H·W` bytes, doubled for
+pre-tiled input) and silently falls back to the output volume if scratch is
+unset, too small, or on the same filesystem, so a too-small or RAM-backed
+`/tmp` can never make a build fail. The staged file is removed when the build
+finishes. On HPC schedulers point it at the job's local scratch, e.g.
+`FITSGL_SCRATCH=$TMPDIR fitsgl build` (Slurm) or your node's NVMe mount.
+
 ### `fitsgl demo`
 
 Generate a synthetic dataset, build it (data + viewer), and optionally serve it.
