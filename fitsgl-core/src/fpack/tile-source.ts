@@ -195,6 +195,19 @@ export class TileEngine {
   }
 
   /**
+   * The decoded tile if it is CURRENTLY RAM-resident, else `undefined` — a
+   * synchronous, fetch-free, recency-preserving read. Unlike `getTile`, this
+   * never touches the network/disk/decoder and never bumps the LRU (it uses
+   * `cache.peek`), so it is safe to call at pointer-move frequency for a live
+   * cursor value readout or a region peek. A miss means "not decoded yet", not
+   * "absent" — call `getTile` to load it. The returned array is the cache's own
+   * instance (same as `getTile`): read, don't mutate.
+   */
+  peekTile(level: number, tileX: number, tileY: number): Float32Array | undefined {
+    return this.cache.peek(`${level}/${tileX}/${tileY}`);
+  }
+
+  /**
    * The tile's compressed bytes, served from the disk tier when it holds them and
    * written through on a miss. Disk get/put failures degrade to a plain network
    * fetch so a flaky/disabled store never breaks tile loading.
@@ -340,6 +353,17 @@ export class TilePyramid {
   ): Promise<Float32Array> {
     if (this.destroyed) throw new Error('TilePyramid: getTile called after destroy()');
     return this.engine.getTile(level, tileX, tileY, signal);
+  }
+
+  /**
+   * The decoded tile if RAM-resident, else `undefined` — synchronous, fetch-free,
+   * non-LRU-bumping. The cheap read path for a live cursor value readout (the tile
+   * the renderer just drew is resident, so the peek is an instant hit). See
+   * `TileEngine.peekTile`. Returns `undefined` after `destroy()`.
+   */
+  peekTile(level: number, tileX: number, tileY: number): Float32Array | undefined {
+    if (this.destroyed) return undefined;
+    return this.engine.peekTile(level, tileX, tileY);
   }
 
   /**

@@ -30,6 +30,16 @@ export class LRUCache<K, V> {
     return this.map.has(key);
   }
 
+  /**
+   * Read a value WITHOUT refreshing its recency — a non-mutating peek. Unlike
+   * `get`, the entry is not moved to the most-recent end, so the eviction order
+   * is untouched. For cheap, high-frequency reads (e.g. a per-pointer-move pixel
+   * value peek) where bumping recency would distort which tiles get evicted.
+   */
+  peek(key: K): V | undefined {
+    return this.map.get(key);
+  }
+
   set(key: K, value: V): void {
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, value);

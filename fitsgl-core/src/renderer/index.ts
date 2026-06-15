@@ -14,6 +14,10 @@ export type {
   AutoStretchResult,
   BandHistogram,
   VisibleHistogram,
+  CameraState,
+  DisplayState,
+  PointerTool,
+  ToolPoint,
 } from './viewer.js';
 
 // Percentile auto-stretch + histogram math (M5), promoted from the demo (decision D11).

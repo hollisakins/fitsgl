@@ -42,6 +42,13 @@ export type {
   BandHistogram,
   VisibleHistogram,
   WorldBounds,
+  // Read-side state accessors (`getCameraState`/`getDisplayState`) + the pointer
+  // tool seam (`setTool`/`PointerTool`) — the Phase-0 foundation for the cursor
+  // readout, deep-links, PNG export, the ruler, and split-view locks.
+  CameraState,
+  DisplayState,
+  PointerTool,
+  ToolPoint,
 } from './renderer/index.js';
 // M5 — percentile auto-stretch + visible-data histogram (`FitsViewer.autoStretch`
 // and `.visibleHistogram` apply them; `percentileRange`/`histogram` are the pure
