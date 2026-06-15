@@ -6,7 +6,7 @@
  *   - `u_mode`        0 = single-band, 1 = RGB composite (the M4 slot), 2 = weighted
  *                     multi-band trilogy composite (N bands, each with an (R,G,B)
  *                     contribution weight — Dan Coe's faithful trilogy).
- *   - `u_stretchMode` 0 = linear, 1 = log, 2 = asinh, 3 = trilogy — see `stretch.ts`.
+ *   - `u_stretchMode` 0 = linear, 1 = log, 2 = asinh, 3 = trilogy, 4 = sqrt — see `stretch.ts`.
  *   - `u_useColormap` single-band only: 0 = grayscale, 1 = sample `u_colormap`.
  *
  * The raw float values live untouched in the R32F textures; this shader does the
@@ -62,7 +62,7 @@ uniform sampler2D u_tileB;
 uniform sampler2D u_colormap;
 
 uniform int u_mode;         // 0 = single-band, 1 = RGB composite, 2 = weighted multi-band
-uniform int u_stretchMode;  // 0 = linear, 1 = log, 2 = asinh, 3 = trilogy
+uniform int u_stretchMode;  // 0 = linear, 1 = log, 2 = asinh, 3 = trilogy, 4 = sqrt
 uniform int u_useColormap;  // single-band: 0 = grayscale, 1 = colormap LUT
 
 uniform float u_min;        // single-band display interval
@@ -103,6 +103,8 @@ float applyStretch(float norm, float k) {
   } else if (u_stretchMode == 3) {
     if (!(k > 0.0)) return norm; // k -> 0 (and NaN) limit is linear; mirrors stretch.ts !(k > 0)
     return log(k * norm + 1.0) / log(k + 1.0);
+  } else if (u_stretchMode == 4) {
+    return sqrt(norm);
   }
   return norm; // linear
 }

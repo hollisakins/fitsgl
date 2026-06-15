@@ -142,7 +142,7 @@ describe('validateFitsglConfig', () => {
       validateFitsglConfig({ ...raw(), defaultView: { mode: 'single', band: 'a', colormap: 'rainbow6000' } }),
     ).toThrow(/not a known colormap/);
     expect(() =>
-      validateFitsglConfig({ ...raw(), defaultView: { mode: 'single', band: 'a', stretch: { mode: 'sqrt' } } }),
+      validateFitsglConfig({ ...raw(), defaultView: { mode: 'single', band: 'a', stretch: { mode: 'cbrt' } } }),
     ).toThrow(/not a known stretch mode/);
   });
 

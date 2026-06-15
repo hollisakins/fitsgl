@@ -23,6 +23,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
 } from 'react';
 
@@ -39,6 +40,9 @@ import {
   formatDec,
   formatRA,
   parseCatalogCSV,
+  parseSkyCoord,
+  pixToSky,
+  skyToPix,
   type BandHistogram,
   type BandWeight,
   type ColormapName,
@@ -70,6 +74,33 @@ import {
   type ExplorerState,
 } from './explorer-state.js';
 import { bandsSignature, viewSignature } from './plan.js';
+import { buildShareUrl, decodeShareHash, type ShareState } from './share-url.js';
+
+/** Merge a decoded shared view state onto a base explorer state, validating each
+ *  field against the loaded bands / known modes so a stale or hostile link can't
+ *  produce an invalid state. The camera (`c`) is applied separately, after load. */
+function applyShareToState(
+  base: ExplorerState,
+  u: ShareState,
+  bands: ExplorerBand[],
+): ExplorerState {
+  const hasBand = (n: string | undefined): n is string =>
+    n !== undefined && bands.some((b) => b.name === n);
+  const next: ExplorerState = { ...base };
+  if (u.m === 'single' || u.m === 'rgb') next.mode = u.m;
+  if (hasBand(u.b)) next.band = u.b;
+  if (u.rgb !== undefined && u.rgb.every(hasBand)) {
+    next.rgb = { r: u.rgb[0], g: u.rgb[1], b: u.rgb[2] };
+  }
+  if (u.s !== undefined && (STRETCH_MODES as readonly string[]).includes(u.s)) {
+    next.stretch = u.s as StretchMode;
+  }
+  if (u.cm !== undefined && (COLORMAP_NAMES as readonly string[]).includes(u.cm)) {
+    next.colormap = u.cm as ColormapName;
+  }
+  if (u.n === 0 || u.n === 1) next.northUp = u.n === 1;
+  return next;
+}
 
 const CH_COLOR = { r: '#ff6b6b', g: '#56d089', b: '#5c8cff' } as const;
 type Role = 'r' | 'g' | 'b';
@@ -734,6 +765,21 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const handle = useRef<FitsViewerHandle>(null);
   const getViewer = useCallback((): FitsViewerCore | null => handle.current?.getViewer() ?? null, []);
 
+  // "Go to" a sky position (RA/Dec, any common format): recenter, and zoom in to
+  // native if currently zoomed out. Returns false on an unparseable/out-of-frame
+  // coordinate so the box can flag it. No name resolution — coordinates only.
+  const goTo = useCallback((text: string): boolean => {
+    const parsed = parseSkyCoord(text);
+    const v = handle.current?.getViewer() ?? null;
+    const wcs = v?.getWcs() ?? null;
+    if (parsed === null || v === null || wcs === null) return false;
+    const px = skyToPix(wcs, parsed.ra, parsed.dec);
+    if (!Number.isFinite(px.x) || !Number.isFinite(px.y)) return false;
+    v.setCenter(px.x, px.y);
+    if (v.getCameraState().zoom < 1) v.setZoom(1);
+    return true;
+  }, []);
+
   // Accept either the turnkey `config` (a FitsglConfig) or the loose
   // `bands`/`defaultView`/`catalog`/`title` props; `config` wins when present.
   const bands = useMemo<ExplorerBand[]>(
@@ -753,9 +799,21 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   );
   const title = props.title ?? props.config?.dataset.title;
 
-  const [state, setState] = useState<ExplorerState>(() => defaultExplorerState(bands, initialView));
+  // A shared view link (#v=...) read ONCE at mount: it seeds the initial display
+  // state below and (its camera) is applied after the first frame. The URL is never
+  // written on pan/zoom — only on an explicit "Copy view link" (see the context menu).
+  const urlState = useMemo<ShareState | null>(
+    () => (typeof window !== 'undefined' ? decodeShareHash(window.location.hash) : null),
+    [],
+  );
+
+  const [state, setState] = useState<ExplorerState>(() => {
+    const base = defaultExplorerState(bands, initialView);
+    return urlState !== null ? applyShareToState(base, urlState, bands) : base;
+  });
   const [collapsed, setCollapsed] = useState(false);
   const [readyTick, setReadyTick] = useState(0);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   // The decorative boot overlay: shown until the first frame draws, replayed when
   // the band set reloads (a band change tears down the viewer + refetches pyramids,
   // so the canvas goes blank), and dismissed on a load error so it never sticks.
@@ -816,6 +874,27 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     if (state.overlay) h.setMarkers(markers);
     else h.clearMarkers();
   }, [state.overlay, markers, readyTick]);
+
+  // Apply a shared link's camera once, after the first frame (the construction-time
+  // fitToImage has run by then, so this overrides it to the shared sky position).
+  const urlCamAppliedRef = useRef(false);
+  useEffect(() => {
+    if (urlCamAppliedRef.current || readyTick === 0) return;
+    const cam = urlState?.c;
+    if (cam === undefined) {
+      urlCamAppliedRef.current = true;
+      return;
+    }
+    const v = handle.current?.getViewer() ?? null;
+    const wcs = v?.getWcs() ?? null;
+    if (v === null || wcs === null) return;
+    const px = skyToPix(wcs, cam[0], cam[1]);
+    if (Number.isFinite(px.x) && Number.isFinite(px.y)) {
+      v.setCenter(px.x, px.y);
+      if (cam[2] > 0) v.setZoom(cam[2]);
+    }
+    urlCamAppliedRef.current = true;
+  }, [readyTick, urlState]);
 
   // Stretch MODE is imperative: a flip must not re-auto-stretch the manual limits.
   // Trilogy needs precomputed per-band stats; when an active band lacks them, drive
@@ -967,15 +1046,54 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     else v.setStretch(min, max);
   };
 
+  // Build a shareable link to the CURRENT view on demand (the right-click menu),
+  // sky-anchoring the camera so the link survives a rebuild. The URL is never
+  // mutated by panning/zooming — only assembled here when the user asks.
+  const makeShareUrl = useCallback((): string => {
+    const r = (n: number, d: number): number => {
+      const f = 10 ** d;
+      return Math.round(n * f) / f;
+    };
+    const s: ShareState = {
+      m: state.mode,
+      b: state.band,
+      rgb: [state.rgb.r, state.rgb.g, state.rgb.b],
+      s: state.stretch,
+      cm: state.colormap,
+      n: state.northUp ? 1 : 0,
+    };
+    const v = handle.current?.getViewer() ?? null;
+    const wcs = v?.getWcs() ?? null;
+    const cam = v?.getCameraState() ?? null;
+    if (v !== null && wcs !== null && cam !== null) {
+      const sky = pixToSky(wcs, cam.centerX, cam.centerY);
+      if (Number.isFinite(sky.ra) && Number.isFinite(sky.dec)) {
+        s.c = [r(sky.ra, 6), r(sky.dec, 6), r(cam.zoom, 4)];
+      }
+    }
+    return buildShareUrl(window.location.href, s);
+  }, [state]);
+
   const activeBands = activeBandNames(state);
   const activeLabels = activeBands.map((n) => bands.find((b) => b.name === n)?.label ?? n);
 
   const containerStyle =
     props.style === undefined ? ROOT_STYLE : { ...ROOT_STYLE, ...props.style };
 
+  // Right-click over the image opens the share menu; over the control panel the
+  // native menu is left alone (so inputs keep paste/select).
+  const onStageContextMenu = (e: ReactMouseEvent): void => {
+    if ((e.target as HTMLElement).closest('.fgl-win') !== null) return;
+    e.preventDefault();
+    setMenu({ x: e.clientX, y: e.clientY });
+  };
+
   return (
     <div className={`fgl-explorer${props.className === undefined ? '' : ` ${props.className}`}`} style={containerStyle}>
-      <div className="fgl-stage">
+      {menu !== null && (
+        <ShareMenu x={menu.x} y={menu.y} onCopy={makeShareUrl} onClose={() => setMenu(null)} />
+      )}
+      <div className="fgl-stage" onContextMenu={onStageContextMenu}>
         <FitsViewer
           config={viewerConfig}
           ref={handle}
@@ -999,6 +1117,12 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
               <span className="fgl-chev">▾</span>
             </div>
             <div className="fgl-win-body">
+              {/* go to coordinates */}
+              <div className="fgl-sec">
+                <span className="fgl-cap">Go to</span>
+                <GotoBox onGo={goTo} />
+              </div>
+
               {/* layers */}
               <div className="fgl-sec">
                 <span className="fgl-cap">Layers</span>
@@ -1156,9 +1280,25 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
               </div>
 
               <div className="fgl-sec">
-                <button type="button" className="fgl-reset" onClick={() => handle.current?.fitToImage()}>
-                  Fit to image
-                </button>
+                <div className="fgl-btn-row">
+                  <button type="button" className="fgl-reset" onClick={() => handle.current?.fitToImage()}>
+                    Fit to image
+                  </button>
+                  <button
+                    type="button"
+                    className="fgl-reset"
+                    onClick={() => {
+                      const url = handle.current?.exportPNG();
+                      if (url === null || url === undefined) return;
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `${(title ?? 'fitsgl').replace(/\s+/g, '_')}.png`;
+                      a.click();
+                    }}
+                  >
+                    Save PNG
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1212,6 +1352,85 @@ function createReadoutStore(): ReadoutStore {
 function emitReadout(store: ReadoutStore): void {
   store.version++;
   for (const l of store.listeners) l();
+}
+
+/** "Go to coordinates" box: parses RA/Dec on Enter/Go and recenters via `onGo`,
+ *  flashing an error border when the input doesn't parse or is off the image. */
+function GotoBox({ onGo }: { onGo: (text: string) => boolean }): JSX.Element {
+  const [text, setText] = useState('');
+  const [err, setErr] = useState(false);
+  const submit = (): void => {
+    if (text.trim() === '') return;
+    setErr(!onGo(text));
+  };
+  return (
+    <div className="fgl-goto">
+      <input
+        className={`fgl-goto-in${err ? ' err' : ''}`}
+        type="text"
+        value={text}
+        placeholder="RA Dec — e.g. 10:00:00 +02:12:00"
+        spellCheck={false}
+        autoComplete="off"
+        onChange={(e) => {
+          setText(e.target.value);
+          setErr(false);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') submit();
+        }}
+      />
+      <button type="button" className="fgl-goto-btn" onClick={submit}>
+        Go
+      </button>
+    </div>
+  );
+}
+
+/** The right-click menu: a single "Copy view link" action that builds a shareable
+ *  URL on demand (the URL is never live-updated). Closes on any outside interaction. */
+function ShareMenu({
+  x,
+  y,
+  onCopy,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  onCopy: () => string;
+  onClose: () => void;
+}): JSX.Element {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    window.addEventListener('mousedown', onClose);
+    window.addEventListener('keydown', onClose);
+    window.addEventListener('blur', onClose);
+    return () => {
+      window.removeEventListener('mousedown', onClose);
+      window.removeEventListener('keydown', onClose);
+      window.removeEventListener('blur', onClose);
+    };
+  }, [onClose]);
+  const copy = (): void => {
+    const url = onCopy();
+    const done = (): void => {
+      setCopied(true);
+      window.setTimeout(onClose, 900);
+    };
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText !== undefined) {
+      navigator.clipboard.writeText(url).then(done, done);
+    } else {
+      done();
+    }
+  };
+  return (
+    // Stop mousedown from reaching the window closer so the click lands on the item.
+    <div className="fgl-menu" style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
+      <button type="button" className="fgl-menu-item" onClick={copy}>
+        {copied ? 'Link copied ✓' : 'Copy view link'}
+      </button>
+    </div>
+  );
 }
 
 /** Format a pixel value for the status bar: '—' for no-data / not-resident, else
@@ -1407,6 +1626,22 @@ const STYLE_CSS = `
 .fgl-reset{width:100%;background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
   font-size:10px;letter-spacing:.14em;text-transform:uppercase;padding:9px;border-radius:4px;cursor:pointer;}
 .fgl-reset:hover{border-color:var(--gold-d);color:var(--gold);}
+.fgl-btn-row{display:flex;gap:7px;}
+.fgl-btn-row .fgl-reset{flex:1;}
+.fgl-goto{display:flex;gap:6px;}
+.fgl-goto-in{flex:1;min-width:0;background:var(--inset);border:1px solid var(--line2);border-radius:4px;color:var(--text);
+  font-family:var(--mono);font-size:11px;padding:7px 8px;outline:none;}
+.fgl-goto-in::placeholder{color:var(--dim);opacity:.7;}
+.fgl-goto-in:focus{border-color:var(--gold-d);}
+.fgl-goto-in.err{border-color:#c4543b;}
+.fgl-goto-btn{background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
+  font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:0 12px;border-radius:4px;cursor:pointer;}
+.fgl-goto-btn:hover{border-color:var(--gold-d);color:var(--gold);}
+.fgl-menu{position:fixed;z-index:2147483647;background:var(--win);border:1px solid var(--line2);border-radius:6px;
+  padding:4px;box-shadow:0 8px 28px rgba(0,0,0,.55);}
+.fgl-menu-item{display:block;width:100%;text-align:left;background:transparent;border:none;color:var(--text);
+  font-family:var(--mono);font-size:11px;padding:7px 13px;border-radius:4px;cursor:pointer;white-space:nowrap;}
+.fgl-menu-item:hover{background:var(--inset);color:var(--gold);}
 .fgl-status{flex:none;height:29px;display:flex;align-items:center;background:#080b12;border-top:1px solid var(--line2);
   padding:0 12px;font-size:11px;overflow:hidden;white-space:nowrap;}
 .fgl-brand{color:var(--gold);font-weight:600;letter-spacing:.16em;font-size:10.5px;}

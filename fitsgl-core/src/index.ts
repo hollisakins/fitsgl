@@ -93,7 +93,7 @@ export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './re
 export type { ColormapName, ColormapLUT } from './renderer/index.js';
 
 // M2 — WCS: client-side TAN pixel<->sky (ICRS) + sexagesimal formatting.
-export { parseWcs, pixToSky, skyToPix, formatRA, formatDec } from './wcs/index.js';
+export { parseWcs, pixToSky, skyToPix, formatRA, formatDec, parseSkyCoord } from './wcs/index.js';
 export type { TanWcs, SkyCoord, PixelCoord } from './wcs/index.js';
 
 // M4 — dataset manifest: groups composite-compatible single-band pyramids. The

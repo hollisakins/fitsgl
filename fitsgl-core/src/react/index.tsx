@@ -94,6 +94,8 @@ export interface FitsViewerHandle {
   imageToScreen(worldX: number, worldY: number): { x: number; y: number } | null;
   /** Install (or clear with null) a pointer tool that pre-empts pan/marker-click (e.g. a ruler). */
   setTool(tool: PointerTool | null): void;
+  /** Capture the current view as a PNG data URL (device-pixel res; overlays included), or null before load. */
+  exportPNG(): string | null;
   /** Escape hatch: the underlying core viewer, or null before load / after unmount. */
   getViewer(): CoreViewer | null;
   /** Escape hatch: every loaded band pyramid by name, or null before load. */
@@ -282,6 +284,7 @@ const FitsViewerComponent = forwardRef<FitsViewerHandle, FitsViewerProps>(functi
       screenToImage: (clientX, clientY) => viewerRef.current?.screenToImage(clientX, clientY) ?? null,
       imageToScreen: (worldX, worldY) => viewerRef.current?.imageToScreen(worldX, worldY) ?? null,
       setTool: (tool) => viewerRef.current?.setTool(tool),
+      exportPNG: () => viewerRef.current?.exportPNG() ?? null,
       getViewer: () => viewerRef.current,
       getPyramids: () => pyramidsRef.current,
     };

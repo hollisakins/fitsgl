@@ -128,6 +128,10 @@ const PREFETCH_IDLE_MS = 150;
 const PREFETCH_THROTTLE_MS = 80;
 /** Wheel sensitivity: zoom factor per deltaY unit (exponential). */
 const WHEEL_ZOOM_RATE = 0.0015;
+/** Keyboard zoom step (+/- keys): zoom multiplier per press. */
+const KEY_ZOOM_STEP = 1.3;
+/** Keyboard pan step (arrow keys): fraction of the smaller viewport edge per press. */
+const KEY_PAN_FRACTION = 0.15;
 /**
  * Opaque background colour (RGB). The canvas clears to this and the shader emits
  * it for NaN/no-data pixels, so no-data reads identically whether it falls on the
@@ -541,6 +545,7 @@ export class FitsViewer {
   private readonly onWheel: (e: WheelEvent) => void;
   private readonly onCanvasMove: (e: MouseEvent) => void;
   private readonly onCanvasLeave: () => void;
+  private readonly onKeyDown: (e: KeyboardEvent) => void;
   private readonly frame: () => void;
   private readonly pointerFrame: () => void;
 
@@ -667,6 +672,9 @@ export class FitsViewer {
     };
 
     this.onMouseDown = (e) => {
+      // Focus the canvas so keyboard shortcuts target this viewer (tabindex set in
+      // attachHandlers). preventScroll so a click never jumps the page.
+      this.canvas.focus({ preventScroll: true });
       if (e.button !== 0) return;
       const p = this.toBufferCoords(e);
       // An active tool pre-empts pan + marker-click for the gesture it claims.
@@ -765,6 +773,46 @@ export class FitsViewer {
       this.pendingPointer = null;
       this.onCursor?.(null);
       this.clearHoverState();
+    };
+    this.onKeyDown = (e) => {
+      // Let browser/OS shortcuts (Cmd/Ctrl/Alt combos) pass through untouched.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const panStep = Math.min(this.camera.viewportWidth, this.camera.viewportHeight) * KEY_PAN_FRACTION;
+      switch (e.key) {
+        case '+':
+        case '=':
+          this.setZoom(this.camera.zoom * KEY_ZOOM_STEP);
+          break;
+        case '-':
+        case '_':
+          this.setZoom(this.camera.zoom / KEY_ZOOM_STEP);
+          break;
+        case '0':
+        case 'f':
+        case 'F':
+          this.fitToImage();
+          break;
+        case 'n':
+        case 'N':
+          this.setNorthUp(!this.northUpEnabled);
+          break;
+        // Arrows scroll the view in their own direction (reveal content that way).
+        case 'ArrowLeft':
+          this.panByKey(panStep, 0);
+          break;
+        case 'ArrowRight':
+          this.panByKey(-panStep, 0);
+          break;
+        case 'ArrowUp':
+          this.panByKey(0, panStep);
+          break;
+        case 'ArrowDown':
+          this.panByKey(0, -panStep);
+          break;
+        default:
+          return; // not a shortcut — leave the event alone
+      }
+      e.preventDefault();
     };
 
     this.syncCanvasSize();
@@ -1184,6 +1232,15 @@ export class FitsViewer {
     return this.northUpEnabled && this.wcs !== null ? this.northUpMatrix : IDENTITY_MAT2;
   }
 
+  /** Pan the camera by a drawing-buffer-pixel delta (keyboard arrows), through the
+   *  current orientation so arrows move the view in screen directions under North-up. */
+  private panByKey(dxScreen: number, dyScreen: number): void {
+    const c = panCenter(this.camera, this.currentOrientation(), dxScreen, dyScreen);
+    this.camera.setCenter(c.centerX, c.centerY);
+    this.markCameraMoved();
+    this.requestRender();
+  }
+
   setCenter(x: number, y: number): void {
     this.camera.setCenter(x, y);
     this.markCameraMoved();
@@ -1267,6 +1324,40 @@ export class FitsViewer {
       northUp: this.northUpEnabled,
       mode: this.mode,
     };
+  }
+
+  /**
+   * Capture the current view as a PNG data URL (at drawing-buffer / device-pixel
+   * resolution). Forces a synchronous redraw, then reads the drawing buffer — so
+   * markers and any GL overlay compositing into the same canvas are included. This
+   * is a plain framebuffer read (not the per-tile value read-back), valid even
+   * without `preserveDrawingBuffer` because the read happens in the same task as
+   * the draw, before the browser composites. The host triggers the download (e.g.
+   * an `<a download>` with the returned URL).
+   */
+  exportPNG(): string {
+    const gl = this.gl;
+    this.draw(); // render into the back buffer now and read it before compositing
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const pixels = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    const out = document.createElement('canvas');
+    out.width = w;
+    out.height = h;
+    const ctx = out.getContext('2d');
+    if (ctx === null) throw new Error('FitsViewer.exportPNG: 2D canvas context unavailable');
+    const img = ctx.createImageData(w, h);
+    const row = w * 4;
+    // GL is y-up; flip rows into the y-down 2D canvas.
+    for (let y = 0; y < h; y++) {
+      const src = (h - 1 - y) * row;
+      img.data.set(pixels.subarray(src, src + row), y * row);
+    }
+    // The canvas is opaque (alpha:false); force full alpha so the PNG isn't transparent.
+    for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+    ctx.putImageData(img, 0, 0);
+    return out.toDataURL('image/png');
   }
 
   // ---- tool mode (pointer arbitration) ------------------------------------
@@ -1392,12 +1483,17 @@ export class FitsViewer {
   // ---- event wiring -------------------------------------------------------
 
   private attachHandlers(): void {
+    // Make the canvas keyboard-focusable (shortcuts target the focused viewer) and
+    // suppress the focus ring on the canvas itself (the host can restyle).
+    if (!this.canvas.hasAttribute('tabindex')) this.canvas.tabIndex = 0;
+    this.canvas.style.outline = 'none';
     this.canvas.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mouseup', this.onMouseUp);
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
     this.canvas.addEventListener('mousemove', this.onCanvasMove);
     this.canvas.addEventListener('mouseleave', this.onCanvasLeave);
+    this.canvas.addEventListener('keydown', this.onKeyDown);
     if (typeof ResizeObserver !== 'undefined') {
       this.resizeObserver = new ResizeObserver(() => {
         this.syncCanvasSize();
@@ -1414,6 +1510,7 @@ export class FitsViewer {
     this.canvas.removeEventListener('wheel', this.onWheel);
     this.canvas.removeEventListener('mousemove', this.onCanvasMove);
     this.canvas.removeEventListener('mouseleave', this.onCanvasLeave);
+    this.canvas.removeEventListener('keydown', this.onKeyDown);
     if (this.resizeObserver !== null) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;

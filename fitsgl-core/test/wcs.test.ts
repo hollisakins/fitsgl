@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { parseWcs, pixToSky, skyToPix } from '../src/wcs/tan.js';
-import { formatRA, formatDec } from '../src/wcs/format.js';
+import { formatRA, formatDec, parseSkyCoord } from '../src/wcs/format.js';
 
 interface Config {
   name: string;
@@ -112,5 +112,41 @@ describe('sexagesimal formatting', () => {
     // 1 deg = 240s of RA-time; just under a 1" RA tick should not print 60.
     expect(formatRA(359.9999999)).toBe('00:00:00.000'); // wraps to 0
     expect(formatDec(-0.00000001)).toBe('+00:00:00.00'); // -0 -> +00 (rounds to zero)
+  });
+});
+
+describe('parseSkyCoord — free-form RA/Dec input', () => {
+  function near(got: { ra: number; dec: number } | null, ra: number, dec: number): void {
+    expect(got).not.toBeNull();
+    expect(got!.ra).toBeCloseTo(ra, 6);
+    expect(got!.dec).toBeCloseTo(dec, 6);
+  }
+
+  it('parses decimal degrees (space and comma separated)', () => {
+    near(parseSkyCoord('150.12 2.34'), 150.12, 2.34);
+    near(parseSkyCoord('150.12, 2.34'), 150.12, 2.34);
+    near(parseSkyCoord('  150.12 , -2.34 '), 150.12, -2.34);
+  });
+
+  it('parses sexagesimal with colons (RA in hours, Dec in degrees)', () => {
+    near(parseSkyCoord('10:00:00 +02:12:00'), 150, 2.2);
+    near(parseSkyCoord('10:00:00 -02:12:00'), 150, -2.2);
+  });
+
+  it('parses space-delimited sexagesimal and h/m/s · d/m/s unit letters', () => {
+    near(parseSkyCoord('10 00 00 +02 12 00'), 150, 2.2);
+    near(parseSkyCoord('10h00m00s +02d12m00s'), 150, 2.2);
+  });
+
+  it('round-trips formatRA/formatDec output', () => {
+    near(parseSkyCoord(`${formatRA(150.12)} ${formatDec(2.34)}`), 150.12, 2.34);
+  });
+
+  it('rejects garbage and out-of-range values', () => {
+    expect(parseSkyCoord('')).toBeNull();
+    expect(parseSkyCoord('not coords')).toBeNull();
+    expect(parseSkyCoord('400 2.0')).toBeNull(); // RA > 360
+    expect(parseSkyCoord('150 95')).toBeNull(); // Dec > 90
+    expect(parseSkyCoord('10:00:00')).toBeNull(); // RA only, no Dec
   });
 });
