@@ -897,6 +897,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const [collapsed, setCollapsed] = useState(false);
   const [readyTick, setReadyTick] = useState(0);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [headerOpen, setHeaderOpen] = useState(false);
   // The decorative boot overlay: shown until the first frame draws, replayed when
   // the band set reloads (a band change tears down the viewer + refetches pyramids,
   // so the canvas goes blank), and dismissed on a load error so it never sticks.
@@ -1161,6 +1162,12 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const activeBands = activeBandNames(state);
   const activeLabels = activeBands.map((n) => bands.find((b) => b.name === n)?.label ?? n);
 
+  // The active band's header.json sidecar lives next to its manifest.json (same
+  // dir): derive its URL by swapping the last path segment.
+  const headerBand = bands.find((b) => b.name === activeBands[0]);
+  const headerUrl = headerBand?.tiles[0]?.replace(/[^/]*$/, 'header.json') ?? null;
+  const headerLabel = headerBand?.label ?? headerBand?.name ?? '';
+
   const containerStyle =
     props.style === undefined ? ROOT_STYLE : { ...ROOT_STYLE, ...props.style };
 
@@ -1176,6 +1183,9 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     <div className={`fgl-explorer${props.className === undefined ? '' : ` ${props.className}`}`} style={containerStyle}>
       {menu !== null && (
         <ShareMenu x={menu.x} y={menu.y} onCopy={makeShareUrl} onClose={() => setMenu(null)} />
+      )}
+      {headerOpen && headerUrl !== null && (
+        <HeaderPanel url={headerUrl} title={headerLabel} onClose={() => setHeaderOpen(false)} />
       )}
       <div className="fgl-stage" onContextMenu={onStageContextMenu}>
         <FitsViewer
@@ -1409,6 +1419,11 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                   >
                     Save PNG
                   </button>
+                  {headerUrl !== null && (
+                    <button type="button" className="fgl-reset" onClick={() => setHeaderOpen(true)}>
+                      Header
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -1540,6 +1555,98 @@ function ShareMenu({
       <button type="button" className="fgl-menu-item" onClick={copy}>
         {copied ? 'Link copied ✓' : 'Copy view link'}
       </button>
+    </div>
+  );
+}
+
+interface HeaderCard {
+  keyword: string;
+  value: string | number | boolean | null;
+  comment: string;
+}
+interface HeaderDoc {
+  version: number;
+  source_file: string;
+  cards: HeaderCard[];
+}
+
+/** Render a FITS card value the DS9 way: booleans as T/F, undefined as blank. */
+function fmtHeaderValue(v: string | number | boolean | null): string {
+  if (v === null) return '';
+  if (typeof v === 'boolean') return v ? 'T' : 'F';
+  return String(v);
+}
+
+/** A modal FITS-header viewer: fetches the band's header.json sidecar on demand and
+ *  lists the full ordered card set. Closes on backdrop click or Escape. */
+function HeaderPanel({
+  url,
+  title,
+  onClose,
+}: {
+  url: string;
+  title: string;
+  onClose: () => void;
+}): JSX.Element {
+  const [doc, setDoc] = useState<HeaderDoc | null>(null);
+  const [err, setErr] = useState(false);
+  useEffect(() => {
+    let live = true;
+    setDoc(null);
+    setErr(false);
+    fetch(url)
+      .then((r) => (r.ok ? (r.json() as Promise<HeaderDoc>) : Promise.reject(new Error(String(r.status)))))
+      .then((d) => {
+        if (live) setDoc(d);
+      })
+      .catch(() => {
+        if (live) setErr(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, [url]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  const commentLike = (k: string): boolean => k === 'COMMENT' || k === 'HISTORY' || k === '';
+  return (
+    <div className="fgl-modal" onMouseDown={onClose}>
+      <div className="fgl-hdr" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="fgl-hdr-head">
+          <span>FITS header · {title}</span>
+          <button type="button" className="fgl-hdr-x" onClick={onClose} aria-label="Close">
+            ×
+          </button>
+        </div>
+        <div className="fgl-hdr-body">
+          {err ? (
+            <div className="fgl-hdr-msg">No header available for this band.</div>
+          ) : doc === null ? (
+            <div className="fgl-hdr-msg">Loading…</div>
+          ) : (
+            doc.cards.map((c, i) =>
+              commentLike(c.keyword) ? (
+                <div key={i} className="fgl-hdr-card comment">
+                  <span className="fgl-hdr-k">{c.keyword}</span>
+                  <span className="fgl-hdr-v">{c.comment || fmtHeaderValue(c.value)}</span>
+                </div>
+              ) : (
+                <div key={i} className="fgl-hdr-card">
+                  <span className="fgl-hdr-k">{c.keyword}</span>
+                  <span className="fgl-hdr-eq">=</span>
+                  <span className="fgl-hdr-v">{fmtHeaderValue(c.value)}</span>
+                  {c.comment !== '' && <span className="fgl-hdr-c">/ {c.comment}</span>}
+                </div>
+              ),
+            )
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1705,6 +1812,22 @@ const STYLE_CSS = `
 .fgl-cbar-tick{position:absolute;top:0;font-size:9px;color:var(--dim);font-family:var(--mono);
   font-variant-numeric:tabular-nums;white-space:nowrap;}
 .fgl-grat{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;}
+.fgl-modal{position:fixed;inset:0;z-index:2147483646;background:rgba(2,4,8,.62);display:flex;
+  align-items:center;justify-content:center;padding:24px;}
+.fgl-hdr{display:flex;flex-direction:column;width:min(640px,92vw);max-height:82vh;background:var(--win);
+  border:1px solid var(--line2);border-radius:8px;box-shadow:0 18px 60px rgba(0,0,0,.6);overflow:hidden;}
+.fgl-hdr-head{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;
+  border-bottom:1px solid var(--line);color:var(--text);font-size:12px;letter-spacing:.04em;}
+.fgl-hdr-x{background:transparent;border:none;color:var(--dim);font-size:18px;line-height:1;cursor:pointer;padding:0 4px;}
+.fgl-hdr-x:hover{color:var(--gold);}
+.fgl-hdr-body{overflow:auto;padding:8px 14px 12px;font-family:var(--mono);font-size:11px;line-height:1.55;}
+.fgl-hdr-card{display:flex;gap:7px;white-space:pre-wrap;word-break:break-word;}
+.fgl-hdr-card.comment{color:var(--dim);}
+.fgl-hdr-k{color:var(--gold);min-width:80px;flex:none;}
+.fgl-hdr-eq{color:var(--faint);}
+.fgl-hdr-v{color:var(--text);}
+.fgl-hdr-c{color:var(--faint);}
+.fgl-hdr-msg{color:var(--dim);padding:14px 0;text-align:center;}
 .fgl-dr-scanning{font-size:10px;color:var(--faint);padding:6px 0;}
 .fgl-dr-track{position:relative;height:32px;}
 .fgl-hist{position:absolute;inset:0 0 8px;width:100%;height:24px;border:1px solid var(--line);border-radius:3px;background:var(--inset);}

@@ -88,6 +88,13 @@ def test_build_dataset_end_to_end(tmp_path):
     assert ds == tmp_path / "dist" / "demo"
     for band in ("f150w", "f277w", "f444w"):
         assert (ds / band / "manifest.json").is_file()
+        # The header sidecar sits next to the manifest (the viewer derives its URL
+        # by filename swap), carrying the full ordered card list.
+        hdr = json.loads((ds / band / "header.json").read_text())
+        assert hdr["version"] == 1
+        assert isinstance(hdr["cards"], list) and len(hdr["cards"]) > 0
+        assert all({"keyword", "value", "comment"} <= c.keys() for c in hdr["cards"])
+        assert any(c["keyword"] == "NAXIS" for c in hdr["cards"])
     assert (ds / "catalog.csv").is_file()
     assert not list(ds.glob(".*.building"))  # no per-band staging left behind
 

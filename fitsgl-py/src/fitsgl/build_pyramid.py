@@ -33,7 +33,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 
-from .manifest import LevelInfo, Manifest, SupertileInfo, write_manifest
+from .manifest import LevelInfo, Manifest, SupertileInfo, write_header, write_manifest
 
 if TYPE_CHECKING:
     from .placed_tiles import GridFrame
@@ -738,6 +738,9 @@ def build_pyramid(
             levels=levels,
         )
         write_manifest(output_dir / "manifest.json", manifest)
+        # Sidecar: the full native-header card list, for the viewer's header panel.
+        # Sits next to manifest.json so the client derives its URL by filename swap.
+        write_header(output_dir / "header.json", header, source_file)
     finally:
         # Drop the transient native array. When it was staged in a private scratch
         # subdir (not the output dir), remove the whole subdir so nothing leaks.
