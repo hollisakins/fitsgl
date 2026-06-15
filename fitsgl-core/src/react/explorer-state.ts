@@ -99,6 +99,8 @@ export interface ExplorerState {
   overlay: boolean;
   /** RA/Dec coordinate grid (graticule) overlay. */
   graticule: boolean;
+  /** Ruler / measure tool active (drag the image to measure distance + PA). */
+  ruler: boolean;
 }
 
 /** A band's grid group, defaulting to 0 (one group / single-grid dataset). */
@@ -205,6 +207,7 @@ export function defaultExplorerState(
     northUp: dv?.northUp ?? true,
     overlay: false,
     graticule: false,
+    ruler: false,
   };
 }
 

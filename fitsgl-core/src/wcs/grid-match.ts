@@ -20,6 +20,7 @@
  */
 
 import { parseWcs, pixToSky, type TanWcs } from './tan.js';
+import { angularSeparationDeg } from './separation.js';
 
 /**
  * Maximum sky disagreement allowed between two bands at a sampled point,
@@ -39,25 +40,10 @@ export interface GridSpec {
   shape: readonly [number, number];
 }
 
-const DEG = Math.PI / 180;
-
 /** Mean pixel scale (arcsec/px) from a CD matrix: √|det(CD)| · 3600. */
 function pixelScaleArcsec(wcs: TanWcs): number {
   const [a, b, c, d] = wcs.cd;
   return Math.sqrt(Math.abs(a * d - b * c)) * 3600;
-}
-
-/** Great-circle separation in arcsec (robust to RA wrap and cos(dec)). */
-function angularSepArcsec(ra1: number, dec1: number, ra2: number, dec2: number): number {
-  const a1 = ra1 * DEG;
-  const a2 = ra2 * DEG;
-  const b1 = dec1 * DEG;
-  const b2 = dec2 * DEG;
-  const sinHalfD = Math.sin((b2 - b1) / 2);
-  const sinHalfA = Math.sin((a2 - a1) / 2);
-  const hav = sinHalfD * sinHalfD + Math.cos(b1) * Math.cos(b2) * sinHalfA * sinHalfA;
-  const sep = 2 * Math.asin(Math.min(1, Math.sqrt(hav)));
-  return (sep / DEG) * 3600;
 }
 
 function ctype(wcs: Record<string, unknown>, key: string): string {
@@ -111,7 +97,7 @@ export function gridsMatch(a: GridSpec, b: GridSpec): boolean {
   for (const [x, y] of samples) {
     const sa = pixToSky(wa, x, y);
     const sb = pixToSky(wb, x, y);
-    if (angularSepArcsec(sa.ra, sa.dec, sb.ra, sb.dec) > toleranceArcsec) {
+    if (angularSeparationDeg(sa, sb) * 3600 > toleranceArcsec) {
       return false;
     }
   }

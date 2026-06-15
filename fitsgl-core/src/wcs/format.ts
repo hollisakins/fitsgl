@@ -60,6 +60,19 @@ export function formatDec(decDeg: number, decimals = 2): string {
   return `${sign}${pad2(whole)}:${pad2(minutes)}:${padSeconds(seconds, decimals)}`;
 }
 
+/**
+ * Format a great-circle separation (DEGREES) with an auto-selected unit so a
+ * measurement reads naturally at any scale: arcseconds below 1′, arcminutes below
+ * 1°, degrees above. Non-finite collapses to the standard `—` placeholder.
+ */
+export function formatSeparation(sepDeg: number): string {
+  if (!Number.isFinite(sepDeg)) return '—';
+  const arcsec = Math.abs(sepDeg) * 3600;
+  if (arcsec < 60) return `${arcsec.toFixed(2)}″`;
+  if (arcsec < 3600) return `${(arcsec / 60).toFixed(2)}′`;
+  return `${Math.abs(sepDeg).toFixed(3)}°`;
+}
+
 /** Convert a 1- or 3-token coordinate field to degrees. 1 token = decimal degrees
  *  (a decimal RA is already in degrees). 3 tokens = sexagesimal; RA tokens are in
  *  hours (×15 → degrees), Dec tokens in degrees. Returns null on a non-numeric token. */

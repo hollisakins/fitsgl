@@ -40,6 +40,7 @@ import {
   colormapRGB,
   formatDec,
   formatRA,
+  formatSeparation,
   parseCatalogCSV,
   parseSkyCoord,
   pixToSky,
@@ -51,6 +52,7 @@ import {
   type FitsglConfig,
   type MarkerEvent,
   type MarkerInput,
+  type PointerTool,
   type ResolvedMarker,
   type StretchMode,
   type TilePyramidOptions,
@@ -77,6 +79,7 @@ import {
 import { bandsSignature, viewSignature } from './plan.js';
 import { buildShareUrl, decodeShareHash, type ShareState } from './share-url.js';
 import { drawGraticule } from './graticule.js';
+import { drawRuler, measureRuler, type RulerGeometry } from './ruler.js';
 
 /** Merge a decoded shared view state onto a base explorer state, validating each
  *  field against the loaded bands / known modes so a stale or hostile link can't
@@ -959,6 +962,52 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     else h.clearMarkers();
   }, [state.overlay, markers, readyTick]);
 
+  // The measure tool (ruler): a PointerTool (the Phase 0 seam) that turns a
+  // left-drag into a measured line. Endpoints + the derived distance/PA live in the
+  // readout store (per-drag high frequency), so only the overlay + status leaf
+  // re-render — never the whole control panel. WCS is read live so a band switch
+  // mid-session is reflected; without one only the pixel distance is defined.
+  const rulerTool = useMemo<PointerTool>(
+    () => ({
+      cursor: 'crosshair',
+      onPointerDown(world) {
+        const a = { x: world.x, y: world.y };
+        const wcs = getViewer()?.getWcs() ?? null;
+        readout.ruler = { a, b: a, dragging: true, ...measureRuler(wcs, a, a) };
+        emitReadout(readout);
+      },
+      onPointerMove(world) {
+        const r = readout.ruler;
+        if (r === null) return;
+        const b = { x: world.x, y: world.y };
+        const wcs = getViewer()?.getWcs() ?? null;
+        readout.ruler = { a: r.a, b, dragging: true, ...measureRuler(wcs, r.a, b) };
+        emitReadout(readout);
+      },
+      onPointerUp(world) {
+        const r = readout.ruler;
+        if (r === null) return;
+        const b = { x: world.x, y: world.y };
+        const wcs = getViewer()?.getWcs() ?? null;
+        readout.ruler = { a: r.a, b, dragging: false, ...measureRuler(wcs, r.a, b) };
+        emitReadout(readout);
+      },
+    }),
+    [getViewer, readout],
+  );
+
+  // Install/clear the tool with the toggle (gated on a ready viewer, like markers).
+  // Turning it off also clears any drawn line so re-enabling starts fresh.
+  useEffect(() => {
+    const h = handle.current;
+    if (h === null || readyTick === 0) return;
+    h.setTool(state.ruler ? rulerTool : null);
+    if (!state.ruler && readout.ruler !== null) {
+      readout.ruler = null;
+      emitReadout(readout);
+    }
+  }, [state.ruler, rulerTool, readyTick, readout]);
+
   // Apply a shared link's camera once, after the first frame (the construction-time
   // fitToImage has run by then, so this overrides it to the shared sky position).
   const urlCamAppliedRef = useRef(false);
@@ -1226,6 +1275,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
           }}
         >
           {state.graticule && <Graticule getViewer={getViewer} store={readout} />}
+          {state.ruler && <RulerOverlay getViewer={getViewer} store={readout} />}
           <FitsLoadingField active={loading} />
           <div className={`fgl-win${collapsed ? ' collapsed' : ''}`}>
             <div className="fgl-win-head" onClick={() => setCollapsed((c) => !c)}>
@@ -1428,6 +1478,19 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                 </div>
               </div>
 
+              {/* tools */}
+              <div className="fgl-sec">
+                <span className="fgl-cap">Tools</span>
+                <div
+                  className={`fgl-tg${state.ruler ? ' on' : ''}`}
+                  onClick={() => setState((s) => ({ ...s, ruler: !s.ruler }))}
+                >
+                  <span className="fgl-tx">Ruler</span>
+                  <span className="fgl-switch" />
+                </div>
+                <div className="fgl-note">Drag across the image to measure separation &amp; position angle.</div>
+              </div>
+
               <div className="fgl-sec">
                 <div className="fgl-btn-row">
                   <button type="button" className="fgl-reset" onClick={() => handle.current?.fitToImage()}>
@@ -1495,12 +1558,14 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
 interface ReadoutStore {
   cursor: CursorInfo | null;
   frame: ViewerFrameInfo | null;
+  /** Live ruler measurement (measure tool); null when idle/inactive. */
+  ruler: RulerGeometry | null;
   version: number;
   listeners: Set<() => void>;
 }
 
 function createReadoutStore(): ReadoutStore {
-  return { cursor: null, frame: null, version: 0, listeners: new Set() };
+  return { cursor: null, frame: null, ruler: null, version: 0, listeners: new Set() };
 }
 
 function emitReadout(store: ReadoutStore): void {
@@ -1705,6 +1770,33 @@ function Graticule({
   return <canvas ref={ref} className="fgl-grat" aria-hidden="true" />;
 }
 
+/** A Canvas2D ruler line + measurement label stacked over the GL canvas; redraws by
+ *  subscribing to the readout store (which the measure tool bumps on every drag move,
+ *  and which the per-frame onFrame/onCursor traffic bumps so it stays glued on zoom). */
+function RulerOverlay({
+  getViewer,
+  store,
+}: {
+  getViewer: () => FitsViewerCore | null;
+  store: ReadoutStore;
+}): JSX.Element {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  useSyncExternalStore(
+    (cb) => {
+      store.listeners.add(cb);
+      return (): void => {
+        store.listeners.delete(cb);
+      };
+    },
+    () => store.version,
+    () => 0,
+  );
+  useEffect(() => {
+    drawRuler(ref.current, getViewer(), store.ruler);
+  });
+  return <canvas ref={ref} className="fgl-ruler" aria-hidden="true" />;
+}
+
 /** Format a pixel value for the status bar: '—' for no-data / not-resident, else
  *  5 significant figures with trailing zeros trimmed. */
 function formatValue(v: number | null): string {
@@ -1724,7 +1816,7 @@ function StatusReadout({ store }: { store: ReadoutStore }): JSX.Element {
     () => store.version,
     () => 0,
   );
-  const { cursor, frame } = store;
+  const { cursor, frame, ruler } = store;
   const inside = cursor !== null && cursor.insideImage;
   const pixStr =
     cursor !== null && cursor.insideImage
@@ -1757,6 +1849,20 @@ function StatusReadout({ store }: { store: ReadoutStore }): JSX.Element {
         <i>zoom</i>
         <b>{frame !== null ? `${frame.zoom.toFixed(2)}×` : '—'}</b>
       </span>
+      {ruler !== null && (
+        <>
+          <span className="fgl-item coord" title={`${ruler.pixelDist.toFixed(2)} px`}>
+            <i>dist</i>
+            <b>{ruler.sepDeg !== null ? formatSeparation(ruler.sepDeg) : `${ruler.pixelDist.toFixed(1)} px`}</b>
+          </span>
+          {ruler.paDeg !== null && (
+            <span className="fgl-item coord">
+              <i>PA</i>
+              <b>{`${ruler.paDeg.toFixed(1)}°`}</b>
+            </span>
+          )}
+        </>
+      )}
     </>
   );
 }
@@ -1840,6 +1946,7 @@ const STYLE_CSS = `
 .fgl-cbar-tick{position:absolute;top:0;font-size:9px;color:var(--dim);font-family:var(--mono);
   font-variant-numeric:tabular-nums;white-space:nowrap;}
 .fgl-grat{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;}
+.fgl-ruler{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:2;}
 .fgl-modal{position:fixed;inset:0;z-index:2147483646;background:rgba(2,4,8,.62);display:flex;
   align-items:center;justify-content:center;padding:24px;}
 .fgl-hdr{display:flex;flex-direction:column;width:min(640px,92vw);max-height:82vh;background:var(--win);
