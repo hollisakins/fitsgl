@@ -14,6 +14,7 @@ import {
   buildLevelGeoms,
   tileWorldRect,
   tilePixelDims,
+  worldPixelToTileIndex,
   fallbackUV,
   tileKey,
   type LevelGeom,
@@ -31,6 +32,49 @@ function geom(partial: Partial<LevelGeom> & { z: number }): LevelGeom {
     nTilesY: partial.nTilesY ?? Math.ceil(levelH / 256),
   };
 }
+
+describe('worldPixelToTileIndex (cursor value sampling — inverse of tileWorldRect)', () => {
+  it('maps a z=0 point to its tile + row-major index', () => {
+    const g = geom({ z: 0 }); // 512×512, four 256² tiles
+    expect(worldPixelToTileIndex(g, 0.5, 0.5)).toEqual({ tileX: 0, tileY: 0, col: 0, row: 0, index: 0 });
+    // (300, 5) → tile (1,0), in-tile (44, 5); full-width tile so stride 256.
+    expect(worldPixelToTileIndex(g, 300, 5)).toEqual({ tileX: 1, tileY: 0, col: 44, row: 5, index: 5 * 256 + 44 });
+  });
+
+  it('uses the partial edge-tile width as the row stride', () => {
+    const g = geom({ z: 0, levelW: 300, levelH: 300 }); // tile (1,0) is only 44 px wide
+    // (280, 10) → tile (1,0), col 24, row 10; stride is 44, NOT 256.
+    expect(worldPixelToTileIndex(g, 280, 10)).toEqual({ tileX: 1, tileY: 0, col: 24, row: 10, index: 10 * 44 + 24 });
+  });
+
+  it('applies the 2^z scale: a coarser level maps world px through f', () => {
+    const g = geom({ z: 1, levelW: 256, levelH: 256 }); // f = 2
+    // world (4, 4) → level px (2, 2) → tile (0,0) index 2*256+2.
+    expect(worldPixelToTileIndex(g, 4, 4)).toEqual({ tileX: 0, tileY: 0, col: 2, row: 2, index: 2 * 256 + 2 });
+    // world (510, 2) → level px (255, 1) → still tile (0,0), col 255.
+    expect(worldPixelToTileIndex(g, 510, 2)).toEqual({ tileX: 0, tileY: 0, col: 255, row: 1, index: 1 * 256 + 255 });
+  });
+
+  it('returns null for a point outside the level grid', () => {
+    const g = geom({ z: 0 }); // 512×512
+    expect(worldPixelToTileIndex(g, -1, 5)).toBeNull();
+    expect(worldPixelToTileIndex(g, 512, 5)).toBeNull(); // lx === levelW is out
+    expect(worldPixelToTileIndex(g, 5, 600)).toBeNull();
+  });
+
+  it('round-trips against tileWorldRect: a tile origin maps back to that tile, col/row 0', () => {
+    const g = geom({ z: 2, levelW: 400, levelH: 400 }); // f = 4
+    for (const [tx, ty] of [[0, 0], [1, 0], [1, 1]] as const) {
+      const rect = tileWorldRect(g, tx, ty);
+      const loc = worldPixelToTileIndex(g, rect.x0 + 0.5, rect.y0 + 0.5);
+      expect(loc).not.toBeNull();
+      expect(loc!.tileX).toBe(tx);
+      expect(loc!.tileY).toBe(ty);
+      expect(loc!.col).toBe(0);
+      expect(loc!.row).toBe(0);
+    }
+  });
+});
 
 describe('targetLevel', () => {
   it('picks the level whose tile pixel ~ one screen pixel (2^z ~ 1/zoom)', () => {

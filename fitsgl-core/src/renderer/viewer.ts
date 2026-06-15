@@ -81,6 +81,7 @@ import {
   tileKey,
   tileWorldRect,
   visibleTiles,
+  worldPixelToTileIndex,
   TILE_SIZE,
   type LevelGeom,
   type TileCoord,
@@ -169,6 +170,23 @@ export interface CursorInfo {
   dec: number | null;
   /** Whether the cursor is within the image's pixel bounds. */
   insideImage: boolean;
+  /**
+   * Data value(s) under the cursor, one per active band (single-band → 1, RGB → 3),
+   * parallel to the composite's bands. Each entry is a finite number; `NaN` for a
+   * resident no-data pixel; or `null` when that tile is not currently RAM-resident
+   * (the readout stays fetch-free — it never kicks a load) or the cursor is outside
+   * the image. Sampled from the DISPLAYED level (`level`), so when zoomed out the
+   * value is block-decimated, not the native pixel — see `native`. Values are RICE
+   * lossy-dequantized (display-grade, ~0.03% faithful), not the lossless mosaic.
+   */
+  values: ReadonlyArray<number | null>;
+  /** Convenience: the primary band's value (`values[0]`), or null. */
+  value: number | null;
+  /** The pyramid level the value(s) were sampled from (the LOD drawn this frame). */
+  level: number;
+  /** Whether `level === 0` — the value is the true native pixel (only near 1:1 zoom);
+   *  at coarser levels the value is block-averaged. */
+  native: boolean;
   /** The topmost marker under the cursor, or null. Correlates the sky readout
    *  with the overlay hit-test in one event (decision D10). */
   marker: ResolvedMarker | null;
@@ -2234,9 +2252,36 @@ export class FitsViewer {
       ra = sky.ra;
       dec = sky.dec;
     }
+
+    // Data value(s) under the cursor — sampled from the DISPLAYED level (its tiles
+    // are RAM-resident because the frame just drew them), so this is a synchronous,
+    // fetch-free peek that never kicks a load. `null` per band when not resident /
+    // outside the image; `NaN` for a resident no-data pixel.
+    const level = this.lastLevel;
+    const geom = insideImage ? this.geoms.get(level) : undefined;
+    const loc = geom !== undefined ? worldPixelToTileIndex(geom, world.x, world.y) : null;
+    const values: Array<number | null> = this.bandPyramids.map((pyr) => {
+      if (loc === null) return null;
+      const tile = pyr.peekTile(level, loc.tileX, loc.tileY);
+      if (tile === undefined || loc.index >= tile.length) return null;
+      return tile[loc.index]!;
+    });
+    const value: number | null = values[0] ?? null;
+
     const marker = this.hitTest(p.bufX, p.bufY);
 
-    this.onCursor?.({ worldX: world.x, worldY: world.y, ra, dec, insideImage, marker });
+    this.onCursor?.({
+      worldX: world.x,
+      worldY: world.y,
+      ra,
+      dec,
+      insideImage,
+      values,
+      value,
+      level,
+      native: level === 0,
+      marker,
+    });
 
     // Hover fires only when the topmost marker changes; the popup follows the
     // cursor while a marker stays hovered.

@@ -1214,7 +1214,14 @@ function emitReadout(store: ReadoutStore): void {
   for (const l of store.listeners) l();
 }
 
-/** The α/δ/zoom status-bar cells — the only subtree that updates per frame. */
+/** Format a pixel value for the status bar: '—' for no-data / not-resident, else
+ *  5 significant figures with trailing zeros trimmed. */
+function formatValue(v: number | null): string {
+  if (v === null || !Number.isFinite(v)) return '—';
+  return Number(v.toPrecision(5)).toString();
+}
+
+/** The value/pixel/α/δ/zoom status-bar cells — the only subtree that updates per frame. */
 function StatusReadout({ store }: { store: ReadoutStore }): JSX.Element {
   useSyncExternalStore(
     (onChange) => {
@@ -1227,8 +1234,26 @@ function StatusReadout({ store }: { store: ReadoutStore }): JSX.Element {
     () => 0,
   );
   const { cursor, frame } = store;
+  const inside = cursor !== null && cursor.insideImage;
+  const pixStr =
+    cursor !== null && cursor.insideImage
+      ? `${Math.floor(cursor.worldX)}, ${Math.floor(cursor.worldY)}`
+      : '—';
+  const valStr =
+    cursor !== null && cursor.insideImage ? cursor.values.map(formatValue).join(' ') : '—';
+  // The value is sampled from the displayed LOD; flag it when that isn't native (1:1).
+  const valTitle =
+    inside && cursor !== null && !cursor.native ? `binned · pyramid level ${cursor.level}` : undefined;
   return (
     <>
+      <span className="fgl-item coord" title={valTitle}>
+        <i>val{inside && cursor !== null && !cursor.native ? '*' : ''}</i>
+        <b>{valStr}</b>
+      </span>
+      <span className="fgl-item coord">
+        <i>x,y</i>
+        <b>{pixStr}</b>
+      </span>
       <span className="fgl-item coord">
         <i>α</i>
         <b>{cursor !== null && cursor.ra !== null ? formatRA(cursor.ra) : '—'}</b>

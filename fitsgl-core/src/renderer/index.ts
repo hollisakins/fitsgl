@@ -85,6 +85,7 @@ export {
   buildLevelGeoms,
   tileWorldRect,
   tilePixelDims,
+  worldPixelToTileIndex,
   fallbackUV,
   tileKey,
   TILE_SIZE,
