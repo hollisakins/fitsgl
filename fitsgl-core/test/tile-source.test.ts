@@ -180,6 +180,56 @@ describe('TileEngine — caching and de-duplication', () => {
   });
 });
 
+describe('TileEngine / TilePyramid — peekTile (synchronous, fetch-free RAM read)', () => {
+  it('returns undefined for a tile that has not been loaded (no fetch triggered)', async () => {
+    const rf = fixtureRangeFetcher();
+    const engine = await TileEngine.load(MANIFEST_URL, {
+      fetchImpl: manifestFetch(),
+      rangeFetch: rf.fetch,
+      blobStore: null,
+    });
+    const callsBefore = rf.calls.length;
+    expect(engine.peekTile(1, 0, 0)).toBeUndefined();
+    expect(rf.calls.length).toBe(callsBefore); // a peek must never fetch
+  });
+
+  it('returns the decoded array once the tile is resident (same instance as getTile)', async () => {
+    const engine = await TileEngine.load(MANIFEST_URL, {
+      fetchImpl: manifestFetch(),
+      rangeFetch: fixtureRangeFetcher().fetch,
+      blobStore: null,
+    });
+    const loaded = await engine.getTile(1, 0, 0);
+    const peeked = engine.peekTile(1, 0, 0);
+    expect(peeked).toBe(loaded); // the cache's own instance
+    expect(firstFloatMismatch(peeked!, z1Decoded, 0)).toBe(-1);
+  });
+
+  it('does not bump LRU recency, so a peeked tile is still evicted as the oldest', async () => {
+    const engine = await TileEngine.load(MANIFEST_URL, {
+      fetchImpl: manifestFetch(),
+      rangeFetch: fixtureRangeFetcher().fetch,
+      cacheSize: 2,
+      blobStore: null,
+    });
+    await engine.getTile(0, 0, 0); // oldest
+    await engine.getTile(0, 1, 0);
+    engine.peekTile(0, 0, 0); // read without bumping recency
+    await engine.getTile(0, 0, 1); // third distinct tile → evicts the still-oldest (0,0,0)
+    expect(engine.peekTile(0, 0, 0)).toBeUndefined();
+    expect(engine.cacheSize).toBe(2);
+  });
+
+  it('TilePyramid facade peeks resident tiles and returns undefined after destroy()', async () => {
+    const p = await TilePyramid.load(MANIFEST_URL, inlineOptions());
+    expect(p.peekTile(1, 0, 0)).toBeUndefined(); // not loaded yet
+    const loaded = await p.getTile(1, 0, 0);
+    expect(p.peekTile(1, 0, 0)).toBe(loaded);
+    p.destroy();
+    expect(p.peekTile(1, 0, 0)).toBeUndefined(); // no throw after destroy
+  });
+});
+
 describe('TilePyramid (decode worker-pool mode, in-process workers)', () => {
   // The main-thread TileEngine owns manifest/fetch/cache; the pool only decodes.
   // So fetchers go to the pyramid (main side), and the in-process workers are

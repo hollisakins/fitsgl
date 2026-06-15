@@ -42,6 +42,7 @@ import {
   projectWorldToNdc,
   viewportWorldAABB,
   screenToWorld,
+  worldToScreen,
   type Mat2,
 } from './view-transform.js';
 import { parseWcs, pixToSky, type TanWcs } from '../wcs/tan.js';
@@ -80,6 +81,7 @@ import {
   tileKey,
   tileWorldRect,
   visibleTiles,
+  worldPixelToTileIndex,
   TILE_SIZE,
   type LevelGeom,
   type TileCoord,
@@ -126,6 +128,10 @@ const PREFETCH_IDLE_MS = 150;
 const PREFETCH_THROTTLE_MS = 80;
 /** Wheel sensitivity: zoom factor per deltaY unit (exponential). */
 const WHEEL_ZOOM_RATE = 0.0015;
+/** Keyboard zoom step (+/- keys): zoom multiplier per press. */
+const KEY_ZOOM_STEP = 1.3;
+/** Keyboard pan step (arrow keys): fraction of the smaller viewport edge per press. */
+const KEY_PAN_FRACTION = 0.15;
 /**
  * Opaque background colour (RGB). The canvas clears to this and the shader emits
  * it for NaN/no-data pixels, so no-data reads identically whether it falls on the
@@ -168,9 +174,55 @@ export interface CursorInfo {
   dec: number | null;
   /** Whether the cursor is within the image's pixel bounds. */
   insideImage: boolean;
+  /**
+   * Data value(s) under the cursor, one per active band (single-band → 1, RGB → 3),
+   * parallel to the composite's bands. Each entry is a finite number; `NaN` for a
+   * resident no-data pixel; or `null` when that tile is not currently RAM-resident
+   * (the readout stays fetch-free — it never kicks a load) or the cursor is outside
+   * the image. Sampled from the DISPLAYED level (`level`), so when zoomed out the
+   * value is block-decimated, not the native pixel — see `native`. Values are RICE
+   * lossy-dequantized (display-grade, ~0.03% faithful), not the lossless mosaic.
+   */
+  values: ReadonlyArray<number | null>;
+  /** Convenience: the primary band's value (`values[0]`), or null. */
+  value: number | null;
+  /** The pyramid level the value(s) were sampled from (the LOD drawn this frame). */
+  level: number;
+  /** Whether `level === 0` — the value is the true native pixel (only near 1:1 zoom);
+   *  at coarser levels the value is block-averaged. */
+  native: boolean;
   /** The topmost marker under the cursor, or null. Correlates the sky readout
    *  with the overlay hit-test in one event (decision D10). */
   marker: ResolvedMarker | null;
+}
+
+/** A point in world (native image-pixel) or drawing-buffer coordinates. */
+export interface ToolPoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * A pluggable pointer tool (e.g. a ruler or region drawer). Install one with
+ * `setTool`; it pre-empts the default pan + marker-click on a left-button press —
+ * the press, drag, and release route to the tool instead. `onPointerDown`
+ * returning `false` declines the gesture, letting the default pan happen
+ * (anything else — including `undefined` — consumes it). Each callback receives
+ * the position in BOTH `world` (native image-pixel, orientation-corrected, the
+ * same space as `screenToImage`/`pixToSky`) and `buffer` (drawing-buffer pixel)
+ * coordinates. The seam is deliberately generic so the ruler — and any future
+ * drag-to-create overlay — share one arbitration path rather than each patching
+ * the pan handlers.
+ */
+export interface PointerTool {
+  /** Left-button press. Return `false` to let the viewer pan instead (default: consume). */
+  onPointerDown?(world: ToolPoint, buffer: ToolPoint, event: MouseEvent): boolean | void;
+  /** Pointer drag while the tool holds the gesture (move events arrive window-wide). */
+  onPointerMove?(world: ToolPoint, buffer: ToolPoint, event: MouseEvent): void;
+  /** Left-button release ending the gesture. */
+  onPointerUp?(world: ToolPoint, buffer: ToolPoint, event: MouseEvent): void;
+  /** Optional CSS cursor shown while the tool is active (e.g. `'crosshair'`). */
+  readonly cursor?: string;
 }
 
 /**
@@ -207,6 +259,44 @@ export interface BandHistogram {
 export type VisibleHistogram =
   | { mode: 'single'; band: BandHistogram }
   | { mode: 'rgb'; r: BandHistogram | null; g: BandHistogram | null; b: BandHistogram | null };
+
+/**
+ * A read-only snapshot of the camera (`getCameraState`). World coordinates are
+ * native (z=0) image pixels; `zoom` is drawing-buffer pixels per world pixel
+ * (1.0 = native). Drives deep-link/restore, PNG export, and split-view sync —
+ * the read side that `onFrame` only ever surfaced per-frame before.
+ */
+export interface CameraState {
+  centerX: number;
+  centerY: number;
+  zoom: number;
+}
+
+/**
+ * A serializable snapshot of the per-band display state (`getDisplayState`),
+ * sufficient to replay the look on another viewer via the existing setters
+ * (`setStretch`/`setStretchMode`/`setChannelStretch`/`setBandWeights`/
+ * `setColormap`/`setNorthUp`) — the basis for a split-view scale/colormap lock.
+ */
+export interface DisplayState {
+  /** Shared single-band stretch interval. */
+  stretchMin: number;
+  stretchMax: number;
+  /** The transfer curve, shared across RGB channels (D5). */
+  stretchMode: StretchMode;
+  /** Per-channel [min] for RGB mode (R, G, B); carries the trilogy black points (x0). */
+  channelMin: readonly [number, number, number];
+  /** Per-channel [max] for RGB mode (R, G, B). */
+  channelMax: readonly [number, number, number];
+  /** Multiband per-band trilogy weights (empty in single/RGB mode). */
+  bandWeights: ReadonlyArray<readonly [number, number, number]>;
+  /** The active single-band colormap spec, replayable via `setColormap` (null = grayscale). */
+  colormap: ColormapName | ColormapLUT | null;
+  /** Whether North-up rotation is currently applied. */
+  northUp: boolean;
+  /** Which draw path is active this configuration. */
+  mode: 'single' | 'rgb' | 'multiband';
+}
 
 export interface FitsViewerOptions {
   /** GPU texture budget in tiles (LRU by last visible frame). Default 200. */
@@ -386,6 +476,11 @@ export class FitsViewer {
   private trilogyLsat = 1;
   /** Single-band colormap LUT (texture unit 1), or null for grayscale. */
   private colormapTexture: WebGLTexture | null = null;
+  /** The spec last passed to `setColormap`, retained so `getDisplayState` can
+   *  report it (the GPU texture alone is not introspectable). A bundled palette
+   *  name (replayable across viewers for a colormap lock), a raw LUT, or null for
+   *  grayscale ('gray' is normalized to null). */
+  private colormapSpec: ColormapName | ColormapLUT | null = null;
 
   /** Parsed manifest WCS (z=0), or null if absent/unsupported. */
   private readonly wcs: TanWcs | null;
@@ -436,6 +531,11 @@ export class FitsViewer {
   private lastDragX = 0;
   private lastDragY = 0;
 
+  /** The active pointer tool (ruler etc.), or null for default pan/marker-click. */
+  private activeTool: PointerTool | null = null;
+  /** True while `activeTool` is consuming a press→release gesture (suppresses pan + marker-click). */
+  private toolGesture = false;
+
   private resizeObserver: ResizeObserver | null = null;
 
   // Bound handlers, retained so destroy() can detach exactly what it attached.
@@ -445,6 +545,7 @@ export class FitsViewer {
   private readonly onWheel: (e: WheelEvent) => void;
   private readonly onCanvasMove: (e: MouseEvent) => void;
   private readonly onCanvasLeave: () => void;
+  private readonly onKeyDown: (e: KeyboardEvent) => void;
   private readonly frame: () => void;
   private readonly pointerFrame: () => void;
 
@@ -571,9 +672,21 @@ export class FitsViewer {
     };
 
     this.onMouseDown = (e) => {
+      // Focus the canvas so keyboard shortcuts target this viewer (tabindex set in
+      // attachHandlers). preventScroll so a click never jumps the page.
+      this.canvas.focus({ preventScroll: true });
       if (e.button !== 0) return;
-      this.dragging = true;
       const p = this.toBufferCoords(e);
+      // An active tool pre-empts pan + marker-click for the gesture it claims.
+      if (this.activeTool !== null) {
+        const world = screenToWorld(this.camera, this.currentOrientation(), p.x, p.y);
+        const consumed = this.activeTool.onPointerDown?.(world, p, e) !== false;
+        if (consumed) {
+          this.toolGesture = true;
+          return;
+        }
+      }
+      this.dragging = true;
       this.lastDragX = p.x;
       this.lastDragY = p.y;
       // Remember the press for click-vs-drag discrimination on mouseup.
@@ -581,6 +694,14 @@ export class FitsViewer {
       this.pressY = p.y;
     };
     this.onMouseMove = (e) => {
+      // Route the drag to the active tool while it holds the gesture (move events
+      // are window-wide, so this works even if the pointer leaves the canvas).
+      if (this.toolGesture && this.activeTool !== null) {
+        const p = this.toBufferCoords(e);
+        const world = screenToWorld(this.camera, this.currentOrientation(), p.x, p.y);
+        this.activeTool.onPointerMove?.(world, p, e);
+        return;
+      }
       if (!this.dragging) return;
       const p = this.toBufferCoords(e);
       // Pan through the current orientation so a drag moves the grabbed point
@@ -593,6 +714,16 @@ export class FitsViewer {
       this.requestRender();
     };
     this.onMouseUp = (e) => {
+      // End an active tool's gesture (suppressing the pan/marker-click path below).
+      if (this.toolGesture && this.activeTool !== null) {
+        this.toolGesture = false;
+        if (e.button === 0) {
+          const p = this.toBufferCoords(e);
+          const world = screenToWorld(this.camera, this.currentOrientation(), p.x, p.y);
+          this.activeTool.onPointerUp?.(world, p, e);
+        }
+        return;
+      }
       // `dragging` is set only by a press that began on the canvas, so it gates
       // out a window mouseup whose mousedown landed elsewhere (which would reuse
       // a stale press position and could spuriously fire onMarkerClick).
@@ -643,6 +774,46 @@ export class FitsViewer {
       this.onCursor?.(null);
       this.clearHoverState();
     };
+    this.onKeyDown = (e) => {
+      // Let browser/OS shortcuts (Cmd/Ctrl/Alt combos) pass through untouched.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const panStep = Math.min(this.camera.viewportWidth, this.camera.viewportHeight) * KEY_PAN_FRACTION;
+      switch (e.key) {
+        case '+':
+        case '=':
+          this.setZoom(this.camera.zoom * KEY_ZOOM_STEP);
+          break;
+        case '-':
+        case '_':
+          this.setZoom(this.camera.zoom / KEY_ZOOM_STEP);
+          break;
+        case '0':
+        case 'f':
+        case 'F':
+          this.fitToImage();
+          break;
+        case 'n':
+        case 'N':
+          this.setNorthUp(!this.northUpEnabled);
+          break;
+        // Arrows scroll the view in their own direction (reveal content that way).
+        case 'ArrowLeft':
+          this.panByKey(panStep, 0);
+          break;
+        case 'ArrowRight':
+          this.panByKey(-panStep, 0);
+          break;
+        case 'ArrowUp':
+          this.panByKey(0, panStep);
+          break;
+        case 'ArrowDown':
+          this.panByKey(0, -panStep);
+          break;
+        default:
+          return; // not a shortcut — leave the event alone
+      }
+      e.preventDefault();
+    };
 
     this.syncCanvasSize();
     this.fitToImage();
@@ -674,6 +845,7 @@ export class FitsViewer {
     // 'gray' is the grayscale fast path (no LUT texture), same as null/default.
     if (spec === null || spec === 'gray') {
       this.clearColormapTexture();
+      this.colormapSpec = null;
       this.requestRender();
       return;
     }
@@ -681,6 +853,7 @@ export class FitsViewer {
     const next = createColormapTexture(this.gl, size, rgba);
     this.clearColormapTexture();
     this.colormapTexture = next;
+    this.colormapSpec = spec;
     this.requestRender();
   }
 
@@ -1059,6 +1232,15 @@ export class FitsViewer {
     return this.northUpEnabled && this.wcs !== null ? this.northUpMatrix : IDENTITY_MAT2;
   }
 
+  /** Pan the camera by a drawing-buffer-pixel delta (keyboard arrows), through the
+   *  current orientation so arrows move the view in screen directions under North-up. */
+  private panByKey(dxScreen: number, dyScreen: number): void {
+    const c = panCenter(this.camera, this.currentOrientation(), dxScreen, dyScreen);
+    this.camera.setCenter(c.centerX, c.centerY);
+    this.markCameraMoved();
+    this.requestRender();
+  }
+
   setCenter(x: number, y: number): void {
     this.camera.setCenter(x, y);
     this.markCameraMoved();
@@ -1077,6 +1259,126 @@ export class FitsViewer {
     this.camera.setZoom(this.fitZoom());
     this.markCameraMoved();
     this.requestRender();
+  }
+
+  // ---- read-side accessors (deep-links, PNG export, overlays, split-view) --
+
+  /**
+   * A read-only snapshot of the camera centre + zoom. Until now the camera state
+   * escaped only via the per-frame `onFrame` callback; this exposes it on demand
+   * for deep-link/restore, PNG export, a magnifier, and split-view sync. Pair with
+   * `setCenter`/`setZoom` to apply a snapshot. See `CameraState`.
+   */
+  getCameraState(): CameraState {
+    return { centerX: this.camera.centerX, centerY: this.camera.centerY, zoom: this.camera.zoom };
+  }
+
+  /** The parsed ICRS-TAN WCS (z=0), or null when the manifest carries none or an
+   *  unsupported projection. The world (native-pixel) ⇄ sky basis for hosts. */
+  getWcs(): TanWcs | null {
+    return this.wcs;
+  }
+
+  /**
+   * Map a client (CSS) coordinate — e.g. `event.clientX/clientY` — to world
+   * (native image-pixel) coordinates, accounting for DPR and the current North-up
+   * orientation. The inverse of `imageToScreen`. Use for a value/coord readout,
+   * region vertices, or hit-testing against the data without reaching into the
+   * private camera. World (0,0) is the top-left pixel corner; pixel centres are at
+   * half-integers (FITS convention), matching `pixToSky`.
+   */
+  screenToImage(clientX: number, clientY: number): { x: number; y: number } {
+    const b = this.clientToBuffer(clientX, clientY);
+    return screenToWorld(this.camera, this.currentOrientation(), b.x, b.y);
+  }
+
+  /**
+   * Map a world (native image-pixel) coordinate to a client (CSS) coordinate, for
+   * positioning a DOM overlay (label, handle) over a data point. The inverse of
+   * `screenToImage`; returns viewport-relative client pixels (same frame as a
+   * pointer event's `clientX/clientY`).
+   */
+  imageToScreen(worldX: number, worldY: number): { x: number; y: number } {
+    const s = worldToScreen(this.camera, this.currentOrientation(), worldX, worldY);
+    const rect = this.canvas.getBoundingClientRect();
+    return {
+      x: rect.left + s.x / (this.canvas.width / (rect.width || 1)),
+      y: rect.top + s.y / (this.canvas.height / (rect.height || 1)),
+    };
+  }
+
+  /**
+   * A serializable snapshot of the current display state (stretch / colormap /
+   * mode / North-up). Replay it on another viewer with the matching setters to
+   * lock the look across a split view. See `DisplayState`.
+   */
+  getDisplayState(): DisplayState {
+    return {
+      stretchMin: this.stretchMin,
+      stretchMax: this.stretchMax,
+      stretchMode: this.stretchMode,
+      channelMin: [this.channelMin[0], this.channelMin[1], this.channelMin[2]],
+      channelMax: [this.channelMax[0], this.channelMax[1], this.channelMax[2]],
+      bandWeights: this.bandWeights.map((w) => [w[0], w[1], w[2]] as const),
+      colormap: this.colormapSpec,
+      northUp: this.northUpEnabled,
+      mode: this.mode,
+    };
+  }
+
+  /**
+   * Capture the current view as a PNG data URL (at drawing-buffer / device-pixel
+   * resolution). Forces a synchronous redraw, then reads the drawing buffer — so
+   * markers and any GL overlay compositing into the same canvas are included. This
+   * is a plain framebuffer read (not the per-tile value read-back), valid even
+   * without `preserveDrawingBuffer` because the read happens in the same task as
+   * the draw, before the browser composites. The host triggers the download (e.g.
+   * an `<a download>` with the returned URL).
+   */
+  exportPNG(): string {
+    const gl = this.gl;
+    this.draw(); // render into the back buffer now and read it before compositing
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const pixels = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    const out = document.createElement('canvas');
+    out.width = w;
+    out.height = h;
+    const ctx = out.getContext('2d');
+    if (ctx === null) throw new Error('FitsViewer.exportPNG: 2D canvas context unavailable');
+    const img = ctx.createImageData(w, h);
+    const row = w * 4;
+    // GL is y-up; flip rows into the y-down 2D canvas.
+    for (let y = 0; y < h; y++) {
+      const src = (h - 1 - y) * row;
+      img.data.set(pixels.subarray(src, src + row), y * row);
+    }
+    // The canvas is opaque (alpha:false); force full alpha so the PNG isn't transparent.
+    for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+    ctx.putImageData(img, 0, 0);
+    return out.toDataURL('image/png');
+  }
+
+  // ---- tool mode (pointer arbitration) ------------------------------------
+
+  /**
+   * Install (or clear, with `null`) a pointer tool that pre-empts the default pan
+   * + marker-click while active — the shared seam the ruler and any future
+   * drag-to-create overlay route through. Switching or clearing a tool cancels any
+   * in-flight tool gesture and sets the canvas cursor to the tool's `cursor`
+   * (cleared when none). Cursor readout (`onCursor`) and zoom are unaffected. See
+   * `PointerTool`.
+   */
+  setTool(tool: PointerTool | null): void {
+    this.activeTool = tool;
+    this.toolGesture = false; // a tool switch mid-gesture must not strand the flag
+    this.canvas.style.cursor = tool?.cursor ?? '';
+  }
+
+  /** The active pointer tool, or null when the default pan/marker-click is in effect. */
+  getTool(): PointerTool | null {
+    return this.activeTool;
   }
 
   destroy(): void {
@@ -1181,12 +1483,17 @@ export class FitsViewer {
   // ---- event wiring -------------------------------------------------------
 
   private attachHandlers(): void {
+    // Make the canvas keyboard-focusable (shortcuts target the focused viewer) and
+    // suppress the focus ring on the canvas itself (the host can restyle).
+    if (!this.canvas.hasAttribute('tabindex')) this.canvas.tabIndex = 0;
+    this.canvas.style.outline = 'none';
     this.canvas.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mouseup', this.onMouseUp);
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
     this.canvas.addEventListener('mousemove', this.onCanvasMove);
     this.canvas.addEventListener('mouseleave', this.onCanvasLeave);
+    this.canvas.addEventListener('keydown', this.onKeyDown);
     if (typeof ResizeObserver !== 'undefined') {
       this.resizeObserver = new ResizeObserver(() => {
         this.syncCanvasSize();
@@ -1203,6 +1510,7 @@ export class FitsViewer {
     this.canvas.removeEventListener('wheel', this.onWheel);
     this.canvas.removeEventListener('mousemove', this.onCanvasMove);
     this.canvas.removeEventListener('mouseleave', this.onCanvasLeave);
+    this.canvas.removeEventListener('keydown', this.onKeyDown);
     if (this.resizeObserver !== null) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;
@@ -1211,10 +1519,15 @@ export class FitsViewer {
 
   /** Convert a mouse event's client coords to drawing-buffer pixels. */
   private toBufferCoords(e: MouseEvent): { x: number; y: number } {
+    return this.clientToBuffer(e.clientX, e.clientY);
+  }
+
+  /** Convert a client (CSS) coordinate to drawing-buffer pixels (dpr-corrected). */
+  private clientToBuffer(clientX: number, clientY: number): { x: number; y: number } {
     const rect = this.canvas.getBoundingClientRect();
     return {
-      x: (e.clientX - rect.left) * (this.canvas.width / (rect.width || 1)),
-      y: (e.clientY - rect.top) * (this.canvas.height / (rect.height || 1)),
+      x: (clientX - rect.left) * (this.canvas.width / (rect.width || 1)),
+      y: (clientY - rect.top) * (this.canvas.height / (rect.height || 1)),
     };
   }
 
@@ -2036,9 +2349,36 @@ export class FitsViewer {
       ra = sky.ra;
       dec = sky.dec;
     }
+
+    // Data value(s) under the cursor — sampled from the DISPLAYED level (its tiles
+    // are RAM-resident because the frame just drew them), so this is a synchronous,
+    // fetch-free peek that never kicks a load. `null` per band when not resident /
+    // outside the image; `NaN` for a resident no-data pixel.
+    const level = this.lastLevel;
+    const geom = insideImage ? this.geoms.get(level) : undefined;
+    const loc = geom !== undefined ? worldPixelToTileIndex(geom, world.x, world.y) : null;
+    const values: Array<number | null> = this.bandPyramids.map((pyr) => {
+      if (loc === null) return null;
+      const tile = pyr.peekTile(level, loc.tileX, loc.tileY);
+      if (tile === undefined || loc.index >= tile.length) return null;
+      return tile[loc.index]!;
+    });
+    const value: number | null = values[0] ?? null;
+
     const marker = this.hitTest(p.bufX, p.bufY);
 
-    this.onCursor?.({ worldX: world.x, worldY: world.y, ra, dec, insideImage, marker });
+    this.onCursor?.({
+      worldX: world.x,
+      worldY: world.y,
+      ra,
+      dec,
+      insideImage,
+      values,
+      value,
+      level,
+      native: level === 0,
+      marker,
+    });
 
     // Hover fires only when the topmost marker changes; the popup follows the
     // cursor while a marker stays hovered.

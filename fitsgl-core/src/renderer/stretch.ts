@@ -24,20 +24,22 @@
  * fixed `LOG_SOFTENING`: the level-determination math (`trilogyLevels`) picks `K`
  * so the noise sits at a chosen output luminance. See `trilogyLevels` below.
  */
-export type StretchMode = 'linear' | 'log' | 'asinh' | 'trilogy';
+export type StretchMode = 'linear' | 'log' | 'sqrt' | 'asinh' | 'trilogy';
 
 /** All stretch modes, in UI/declaration order. */
-export const STRETCH_MODES: readonly StretchMode[] = ['linear', 'log', 'asinh', 'trilogy'];
+export const STRETCH_MODES: readonly StretchMode[] = ['linear', 'log', 'sqrt', 'asinh', 'trilogy'];
 
 /**
  * Integer ids handed to the shader's `u_stretchMode` uniform. Kept in lockstep
- * with the GLSL branch order in `tile.frag.ts`.
+ * with the GLSL branch order in `tile.frag.ts`. New modes take new ids so the
+ * existing ids never renumber (a stale shader/value can't silently shift).
  */
 export const STRETCH_MODE_IDS: Record<StretchMode, number> = {
   linear: 0,
   log: 1,
   asinh: 2,
   trilogy: 3,
+  sqrt: 4,
 };
 
 /** Fixed `log` softening — astropy `LogStretch` default. */
@@ -52,7 +54,13 @@ export const ASINH_SOFTENING = 0.1;
 export const DEFAULT_TRILOGY_K = LOG_SOFTENING;
 
 export function isStretchMode(value: string): value is StretchMode {
-  return value === 'linear' || value === 'log' || value === 'asinh' || value === 'trilogy';
+  return (
+    value === 'linear' ||
+    value === 'log' ||
+    value === 'sqrt' ||
+    value === 'asinh' ||
+    value === 'trilogy'
+  );
 }
 
 /**
@@ -77,6 +85,8 @@ export function applyStretch(norm: number, mode: StretchMode, trilogyK = DEFAULT
       return Math.log(LOG_SOFTENING * norm + 1) / Math.log(LOG_SOFTENING + 1);
     case 'asinh':
       return Math.asinh(norm / ASINH_SOFTENING) / Math.asinh(1 / ASINH_SOFTENING);
+    case 'sqrt':
+      return Math.sqrt(norm);
     case 'trilogy':
       return trilogyCurve(norm, trilogyK);
     case 'linear':

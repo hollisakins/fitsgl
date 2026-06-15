@@ -23,6 +23,7 @@ const h = vi.hoisted(() => {
     updateMarker: vi.fn(() => true),
     removeMarker: vi.fn(() => true),
     clearMarkers: vi.fn(),
+    setTool: vi.fn(),
     autoStretch: vi.fn(async () => null),
     fitToImage: vi.fn(),
     setCenter: vi.fn(),

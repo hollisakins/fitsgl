@@ -10,6 +10,7 @@ from fitsgl.stats import (
     compute_band_trilogy_stats,
     histogram_dict,
     trilogy_stats_dict,
+    zscale_limits,
 )
 
 
@@ -203,3 +204,24 @@ def test_choose_level_picks_finest_within_cap():
     assert _choose_level(m, 2_000_000).z == 3  # only z3 (1M) is within 2M
     assert _choose_level(m, 5_000_000).z == 2  # z2 (4M) is the finest within 5M
     assert _choose_level(m, 1).z == 3  # nothing fits -> coarsest
+
+
+def test_zscale_limits_basic():
+    rng = np.random.default_rng(0)
+    # A gaussian sky + a few bright sources: zscale should bracket the sky, not the peaks.
+    data = rng.normal(100.0, 5.0, size=20000).astype(np.float32)
+    data[:50] = 5000.0  # bright tail
+    z = zscale_limits(data)
+    assert z is not None
+    z1, z2 = z
+    assert z2 > z1
+    # The cuts sit around the sky (~100), nowhere near the 5000 outliers.
+    assert 50 < z1 < 150 and 60 < z2 < 220
+
+
+def test_zscale_limits_ignores_nans_and_handles_degenerate():
+    d = np.array([1.0, np.nan, np.inf, 2.0, np.nan], dtype=np.float32)
+    z = zscale_limits(d)
+    assert z is None or (z[1] > z[0])  # finite-only; may be degenerate on 2 points
+    assert zscale_limits(np.full(100, 7.0, dtype=np.float32)) is None  # constant → None
+    assert zscale_limits(np.array([], dtype=np.float32)) is None

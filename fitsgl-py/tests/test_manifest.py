@@ -2,12 +2,16 @@
 
 import json
 
+from astropy.io import fits
+
 from fitsgl.manifest import (
+    HEADER_VERSION,
     MANIFEST_VERSION,
     LevelInfo,
     Manifest,
     SupertileInfo,
     read_manifest,
+    write_header,
     write_manifest,
 )
 
@@ -116,3 +120,29 @@ def test_write_read(tmp_path):
 def test_json_serializable():
     # Every field must survive json.dumps without a custom encoder.
     json.dumps(_example_manifest().to_dict())
+
+
+def test_write_header_sidecar(tmp_path):
+    h = fits.Header()
+    h["SIMPLE"] = True
+    h["BITPIX"] = -32
+    h["NAXIS"] = 2
+    h["BUNIT"] = ("MJy/sr", "surface brightness unit")
+    h["BLANK"] = None  # an undefined-value card -> null
+    h.add_history("processed by fitsgl test")
+    h.add_comment("a comment card")
+
+    p = tmp_path / "header.json"
+    write_header(p, h, source_file="thing.fits")
+
+    raw = json.loads(p.read_text())  # parses => valid strict JSON (no NaN/Infinity)
+    assert raw["version"] == HEADER_VERSION
+    assert raw["source_file"] == "thing.fits"
+    cards = {c["keyword"]: c for c in raw["cards"]}
+    assert cards["BITPIX"]["value"] == -32
+    assert cards["BUNIT"]["value"] == "MJy/sr"
+    assert cards["BUNIT"]["comment"] == "surface brightness unit"
+    assert cards["BLANK"]["value"] is None
+    # COMMENT/HISTORY cards are preserved in order with their text in `value`.
+    assert any(c["keyword"] == "HISTORY" for c in raw["cards"])
+    assert any(c["keyword"] == "COMMENT" for c in raw["cards"])

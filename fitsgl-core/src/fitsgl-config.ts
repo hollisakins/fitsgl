@@ -67,6 +67,10 @@ export interface FitsglBandStats {
     sigma: number;
     tail: { p99: number; p99_9: number; p99_99: number; p99_999: number };
   };
+  /** Precomputed whole-image DS9/IRAF zscale display cuts `[z1, z2]` for the "zscale"
+   *  stretch preset. Whole-image (not viewport), so it can't be reproduced in-browser.
+   *  Omitted ⇒ no zscale preset for the band. */
+  zscale?: [number, number];
 }
 
 /** The dataset inventory — pure data, no view. */
@@ -139,6 +143,18 @@ function asBandStats(v: unknown, name: string): FitsglBandStats | undefined {
   const out: FitsglBandStats = { histogram: { counts: (h.counts as number[]).slice(), lo, hi } };
   const tri = asTrilogyStats(v.trilogy, name);
   if (tri !== undefined) out.trilogy = tri;
+  const zs = v.zscale;
+  if (zs !== undefined) {
+    if (
+      !Array.isArray(zs) ||
+      zs.length !== 2 ||
+      !zs.every((n) => typeof n === 'number' && Number.isFinite(n)) ||
+      !(zs[1] > zs[0])
+    ) {
+      throw new Error(`fitsgl-config: band "${name}" stats.zscale must be [z1, z2] with z2 > z1`);
+    }
+    out.zscale = [zs[0] as number, zs[1] as number];
+  }
   return out;
 }
 

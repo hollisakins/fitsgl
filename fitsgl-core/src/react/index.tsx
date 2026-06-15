@@ -32,12 +32,14 @@ import type { CSSProperties, ReactNode } from 'react';
 import { FitsViewer as CoreViewer, loadViewerSource, renderSourceForView } from '../index.js';
 import type {
   AutoStretchResult,
+  CameraState,
   CursorInfo,
   FitsViewerOptions,
   MarkerEvent,
   MarkerHandlers,
   MarkerInput,
   MarkerPatch,
+  PointerTool,
   ResolvedMarker,
   TilePyramid,
   TilePyramidOptions,
@@ -84,6 +86,16 @@ export interface FitsViewerHandle {
   setCenter(x: number, y: number): void;
   /** Set the zoom (drawing-buffer px per native px). */
   setZoom(zoom: number): void;
+  /** A snapshot of the camera centre + zoom, or null before load. */
+  getCameraState(): CameraState | null;
+  /** Map a client (CSS) coord to world (native image-pixel) coords; null before load. */
+  screenToImage(clientX: number, clientY: number): { x: number; y: number } | null;
+  /** Map a world (native image-pixel) coord to a client (CSS) coord; null before load. */
+  imageToScreen(worldX: number, worldY: number): { x: number; y: number } | null;
+  /** Install (or clear with null) a pointer tool that pre-empts pan/marker-click (e.g. a ruler). */
+  setTool(tool: PointerTool | null): void;
+  /** Capture the current view as a PNG data URL (device-pixel res; overlays included), or null before load. */
+  exportPNG(): string | null;
   /** Escape hatch: the underlying core viewer, or null before load / after unmount. */
   getViewer(): CoreViewer | null;
   /** Escape hatch: every loaded band pyramid by name, or null before load. */
@@ -268,6 +280,11 @@ const FitsViewerComponent = forwardRef<FitsViewerHandle, FitsViewerProps>(functi
       fitToImage: () => viewerRef.current?.fitToImage(),
       setCenter: (x, y) => viewerRef.current?.setCenter(x, y),
       setZoom: (z) => viewerRef.current?.setZoom(z),
+      getCameraState: () => viewerRef.current?.getCameraState() ?? null,
+      screenToImage: (clientX, clientY) => viewerRef.current?.screenToImage(clientX, clientY) ?? null,
+      imageToScreen: (worldX, worldY) => viewerRef.current?.imageToScreen(worldX, worldY) ?? null,
+      setTool: (tool) => viewerRef.current?.setTool(tool),
+      exportPNG: () => viewerRef.current?.exportPNG() ?? null,
       getViewer: () => viewerRef.current,
       getPyramids: () => pyramidsRef.current,
     };

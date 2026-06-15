@@ -114,14 +114,24 @@ describe('scaleValue — interval + clamp + stretch', () => {
 });
 
 describe('stretch mode metadata', () => {
-  it('ids are the linear/log/asinh/trilogy branch order in the shader', () => {
-    expect(STRETCH_MODE_IDS).toEqual({ linear: 0, log: 1, asinh: 2, trilogy: 3 });
+  it('ids match the shader branch order; new modes take new ids (existing never renumber)', () => {
+    expect(STRETCH_MODE_IDS).toEqual({ linear: 0, log: 1, asinh: 2, trilogy: 3, sqrt: 4 });
   });
   it('isStretchMode is a correct guard', () => {
     for (const m of STRETCH_MODES) expect(isStretchMode(m)).toBe(true);
     expect(isStretchMode('trilogy')).toBe(true);
-    expect(isStretchMode('sqrt')).toBe(false);
+    expect(isStretchMode('sqrt')).toBe(true);
+    expect(isStretchMode('cbrt')).toBe(false);
     expect(isStretchMode('')).toBe(false);
+  });
+});
+
+describe('sqrt stretch mode', () => {
+  it('applyStretch sqrt maps [0,1] -> [0,1] via the square root', () => {
+    expect(applyStretch(0, 'sqrt')).toBe(0);
+    expect(applyStretch(1, 'sqrt')).toBe(1);
+    expect(applyStretch(0.25, 'sqrt')).toBeCloseTo(0.5, 12);
+    expect(applyStretch(0.5, 'sqrt')).toBeCloseTo(Math.SQRT1_2, 12);
   });
 });
 

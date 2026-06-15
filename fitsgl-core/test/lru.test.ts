@@ -44,6 +44,24 @@ describe('LRUCache', () => {
     expect(c.has('b')).toBe(false);
   });
 
+  it('peek reads without refreshing recency, so it does not change eviction order', () => {
+    const c = new LRUCache<string, number>(2);
+    c.set('a', 1);
+    c.set('b', 2);
+    expect(c.peek('a')).toBe(1); // 'a' read, but recency NOT bumped
+    expect(c.keys()).toEqual(['a', 'b']); // order unchanged (a still oldest)
+    c.set('c', 3); // evicts the still-oldest 'a' (unlike get, which would save it)
+    expect(c.has('a')).toBe(false);
+    expect(c.has('b')).toBe(true);
+    expect(c.has('c')).toBe(true);
+  });
+
+  it('peek returns undefined for a missing key', () => {
+    const c = new LRUCache<string, number>(2);
+    c.set('a', 1);
+    expect(c.peek('missing')).toBeUndefined();
+  });
+
   it('rejects an invalid capacity', () => {
     expect(() => new LRUCache<string, number>(0)).toThrow(/positive integer/i);
     expect(() => new LRUCache<string, number>(-1)).toThrow(/positive integer/i);

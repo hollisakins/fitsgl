@@ -79,6 +79,32 @@ export function tilePixelDims(
   };
 }
 
+/**
+ * Map a world (native-pixel) point to the tile + in-tile location that holds it at
+ * level `geom.z`, or `null` when the point is outside the level grid. A level pixel
+ * `lx` covers the world span `[lx·f, (lx+1)·f)` with `f = 2^z` (the inverse of
+ * `tileWorldRect`), so `lx = floor(worldX / f)`. `index` is the offset into the
+ * tile's decoded row-major `Float32Array`, whose row stride is `width` — taken from
+ * `tilePixelDims` so partial high-index edge tiles index correctly. Pure (GL/DOM-free):
+ * the cursor value readout uses it; unit-tested under Node.
+ */
+export function worldPixelToTileIndex(
+  geom: LevelGeom,
+  worldX: number,
+  worldY: number,
+): { tileX: number; tileY: number; col: number; row: number; index: number } | null {
+  const f = 2 ** geom.z;
+  const lx = Math.floor(worldX / f);
+  const ly = Math.floor(worldY / f);
+  if (lx < 0 || ly < 0 || lx >= geom.levelW || ly >= geom.levelH) return null;
+  const tileX = Math.floor(lx / TILE_SIZE);
+  const tileY = Math.floor(ly / TILE_SIZE);
+  const col = lx - tileX * TILE_SIZE;
+  const row = ly - tileY * TILE_SIZE;
+  const { width } = tilePixelDims(geom, tileX, tileY);
+  return { tileX, tileY, col, row, index: row * width + col };
+}
+
 /** World-space rectangle covered by a tile (native pixels). */
 export function tileWorldRect(
   geom: LevelGeom,

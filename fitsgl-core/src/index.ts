@@ -42,6 +42,13 @@ export type {
   BandHistogram,
   VisibleHistogram,
   WorldBounds,
+  // Read-side state accessors (`getCameraState`/`getDisplayState`) + the pointer
+  // tool seam (`setTool`/`PointerTool`) — the Phase-0 foundation for the cursor
+  // readout, deep-links, PNG export, the ruler, and split-view locks.
+  CameraState,
+  DisplayState,
+  PointerTool,
+  ToolPoint,
 } from './renderer/index.js';
 // M5 — percentile auto-stretch + visible-data histogram (`FitsViewer.autoStretch`
 // and `.visibleHistogram` apply them; `percentileRange`/`histogram` are the pure
@@ -57,7 +64,7 @@ export type {
 } from './renderer/index.js';
 
 // M1 — display modes: stretch curves + bundled colormaps (single-band).
-export { STRETCH_MODES, isStretchMode } from './renderer/index.js';
+export { STRETCH_MODES, isStretchMode, applyStretch } from './renderer/index.js';
 export type { StretchMode } from './renderer/index.js';
 // Trilogy stretch: pure level-determination math + precomputed-stats types, plus
 // the weighted multi-band helpers (faithful trilogy: per-band stretch + rainbow).
@@ -85,8 +92,19 @@ export type {
 export { COLORMAP_NAMES, COLORMAP_SIZE, isColormapName, colormapRGB } from './renderer/index.js';
 export type { ColormapName, ColormapLUT } from './renderer/index.js';
 
-// M2 — WCS: client-side TAN pixel<->sky (ICRS) + sexagesimal formatting.
-export { parseWcs, pixToSky, skyToPix, formatRA, formatDec } from './wcs/index.js';
+// M2 — WCS: client-side TAN pixel<->sky (ICRS) + sexagesimal formatting +
+// great-circle separation / position angle (the ruler measure tool).
+export {
+  parseWcs,
+  pixToSky,
+  skyToPix,
+  formatRA,
+  formatDec,
+  parseSkyCoord,
+  formatSeparation,
+  angularSeparationDeg,
+  positionAngleDeg,
+} from './wcs/index.js';
 export type { TanWcs, SkyCoord, PixelCoord } from './wcs/index.js';
 
 // M4 — dataset manifest: groups composite-compatible single-band pyramids. The

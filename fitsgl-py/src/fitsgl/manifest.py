@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -133,3 +134,41 @@ def read_manifest(path: str | Path) -> Manifest:
     path = Path(path)
     with path.open() as f:
         return Manifest.from_dict(json.load(f))
+
+
+# Full primary-HDU header sidecar (header.json), written next to each band's
+# manifest.json so the viewer can show a DS9-style header panel on demand without
+# bloating the per-tile manifest (which only carries the WCS subset).
+HEADER_VERSION = 1
+
+
+def _header_card_value(value: object) -> object:
+    """Coerce a FITS card value to a JSON scalar. Undefined cards, complex values,
+    and non-finite floats (Inf/NaN, which strict JSON/JS reject) become null."""
+    if isinstance(value, bool) or isinstance(value, int) or isinstance(value, str):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return None
+
+
+def write_header(path: str | Path, header: object, source_file: str = "") -> None:
+    """Serialize a FITS header's full ordered card list (keyword/value/comment,
+    including COMMENT/HISTORY) to a JSON sidecar for the viewer's header panel.
+
+    ``header`` is an astropy ``fits.Header`` (duck-typed via ``header.cards`` so
+    this module stays astropy-free). Values that are not JSON scalars become null.
+    """
+    cards = [
+        {
+            "keyword": str(card.keyword),
+            "value": _header_card_value(card.value),
+            "comment": str(card.comment),
+        }
+        for card in header.cards  # type: ignore[attr-defined]
+    ]
+    out = {"version": HEADER_VERSION, "source_file": source_file, "cards": cards}
+    path = Path(path)
+    with path.open("w") as f:
+        json.dump(out, f, indent=2, sort_keys=False, allow_nan=False)
+        f.write("\n")

@@ -23,6 +23,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
 } from 'react';
 
@@ -35,10 +36,15 @@ import {
   COLORMAP_NAMES,
   STRETCH_MODES,
   MAX_BANDS,
+  applyStretch,
   colormapRGB,
   formatDec,
   formatRA,
+  formatSeparation,
   parseCatalogCSV,
+  parseSkyCoord,
+  pixToSky,
+  skyToPix,
   type BandHistogram,
   type BandWeight,
   type ColormapName,
@@ -46,6 +52,7 @@ import {
   type FitsglConfig,
   type MarkerEvent,
   type MarkerInput,
+  type PointerTool,
   type ResolvedMarker,
   type StretchMode,
   type TilePyramidOptions,
@@ -70,6 +77,36 @@ import {
   type ExplorerState,
 } from './explorer-state.js';
 import { bandsSignature, viewSignature } from './plan.js';
+import { buildShareUrl, decodeShareHash, type ShareState } from './share-url.js';
+import { drawGraticule } from './graticule.js';
+import { drawRuler, measureRuler, type RulerGeometry } from './ruler.js';
+
+/** Merge a decoded shared view state onto a base explorer state, validating each
+ *  field against the loaded bands / known modes so a stale or hostile link can't
+ *  produce an invalid state. The camera (`c`) is applied separately, after load. */
+function applyShareToState(
+  base: ExplorerState,
+  u: ShareState,
+  bands: ExplorerBand[],
+): ExplorerState {
+  const hasBand = (n: string | undefined): n is string =>
+    n !== undefined && bands.some((b) => b.name === n);
+  const next: ExplorerState = { ...base };
+  if (u.m === 'single' || u.m === 'rgb') next.mode = u.m;
+  if (hasBand(u.b)) next.band = u.b;
+  if (u.rgb !== undefined && u.rgb.every(hasBand)) {
+    next.rgb = { r: u.rgb[0], g: u.rgb[1], b: u.rgb[2] };
+  }
+  if (u.s !== undefined && (STRETCH_MODES as readonly string[]).includes(u.s)) {
+    next.stretch = u.s as StretchMode;
+  }
+  if (u.cm !== undefined && (COLORMAP_NAMES as readonly string[]).includes(u.cm)) {
+    next.colormap = u.cm as ColormapName;
+  }
+  if (u.n === 0 || u.n === 1) next.northUp = u.n === 1;
+  if (u.g === 0 || u.g === 1) next.graticule = u.g === 1;
+  return next;
+}
 
 const CH_COLOR = { r: '#ff6b6b', g: '#56d089', b: '#5c8cff' } as const;
 type Role = 'r' | 'g' | 'b';
@@ -121,6 +158,45 @@ function gradientCss(name: ColormapName): string {
   return `linear-gradient(90deg,${stops.join(',')})`;
 }
 
+/** A horizontal colorbar (single-band): the colormap gradient (linear in stretched
+ *  output) with data-value ticks placed through the stretch curve, so a glance maps
+ *  colour → value. Returns null for a degenerate range. */
+function Colorbar({
+  min,
+  max,
+  mode,
+  colormap,
+}: {
+  min: number;
+  max: number;
+  mode: StretchMode;
+  colormap: ColormapName;
+}): JSX.Element | null {
+  if (!(max > min)) return null;
+  const N = 5;
+  const ticks = Array.from({ length: N }, (_, i) => {
+    const v = min + ((max - min) * i) / (N - 1);
+    const x = Math.min(1, Math.max(0, applyStretch((v - min) / (max - min), mode)));
+    return { v, x };
+  });
+  return (
+    <div className="fgl-cbar">
+      <div className="fgl-cbar-strip" style={{ background: gradientCss(colormap) }} />
+      <div className="fgl-cbar-axis">
+        {ticks.map((t, i) => (
+          <span
+            key={i}
+            className="fgl-cbar-tick"
+            style={{ left: `${t.x * 100}%`, transform: i === 0 ? 'none' : i === N - 1 ? 'translateX(-100%)' : 'translateX(-50%)' }}
+          >
+            {fmtVal(t.v)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** Log-scaled histogram bars on a canvas; redraws only when its data changes. */
 function Histogram({ counts, color }: { counts: Float32Array; color: string }): JSX.Element {
   const ref = useRef<HTMLCanvasElement | null>(null);
@@ -150,6 +226,45 @@ function Histogram({ counts, color }: { counts: Float32Array; color: string }): 
     }
   }, [counts, color]);
   return <canvas ref={ref} className="fgl-hist" />;
+}
+
+/** A compact numeric input for a stretch limit: commits on blur/Enter, and re-syncs
+ *  to the prop while not being edited (so a slider drag updates the shown value). */
+function NumField({
+  value,
+  onCommit,
+  title,
+}: {
+  value: number;
+  onCommit: (v: number) => void;
+  title: string;
+}): JSX.Element {
+  const [text, setText] = useState('');
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    if (!editing) setText(String(Number(value.toPrecision(6))));
+  }, [value, editing]);
+  const commit = (): void => {
+    const v = Number(text);
+    if (Number.isFinite(v)) onCommit(v);
+    setEditing(false);
+  };
+  return (
+    <input
+      className="fgl-num"
+      type="text"
+      inputMode="decimal"
+      spellCheck={false}
+      title={title}
+      value={text}
+      onFocus={() => setEditing(true)}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+      }}
+    />
+  );
 }
 
 /** A black/white-point control over a band's visible-data histogram. */
@@ -190,7 +305,9 @@ function LimitsControl({
         <span className="fgl-sw" style={{ background: color }} />
         <span className="fgl-dr-nm">{label}</span>
         <span className="fgl-dr-vals">
-          {fmtVal(min)} – {fmtVal(max)}
+          <NumField value={min} title="black point" onCommit={(v) => onChange(Math.min(v, max), max)} />
+          <span className="fgl-dr-dash">–</span>
+          <NumField value={max} title="white point" onCommit={(v) => onChange(min, Math.max(v, min))} />
         </span>
       </div>
       <div className="fgl-dr-track">
@@ -734,6 +851,21 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const handle = useRef<FitsViewerHandle>(null);
   const getViewer = useCallback((): FitsViewerCore | null => handle.current?.getViewer() ?? null, []);
 
+  // "Go to" a sky position (RA/Dec, any common format): recenter, and zoom in to
+  // native if currently zoomed out. Returns false on an unparseable/out-of-frame
+  // coordinate so the box can flag it. No name resolution — coordinates only.
+  const goTo = useCallback((text: string): boolean => {
+    const parsed = parseSkyCoord(text);
+    const v = handle.current?.getViewer() ?? null;
+    const wcs = v?.getWcs() ?? null;
+    if (parsed === null || v === null || wcs === null) return false;
+    const px = skyToPix(wcs, parsed.ra, parsed.dec);
+    if (!Number.isFinite(px.x) || !Number.isFinite(px.y)) return false;
+    v.setCenter(px.x, px.y);
+    if (v.getCameraState().zoom < 1) v.setZoom(1);
+    return true;
+  }, []);
+
   // Accept either the turnkey `config` (a FitsglConfig) or the loose
   // `bands`/`defaultView`/`catalog`/`title` props; `config` wins when present.
   const bands = useMemo<ExplorerBand[]>(
@@ -753,9 +885,22 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   );
   const title = props.title ?? props.config?.dataset.title;
 
-  const [state, setState] = useState<ExplorerState>(() => defaultExplorerState(bands, initialView));
+  // A shared view link (#v=...) read ONCE at mount: it seeds the initial display
+  // state below and (its camera) is applied after the first frame. The URL is never
+  // written on pan/zoom — only on an explicit "Copy view link" (see the context menu).
+  const urlState = useMemo<ShareState | null>(
+    () => (typeof window !== 'undefined' ? decodeShareHash(window.location.hash) : null),
+    [],
+  );
+
+  const [state, setState] = useState<ExplorerState>(() => {
+    const base = defaultExplorerState(bands, initialView);
+    return urlState !== null ? applyShareToState(base, urlState, bands) : base;
+  });
   const [collapsed, setCollapsed] = useState(false);
   const [readyTick, setReadyTick] = useState(0);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [headerOpen, setHeaderOpen] = useState(false);
   // The decorative boot overlay: shown until the first frame draws, replayed when
   // the band set reloads (a band change tears down the viewer + refetches pyramids,
   // so the canvas goes blank), and dismissed on a load error so it never sticks.
@@ -816,6 +961,73 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     if (state.overlay) h.setMarkers(markers);
     else h.clearMarkers();
   }, [state.overlay, markers, readyTick]);
+
+  // The measure tool (ruler): a PointerTool (the Phase 0 seam) that turns a
+  // left-drag into a measured line. Endpoints + the derived distance/PA live in the
+  // readout store (per-drag high frequency), so only the overlay + status leaf
+  // re-render — never the whole control panel. WCS is read live so a band switch
+  // mid-session is reflected; without one only the pixel distance is defined.
+  const rulerTool = useMemo<PointerTool>(
+    () => ({
+      cursor: 'crosshair',
+      onPointerDown(world) {
+        const a = { x: world.x, y: world.y };
+        const wcs = getViewer()?.getWcs() ?? null;
+        readout.ruler = { a, b: a, dragging: true, ...measureRuler(wcs, a, a) };
+        emitReadout(readout);
+      },
+      onPointerMove(world) {
+        const r = readout.ruler;
+        if (r === null) return;
+        const b = { x: world.x, y: world.y };
+        const wcs = getViewer()?.getWcs() ?? null;
+        readout.ruler = { a: r.a, b, dragging: true, ...measureRuler(wcs, r.a, b) };
+        emitReadout(readout);
+      },
+      onPointerUp(world) {
+        const r = readout.ruler;
+        if (r === null) return;
+        const b = { x: world.x, y: world.y };
+        const wcs = getViewer()?.getWcs() ?? null;
+        readout.ruler = { a: r.a, b, dragging: false, ...measureRuler(wcs, r.a, b) };
+        emitReadout(readout);
+      },
+    }),
+    [getViewer, readout],
+  );
+
+  // Install/clear the tool with the toggle (gated on a ready viewer, like markers).
+  // Turning it off also clears any drawn line so re-enabling starts fresh.
+  useEffect(() => {
+    const h = handle.current;
+    if (h === null || readyTick === 0) return;
+    h.setTool(state.ruler ? rulerTool : null);
+    if (!state.ruler && readout.ruler !== null) {
+      readout.ruler = null;
+      emitReadout(readout);
+    }
+  }, [state.ruler, rulerTool, readyTick, readout]);
+
+  // Apply a shared link's camera once, after the first frame (the construction-time
+  // fitToImage has run by then, so this overrides it to the shared sky position).
+  const urlCamAppliedRef = useRef(false);
+  useEffect(() => {
+    if (urlCamAppliedRef.current || readyTick === 0) return;
+    const cam = urlState?.c;
+    if (cam === undefined) {
+      urlCamAppliedRef.current = true;
+      return;
+    }
+    const v = handle.current?.getViewer() ?? null;
+    const wcs = v?.getWcs() ?? null;
+    if (v === null || wcs === null) return;
+    const px = skyToPix(wcs, cam[0], cam[1]);
+    if (Number.isFinite(px.x) && Number.isFinite(px.y)) {
+      v.setCenter(px.x, px.y);
+      if (cam[2] > 0) v.setZoom(cam[2]);
+    }
+    urlCamAppliedRef.current = true;
+  }, [readyTick, urlState]);
 
   // Stretch MODE is imperative: a flip must not re-auto-stretch the manual limits.
   // Trilogy needs precomputed per-band stats; when an active band lacks them, drive
@@ -967,15 +1179,85 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     else v.setStretch(min, max);
   };
 
+  // Apply the producer's precomputed whole-image zscale cuts (DS9/IRAF) to the
+  // active band(s) — instant, stable, and not viewport-dependent (unlike the live
+  // percentile auto-stretch). Per RGB channel in RGB mode.
+  const zscaleOf = (name: string): readonly [number, number] | undefined =>
+    bands.find((b) => b.name === name)?.zscale;
+  const applyZscale = (): void => {
+    if (state.mode === 'single') {
+      const z = zscaleOf(state.band);
+      if (z !== undefined) setLimit(state.band, z[0], z[1]);
+    } else {
+      for (const role of ['r', 'g', 'b'] as const) {
+        const z = zscaleOf(state.rgb[role]);
+        if (z !== undefined) setLimit(state.rgb[role], z[0], z[1], role);
+      }
+    }
+  };
+  const hasZscale =
+    state.mode === 'single'
+      ? zscaleOf(state.band) !== undefined
+      : (['r', 'g', 'b'] as const).some((role) => zscaleOf(state.rgb[role]) !== undefined);
+
+  // Build a shareable link to the CURRENT view on demand (the right-click menu),
+  // sky-anchoring the camera so the link survives a rebuild. The URL is never
+  // mutated by panning/zooming — only assembled here when the user asks.
+  const makeShareUrl = useCallback((): string => {
+    const r = (n: number, d: number): number => {
+      const f = 10 ** d;
+      return Math.round(n * f) / f;
+    };
+    const s: ShareState = {
+      m: state.mode,
+      b: state.band,
+      rgb: [state.rgb.r, state.rgb.g, state.rgb.b],
+      s: state.stretch,
+      cm: state.colormap,
+      n: state.northUp ? 1 : 0,
+      g: state.graticule ? 1 : 0,
+    };
+    const v = handle.current?.getViewer() ?? null;
+    const wcs = v?.getWcs() ?? null;
+    const cam = v?.getCameraState() ?? null;
+    if (v !== null && wcs !== null && cam !== null) {
+      const sky = pixToSky(wcs, cam.centerX, cam.centerY);
+      if (Number.isFinite(sky.ra) && Number.isFinite(sky.dec)) {
+        s.c = [r(sky.ra, 6), r(sky.dec, 6), r(cam.zoom, 4)];
+      }
+    }
+    return buildShareUrl(window.location.href, s);
+  }, [state]);
+
   const activeBands = activeBandNames(state);
   const activeLabels = activeBands.map((n) => bands.find((b) => b.name === n)?.label ?? n);
+
+  // The active band's header.json sidecar lives next to its manifest.json (same
+  // dir): derive its URL by swapping the last path segment.
+  const headerBand = bands.find((b) => b.name === activeBands[0]);
+  const headerUrl = headerBand?.tiles[0]?.replace(/[^/]*$/, 'header.json') ?? null;
+  const headerLabel = headerBand?.label ?? headerBand?.name ?? '';
 
   const containerStyle =
     props.style === undefined ? ROOT_STYLE : { ...ROOT_STYLE, ...props.style };
 
+  // Right-click over the image opens the share menu; over the control panel the
+  // native menu is left alone (so inputs keep paste/select).
+  const onStageContextMenu = (e: ReactMouseEvent): void => {
+    if ((e.target as HTMLElement).closest('.fgl-win') !== null) return;
+    e.preventDefault();
+    setMenu({ x: e.clientX, y: e.clientY });
+  };
+
   return (
     <div className={`fgl-explorer${props.className === undefined ? '' : ` ${props.className}`}`} style={containerStyle}>
-      <div className="fgl-stage">
+      {menu !== null && (
+        <ShareMenu x={menu.x} y={menu.y} onCopy={makeShareUrl} onClose={() => setMenu(null)} />
+      )}
+      {headerOpen && headerUrl !== null && (
+        <HeaderPanel url={headerUrl} title={headerLabel} onClose={() => setHeaderOpen(false)} />
+      )}
+      <div className="fgl-stage" onContextMenu={onStageContextMenu}>
         <FitsViewer
           config={viewerConfig}
           ref={handle}
@@ -992,6 +1274,8 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
             props.onError?.(e);
           }}
         >
+          {state.graticule && <Graticule getViewer={getViewer} store={readout} />}
+          {state.ruler && <RulerOverlay getViewer={getViewer} store={readout} />}
           <FitsLoadingField active={loading} />
           <div className={`fgl-win${collapsed ? ' collapsed' : ''}`}>
             <div className="fgl-win-head" onClick={() => setCollapsed((c) => !c)}>
@@ -999,6 +1283,12 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
               <span className="fgl-chev">▾</span>
             </div>
             <div className="fgl-win-body">
+              {/* go to coordinates */}
+              <div className="fgl-sec">
+                <span className="fgl-cap">Go to</span>
+                <GotoBox onGo={goTo} />
+              </div>
+
               {/* layers */}
               <div className="fgl-sec">
                 <span className="fgl-cap">Layers</span>
@@ -1118,20 +1408,45 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                     })
                   )}
                   {state.stretch !== 'trilogy' && (
-                    <button type="button" className="fgl-auto" onClick={() => void seed()}>
-                      Auto-stretch visible
-                    </button>
+                    <div className="fgl-btn-row" style={{ marginTop: 3 }}>
+                      <button type="button" className="fgl-auto" onClick={() => void seed()}>
+                        Auto-stretch visible
+                      </button>
+                      {hasZscale && (
+                        <button type="button" className="fgl-auto" onClick={applyZscale} title="Whole-image DS9/IRAF zscale cuts">
+                          zscale
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
 
                 {state.mode === 'single' && (
-                  <div className="fgl-row" style={{ marginTop: 11 }}>
-                    <span className="fgl-cap-inline">Colormap</span>
-                    <ColormapDropdown
-                      value={state.colormap}
-                      onChange={(name) => setState((s) => ({ ...s, colormap: name }))}
-                    />
-                  </div>
+                  <>
+                    <div className="fgl-row" style={{ marginTop: 11 }}>
+                      <span className="fgl-cap-inline">Colormap</span>
+                      <ColormapDropdown
+                        value={state.colormap}
+                        onChange={(name) => setState((s) => ({ ...s, colormap: name }))}
+                      />
+                    </div>
+                    {state.stretch !== 'trilogy' &&
+                      (() => {
+                        const lim =
+                          limits[state.band] ??
+                          (histos[state.band] !== undefined
+                            ? { min: histos[state.band]!.lo, max: histos[state.band]!.hi }
+                            : undefined);
+                        return lim !== undefined ? (
+                          <Colorbar
+                            min={lim.min}
+                            max={lim.max}
+                            mode={state.stretch}
+                            colormap={state.colormap}
+                          />
+                        ) : null;
+                      })()}
+                  </>
                 )}
               </div>
 
@@ -1147,6 +1462,14 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                 </div>
                 <div className="fgl-row" />
                 <div
+                  className={`fgl-tg${state.graticule ? ' on' : ''}`}
+                  onClick={() => setState((s) => ({ ...s, graticule: !s.graticule }))}
+                >
+                  <span className="fgl-tx">Coordinate grid</span>
+                  <span className="fgl-switch" />
+                </div>
+                <div className="fgl-row" />
+                <div
                   className={`fgl-tg${state.overlay ? ' on' : ''}${markers.length === 0 ? ' off' : ''}`}
                   onClick={() => markers.length > 0 && setState((s) => ({ ...s, overlay: !s.overlay }))}
                 >
@@ -1155,10 +1478,44 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                 </div>
               </div>
 
+              {/* tools */}
               <div className="fgl-sec">
-                <button type="button" className="fgl-reset" onClick={() => handle.current?.fitToImage()}>
-                  Fit to image
-                </button>
+                <span className="fgl-cap">Tools</span>
+                <div
+                  className={`fgl-tg${state.ruler ? ' on' : ''}`}
+                  onClick={() => setState((s) => ({ ...s, ruler: !s.ruler }))}
+                >
+                  <span className="fgl-tx">Ruler</span>
+                  <span className="fgl-switch" />
+                </div>
+                <div className="fgl-note">Drag across the image to measure separation &amp; position angle.</div>
+              </div>
+
+              <div className="fgl-sec">
+                <div className="fgl-btn-row">
+                  <button type="button" className="fgl-reset" onClick={() => handle.current?.fitToImage()}>
+                    Fit to image
+                  </button>
+                  <button
+                    type="button"
+                    className="fgl-reset"
+                    onClick={() => {
+                      const url = handle.current?.exportPNG();
+                      if (url === null || url === undefined) return;
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `${(title ?? 'fitsgl').replace(/\s+/g, '_')}.png`;
+                      a.click();
+                    }}
+                  >
+                    Save PNG
+                  </button>
+                  {headerUrl !== null && (
+                    <button type="button" className="fgl-reset" onClick={() => setHeaderOpen(true)}>
+                      Header
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -1201,12 +1558,14 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
 interface ReadoutStore {
   cursor: CursorInfo | null;
   frame: ViewerFrameInfo | null;
+  /** Live ruler measurement (measure tool); null when idle/inactive. */
+  ruler: RulerGeometry | null;
   version: number;
   listeners: Set<() => void>;
 }
 
 function createReadoutStore(): ReadoutStore {
-  return { cursor: null, frame: null, version: 0, listeners: new Set() };
+  return { cursor: null, frame: null, ruler: null, version: 0, listeners: new Set() };
 }
 
 function emitReadout(store: ReadoutStore): void {
@@ -1214,7 +1573,238 @@ function emitReadout(store: ReadoutStore): void {
   for (const l of store.listeners) l();
 }
 
-/** The α/δ/zoom status-bar cells — the only subtree that updates per frame. */
+/** "Go to coordinates" box: parses RA/Dec on Enter/Go and recenters via `onGo`,
+ *  flashing an error border when the input doesn't parse or is off the image. */
+function GotoBox({ onGo }: { onGo: (text: string) => boolean }): JSX.Element {
+  const [text, setText] = useState('');
+  const [err, setErr] = useState(false);
+  const submit = (): void => {
+    if (text.trim() === '') return;
+    setErr(!onGo(text));
+  };
+  return (
+    <div className="fgl-goto">
+      <input
+        className={`fgl-goto-in${err ? ' err' : ''}`}
+        type="text"
+        value={text}
+        placeholder="RA Dec — e.g. 10:00:00 +02:12:00"
+        spellCheck={false}
+        autoComplete="off"
+        onChange={(e) => {
+          setText(e.target.value);
+          setErr(false);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') submit();
+        }}
+      />
+      <button type="button" className="fgl-goto-btn" onClick={submit}>
+        Go
+      </button>
+    </div>
+  );
+}
+
+/** The right-click menu: a single "Copy view link" action that builds a shareable
+ *  URL on demand (the URL is never live-updated). Closes on any outside interaction. */
+function ShareMenu({
+  x,
+  y,
+  onCopy,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  onCopy: () => string;
+  onClose: () => void;
+}): JSX.Element {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    window.addEventListener('mousedown', onClose);
+    window.addEventListener('keydown', onClose);
+    window.addEventListener('blur', onClose);
+    return () => {
+      window.removeEventListener('mousedown', onClose);
+      window.removeEventListener('keydown', onClose);
+      window.removeEventListener('blur', onClose);
+    };
+  }, [onClose]);
+  const copy = (): void => {
+    const url = onCopy();
+    const done = (): void => {
+      setCopied(true);
+      window.setTimeout(onClose, 900);
+    };
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText !== undefined) {
+      navigator.clipboard.writeText(url).then(done, done);
+    } else {
+      done();
+    }
+  };
+  return (
+    // Stop mousedown from reaching the window closer so the click lands on the item.
+    <div className="fgl-menu" style={{ left: x, top: y }} onMouseDown={(e) => e.stopPropagation()}>
+      <button type="button" className="fgl-menu-item" onClick={copy}>
+        {copied ? 'Link copied ✓' : 'Copy view link'}
+      </button>
+    </div>
+  );
+}
+
+interface HeaderCard {
+  keyword: string;
+  value: string | number | boolean | null;
+  comment: string;
+}
+interface HeaderDoc {
+  version: number;
+  source_file: string;
+  cards: HeaderCard[];
+}
+
+/** Render a FITS card value the DS9 way: booleans as T/F, undefined as blank. */
+function fmtHeaderValue(v: string | number | boolean | null): string {
+  if (v === null) return '';
+  if (typeof v === 'boolean') return v ? 'T' : 'F';
+  return String(v);
+}
+
+/** A modal FITS-header viewer: fetches the band's header.json sidecar on demand and
+ *  lists the full ordered card set. Closes on backdrop click or Escape. */
+function HeaderPanel({
+  url,
+  title,
+  onClose,
+}: {
+  url: string;
+  title: string;
+  onClose: () => void;
+}): JSX.Element {
+  const [doc, setDoc] = useState<HeaderDoc | null>(null);
+  const [err, setErr] = useState(false);
+  useEffect(() => {
+    let live = true;
+    setDoc(null);
+    setErr(false);
+    fetch(url)
+      .then((r) => (r.ok ? (r.json() as Promise<HeaderDoc>) : Promise.reject(new Error(String(r.status)))))
+      .then((d) => {
+        if (live) setDoc(d);
+      })
+      .catch(() => {
+        if (live) setErr(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, [url]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  const commentLike = (k: string): boolean => k === 'COMMENT' || k === 'HISTORY' || k === '';
+  return (
+    <div className="fgl-modal" onMouseDown={onClose}>
+      <div className="fgl-hdr" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="fgl-hdr-head">
+          <span>FITS header · {title}</span>
+          <button type="button" className="fgl-hdr-x" onClick={onClose} aria-label="Close">
+            ×
+          </button>
+        </div>
+        <div className="fgl-hdr-body">
+          {err ? (
+            <div className="fgl-hdr-msg">No header available for this band.</div>
+          ) : doc === null ? (
+            <div className="fgl-hdr-msg">Loading…</div>
+          ) : (
+            doc.cards.map((c, i) =>
+              commentLike(c.keyword) ? (
+                <div key={i} className="fgl-hdr-card comment">
+                  <span className="fgl-hdr-k">{c.keyword}</span>
+                  <span className="fgl-hdr-v">{c.comment || fmtHeaderValue(c.value)}</span>
+                </div>
+              ) : (
+                <div key={i} className="fgl-hdr-card">
+                  <span className="fgl-hdr-k">{c.keyword}</span>
+                  <span className="fgl-hdr-eq">=</span>
+                  <span className="fgl-hdr-v">{fmtHeaderValue(c.value)}</span>
+                  {c.comment !== '' && <span className="fgl-hdr-c">/ {c.comment}</span>}
+                </div>
+              ),
+            )
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** A Canvas2D RA/Dec graticule stacked over the GL canvas; redraws each frame by
+ *  subscribing to the readout store (the per-frame leaf pattern of StatusReadout). */
+function Graticule({
+  getViewer,
+  store,
+}: {
+  getViewer: () => FitsViewerCore | null;
+  store: ReadoutStore;
+}): JSX.Element {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  useSyncExternalStore(
+    (cb) => {
+      store.listeners.add(cb);
+      return (): void => {
+        store.listeners.delete(cb);
+      };
+    },
+    () => store.version,
+    () => 0,
+  );
+  useEffect(() => {
+    drawGraticule(ref.current, getViewer());
+  });
+  return <canvas ref={ref} className="fgl-grat" aria-hidden="true" />;
+}
+
+/** A Canvas2D ruler line + measurement label stacked over the GL canvas; redraws by
+ *  subscribing to the readout store (which the measure tool bumps on every drag move,
+ *  and which the per-frame onFrame/onCursor traffic bumps so it stays glued on zoom). */
+function RulerOverlay({
+  getViewer,
+  store,
+}: {
+  getViewer: () => FitsViewerCore | null;
+  store: ReadoutStore;
+}): JSX.Element {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  useSyncExternalStore(
+    (cb) => {
+      store.listeners.add(cb);
+      return (): void => {
+        store.listeners.delete(cb);
+      };
+    },
+    () => store.version,
+    () => 0,
+  );
+  useEffect(() => {
+    drawRuler(ref.current, getViewer(), store.ruler);
+  });
+  return <canvas ref={ref} className="fgl-ruler" aria-hidden="true" />;
+}
+
+/** Format a pixel value for the status bar: '—' for no-data / not-resident, else
+ *  5 significant figures with trailing zeros trimmed. */
+function formatValue(v: number | null): string {
+  if (v === null || !Number.isFinite(v)) return '—';
+  return Number(v.toPrecision(5)).toString();
+}
+
+/** The value/pixel/α/δ/zoom status-bar cells — the only subtree that updates per frame. */
 function StatusReadout({ store }: { store: ReadoutStore }): JSX.Element {
   useSyncExternalStore(
     (onChange) => {
@@ -1226,9 +1816,27 @@ function StatusReadout({ store }: { store: ReadoutStore }): JSX.Element {
     () => store.version,
     () => 0,
   );
-  const { cursor, frame } = store;
+  const { cursor, frame, ruler } = store;
+  const inside = cursor !== null && cursor.insideImage;
+  const pixStr =
+    cursor !== null && cursor.insideImage
+      ? `${Math.floor(cursor.worldX)}, ${Math.floor(cursor.worldY)}`
+      : '—';
+  const valStr =
+    cursor !== null && cursor.insideImage ? cursor.values.map(formatValue).join(' ') : '—';
+  // The value is sampled from the displayed LOD; flag it when that isn't native (1:1).
+  const valTitle =
+    inside && cursor !== null && !cursor.native ? `binned · pyramid level ${cursor.level}` : undefined;
   return (
     <>
+      <span className="fgl-item coord" title={valTitle}>
+        <i>val{inside && cursor !== null && !cursor.native ? '*' : ''}</i>
+        <b>{valStr}</b>
+      </span>
+      <span className="fgl-item coord">
+        <i>x,y</i>
+        <b>{pixStr}</b>
+      </span>
       <span className="fgl-item coord">
         <i>α</i>
         <b>{cursor !== null && cursor.ra !== null ? formatRA(cursor.ra) : '—'}</b>
@@ -1241,6 +1849,20 @@ function StatusReadout({ store }: { store: ReadoutStore }): JSX.Element {
         <i>zoom</i>
         <b>{frame !== null ? `${frame.zoom.toFixed(2)}×` : '—'}</b>
       </span>
+      {ruler !== null && (
+        <>
+          <span className="fgl-item coord" title={`${ruler.pixelDist.toFixed(2)} px`}>
+            <i>dist</i>
+            <b>{ruler.sepDeg !== null ? formatSeparation(ruler.sepDeg) : `${ruler.pixelDist.toFixed(1)} px`}</b>
+          </span>
+          {ruler.paDeg !== null && (
+            <span className="fgl-item coord">
+              <i>PA</i>
+              <b>{`${ruler.paDeg.toFixed(1)}°`}</b>
+            </span>
+          )}
+        </>
+      )}
     </>
   );
 }
@@ -1313,7 +1935,34 @@ const STYLE_CSS = `
 .fgl-dr-head{display:flex;align-items:center;gap:7px;margin-bottom:5px;}
 .fgl-sw{width:7px;height:7px;border-radius:2px;}
 .fgl-dr-nm{font-size:10.5px;color:var(--text);flex:1;letter-spacing:.03em;}
-.fgl-dr-vals{font-size:9.5px;color:var(--dim);font-variant-numeric:tabular-nums;}
+.fgl-dr-vals{font-size:9.5px;color:var(--dim);font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:3px;}
+.fgl-dr-dash{color:var(--faint);}
+.fgl-num{width:62px;background:var(--inset);border:1px solid var(--line);border-radius:3px;color:var(--text);
+  font-family:var(--mono);font-size:9.5px;text-align:right;padding:2px 4px;outline:none;font-variant-numeric:tabular-nums;}
+.fgl-num:focus{border-color:var(--gold-d);}
+.fgl-cbar{margin-top:11px;}
+.fgl-cbar-strip{height:12px;border-radius:3px;border:1px solid var(--line2);}
+.fgl-cbar-axis{position:relative;height:13px;margin-top:3px;}
+.fgl-cbar-tick{position:absolute;top:0;font-size:9px;color:var(--dim);font-family:var(--mono);
+  font-variant-numeric:tabular-nums;white-space:nowrap;}
+.fgl-grat{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;}
+.fgl-ruler{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:2;}
+.fgl-modal{position:fixed;inset:0;z-index:2147483646;background:rgba(2,4,8,.62);display:flex;
+  align-items:center;justify-content:center;padding:24px;}
+.fgl-hdr{display:flex;flex-direction:column;width:min(640px,92vw);max-height:82vh;background:var(--win);
+  border:1px solid var(--line2);border-radius:8px;box-shadow:0 18px 60px rgba(0,0,0,.6);overflow:hidden;}
+.fgl-hdr-head{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;
+  border-bottom:1px solid var(--line);color:var(--text);font-size:12px;letter-spacing:.04em;}
+.fgl-hdr-x{background:transparent;border:none;color:var(--dim);font-size:18px;line-height:1;cursor:pointer;padding:0 4px;}
+.fgl-hdr-x:hover{color:var(--gold);}
+.fgl-hdr-body{overflow:auto;padding:8px 14px 12px;font-family:var(--mono);font-size:11px;line-height:1.55;}
+.fgl-hdr-card{display:flex;gap:7px;white-space:pre-wrap;word-break:break-word;}
+.fgl-hdr-card.comment{color:var(--dim);}
+.fgl-hdr-k{color:var(--gold);min-width:80px;flex:none;}
+.fgl-hdr-eq{color:var(--faint);}
+.fgl-hdr-v{color:var(--text);}
+.fgl-hdr-c{color:var(--faint);}
+.fgl-hdr-msg{color:var(--dim);padding:14px 0;text-align:center;}
 .fgl-dr-scanning{font-size:10px;color:var(--faint);padding:6px 0;}
 .fgl-dr-track{position:relative;height:32px;}
 .fgl-hist{position:absolute;inset:0 0 8px;width:100%;height:24px;border:1px solid var(--line);border-radius:3px;background:var(--inset);}
@@ -1382,6 +2031,23 @@ const STYLE_CSS = `
 .fgl-reset{width:100%;background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
   font-size:10px;letter-spacing:.14em;text-transform:uppercase;padding:9px;border-radius:4px;cursor:pointer;}
 .fgl-reset:hover{border-color:var(--gold-d);color:var(--gold);}
+.fgl-btn-row{display:flex;gap:7px;}
+.fgl-btn-row .fgl-reset{flex:1;}
+.fgl-btn-row .fgl-auto{flex:1;margin-top:0;}
+.fgl-goto{display:flex;gap:6px;}
+.fgl-goto-in{flex:1;min-width:0;background:var(--inset);border:1px solid var(--line2);border-radius:4px;color:var(--text);
+  font-family:var(--mono);font-size:11px;padding:7px 8px;outline:none;}
+.fgl-goto-in::placeholder{color:var(--dim);opacity:.7;}
+.fgl-goto-in:focus{border-color:var(--gold-d);}
+.fgl-goto-in.err{border-color:#c4543b;}
+.fgl-goto-btn{background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
+  font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:0 12px;border-radius:4px;cursor:pointer;}
+.fgl-goto-btn:hover{border-color:var(--gold-d);color:var(--gold);}
+.fgl-menu{position:fixed;z-index:2147483647;background:var(--win);border:1px solid var(--line2);border-radius:6px;
+  padding:4px;box-shadow:0 8px 28px rgba(0,0,0,.55);}
+.fgl-menu-item{display:block;width:100%;text-align:left;background:transparent;border:none;color:var(--text);
+  font-family:var(--mono);font-size:11px;padding:7px 13px;border-radius:4px;cursor:pointer;white-space:nowrap;}
+.fgl-menu-item:hover{background:var(--inset);color:var(--gold);}
 .fgl-status{flex:none;height:29px;display:flex;align-items:center;background:#080b12;border-top:1px solid var(--line2);
   padding:0 12px;font-size:11px;overflow:hidden;white-space:nowrap;}
 .fgl-brand{color:var(--gold);font-weight:600;letter-spacing:.16em;font-size:10.5px;}
