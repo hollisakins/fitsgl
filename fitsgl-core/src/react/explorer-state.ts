@@ -56,6 +56,8 @@ export interface ExplorerBand {
   /** Pre-computed global trilogy stats (native z=0); drives a stable, color-preserving
    *  trilogy stretch with no live rescan. Omitted ⇒ trilogy falls back to a percentile fit. */
   trilogy?: TrilogyStats;
+  /** Pre-computed whole-image DS9/IRAF zscale cuts `[z1, z2]` for the "zscale" preset. */
+  zscale?: readonly [number, number];
 }
 
 /** The producer's default view (from `[viewer]` / `defaultView`). All overridable. */
@@ -338,6 +340,7 @@ export function explorerBandsFromConfig(config: FitsglConfig): ExplorerBand[] {
     if (b.pivotUm !== undefined) band.wavelengthMicron = b.pivotUm;
     if (b.stats?.histogram !== undefined) band.histogram = b.stats.histogram;
     if (b.stats?.trilogy !== undefined) band.trilogy = b.stats.trilogy;
+    if (b.stats?.zscale !== undefined) band.zscale = b.stats.zscale;
     return band;
   });
 }

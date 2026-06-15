@@ -171,6 +171,31 @@ describe('validateFitsglConfig', () => {
     expect(c.dataset.bands[0].stats?.trilogy).toEqual(trilogy);
   });
 
+  it('accepts and preserves precomputed zscale cuts', () => {
+    const r = raw();
+    (r.dataset as { bands: Record<string, unknown>[] }).bands[0].stats = {
+      histogram: { counts: [1, 2, 3, 0], lo: 0.5, hi: 9.5 },
+      zscale: [0.8, 7.2],
+    };
+    const c = validateFitsglConfig(r);
+    expect(c.dataset.bands[0].stats?.zscale).toEqual([0.8, 7.2]);
+  });
+
+  it('rejects malformed zscale cuts (z2 must exceed z1; exactly two finite numbers)', () => {
+    const bad = (zscale: unknown) => () => {
+      const r = raw();
+      (r.dataset as { bands: Record<string, unknown>[] }).bands[0].stats = {
+        histogram: { counts: [1, 2], lo: 0, hi: 1 },
+        zscale,
+      };
+      return validateFitsglConfig(r);
+    };
+    expect(bad([5, 5])).toThrow(/zscale/); // z2 not > z1
+    expect(bad([3, 1])).toThrow(/zscale/); // inverted
+    expect(bad([1])).toThrow(/zscale/); // wrong arity
+    expect(bad([1, 'x'])).toThrow(/zscale/); // non-number
+  });
+
   it('rejects malformed trilogy stats', () => {
     const r = raw();
     (r.dataset as { bands: Record<string, unknown>[] }).bands[0].stats = {

@@ -1130,6 +1130,27 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     else v.setStretch(min, max);
   };
 
+  // Apply the producer's precomputed whole-image zscale cuts (DS9/IRAF) to the
+  // active band(s) — instant, stable, and not viewport-dependent (unlike the live
+  // percentile auto-stretch). Per RGB channel in RGB mode.
+  const zscaleOf = (name: string): readonly [number, number] | undefined =>
+    bands.find((b) => b.name === name)?.zscale;
+  const applyZscale = (): void => {
+    if (state.mode === 'single') {
+      const z = zscaleOf(state.band);
+      if (z !== undefined) setLimit(state.band, z[0], z[1]);
+    } else {
+      for (const role of ['r', 'g', 'b'] as const) {
+        const z = zscaleOf(state.rgb[role]);
+        if (z !== undefined) setLimit(state.rgb[role], z[0], z[1], role);
+      }
+    }
+  };
+  const hasZscale =
+    state.mode === 'single'
+      ? zscaleOf(state.band) !== undefined
+      : (['r', 'g', 'b'] as const).some((role) => zscaleOf(state.rgb[role]) !== undefined);
+
   // Build a shareable link to the CURRENT view on demand (the right-click menu),
   // sky-anchoring the camera so the link survives a rebuild. The URL is never
   // mutated by panning/zooming — only assembled here when the user asks.
@@ -1337,9 +1358,16 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                     })
                   )}
                   {state.stretch !== 'trilogy' && (
-                    <button type="button" className="fgl-auto" onClick={() => void seed()}>
-                      Auto-stretch visible
-                    </button>
+                    <div className="fgl-btn-row" style={{ marginTop: 3 }}>
+                      <button type="button" className="fgl-auto" onClick={() => void seed()}>
+                        Auto-stretch visible
+                      </button>
+                      {hasZscale && (
+                        <button type="button" className="fgl-auto" onClick={applyZscale} title="Whole-image DS9/IRAF zscale cuts">
+                          zscale
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
 
@@ -1898,6 +1926,7 @@ const STYLE_CSS = `
 .fgl-reset:hover{border-color:var(--gold-d);color:var(--gold);}
 .fgl-btn-row{display:flex;gap:7px;}
 .fgl-btn-row .fgl-reset{flex:1;}
+.fgl-btn-row .fgl-auto{flex:1;margin-top:0;}
 .fgl-goto{display:flex;gap:6px;}
 .fgl-goto-in{flex:1;min-width:0;background:var(--inset);border:1px solid var(--line2);border-radius:4px;color:var(--text);
   font-family:var(--mono);font-size:11px;padding:7px 8px;outline:none;}

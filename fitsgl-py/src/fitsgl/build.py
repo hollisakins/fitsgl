@@ -39,7 +39,7 @@ from .fitsgl_config import build_fitsgl_config, default_view_dict
 from .manifest import Manifest, read_manifest
 from .placed_tiles import GridFrame, plan_grid_frames
 from .site import copy_viewer_into
-from .stats import compute_band_histogram, compute_band_trilogy_stats
+from .stats import compute_band_histogram, compute_band_trilogy_stats, compute_band_zscale
 
 
 @dataclass
@@ -304,6 +304,12 @@ def build_dataset(
             histogram = compute_band_histogram(final, manifest)
             if histogram is not None:
                 stats: dict = {"histogram": histogram}
+                # Precomputed whole-image zscale cuts (DS9/IRAF) for the "zscale"
+                # preset — can't be done faithfully in-browser (the client only holds
+                # the in-view tiles). Optional: omitted ⇒ no zscale button for the band.
+                zscale = compute_band_zscale(final, manifest)
+                if zscale is not None:
+                    stats["zscale"] = zscale
                 # Global trilogy levels (native z=0) — color-preserving stretch with no
                 # live rescan. Independently optional: omitted ⇒ the viewer falls back to
                 # its percentile auto-stretch for that band.

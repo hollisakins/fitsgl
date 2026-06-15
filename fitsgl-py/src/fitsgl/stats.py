@@ -69,6 +69,24 @@ def histogram_dict(data: np.ndarray, bins: int = HISTOGRAM_BINS) -> dict | None:
     return {"counts": [int(c) for c in counts], "lo": lo, "hi": hi}
 
 
+def _representative_finite(band_dir, manifest: Manifest, pixel_cap: int) -> np.ndarray | None:
+    """Concatenated finite pixel values of a representative coarse level (the finest
+    level within ``pixel_cap``), reading every supertile. Over pixel VALUES, so
+    spatial layout is irrelevant. ``None`` when the level holds no finite data."""
+    from pathlib import Path
+
+    level = _choose_level(manifest, pixel_cap)
+    values: list[np.ndarray] = []
+    for st in level.supertiles:
+        with fits.open(Path(band_dir) / st.filename) as hdul:
+            arr = np.asarray(_image_hdu(hdul).data, dtype=np.float32).reshape(-1)
+        values.append(arr[np.isfinite(arr)])
+    if not values:
+        return None
+    data = values[0] if len(values) == 1 else np.concatenate(values)
+    return data if data.size else None
+
+
 def compute_band_histogram(
     band_dir, manifest: Manifest, *, pixel_cap: int = STATS_PIXEL_CAP, bins: int = HISTOGRAM_BINS
 ) -> dict | None:
@@ -77,20 +95,37 @@ def compute_band_histogram(
     ``band_dir`` is the band's output directory (holding the ``.fits.fz`` levels).
     Returns the histogram dict, or ``None`` if the level has no usable finite data.
     """
-    from pathlib import Path
+    data = _representative_finite(band_dir, manifest, pixel_cap)
+    return histogram_dict(data, bins) if data is not None else None
 
-    level = _choose_level(manifest, pixel_cap)
-    # A coarse level (≤ pixel_cap) is normally one supertile, but read every supertile
-    # so the histogram is correct even if the chosen level happens to be chunked. The
-    # histogram is over pixel VALUES, so spatial layout (origins) is irrelevant — just
-    # concatenate the finite samples.
-    values: list[np.ndarray] = []
-    for st in level.supertiles:
-        with fits.open(Path(band_dir) / st.filename) as hdul:
-            arr = np.asarray(_image_hdu(hdul).data, dtype=np.float32).reshape(-1)
-        values.append(arr[np.isfinite(arr)])
-    data = values[0] if len(values) == 1 else np.concatenate(values)
-    return histogram_dict(data, bins)
+
+#: zscale display-cut contrast — the IRAF/DS9 default (z1/z2 span the median ± 1/contrast slopes).
+ZSCALE_CONTRAST = 0.25
+
+
+def zscale_limits(data: np.ndarray) -> list[float] | None:
+    """IRAF/DS9 ``[z1, z2]`` display cuts for a 1-D sample, via astropy's
+    ``ZScaleInterval`` (the same median+slope-fit algorithm DS9 uses). ``None`` when
+    the sample is empty or the cuts are degenerate/non-finite, so the caller omits it.
+    """
+    from astropy.visualization import ZScaleInterval
+
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return None
+    z1, z2 = (float(x) for x in ZScaleInterval(contrast=ZSCALE_CONTRAST).get_limits(finite))
+    if not (z2 > z1) or not (math.isfinite(z1) and math.isfinite(z2)):
+        return None
+    return [z1, z2]
+
+
+def compute_band_zscale(
+    band_dir, manifest: Manifest, *, pixel_cap: int = STATS_PIXEL_CAP
+) -> list[float] | None:
+    """zscale display cuts over the SAME representative coarse level as the histogram,
+    so a "zscale" preset and the panel histogram agree. ``None`` if no usable data."""
+    data = _representative_finite(band_dir, manifest, pixel_cap)
+    return zscale_limits(data) if data is not None else None
 
 
 def trilogy_stats_dict(sample: np.ndarray) -> dict | None:

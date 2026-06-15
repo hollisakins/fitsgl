@@ -220,6 +220,9 @@ def test_build_emits_band_histogram_stats(tmp_path):
     assert stats is not None and "histogram" in stats  # pre-computed for the stretch panel
     h = stats["histogram"]
     assert len(h["counts"]) == 128 and h["lo"] < h["hi"]
+    # Precomputed whole-image zscale cuts for the "zscale" stretch preset.
+    z = stats.get("zscale")
+    assert isinstance(z, list) and len(z) == 2 and z[1] > z[0]
 
 
 def test_build_emits_band_trilogy_stats(tmp_path):
