@@ -95,6 +95,8 @@ export interface ExplorerState {
   colormap: ColormapName;
   northUp: boolean;
   overlay: boolean;
+  /** RA/Dec coordinate grid (graticule) overlay. */
+  graticule: boolean;
 }
 
 /** A band's grid group, defaulting to 0 (one group / single-grid dataset). */
@@ -200,6 +202,7 @@ export function defaultExplorerState(
     colormap: dv?.colormap ?? 'gray',
     northUp: dv?.northUp ?? true,
     overlay: false,
+    graticule: false,
   };
 }
 

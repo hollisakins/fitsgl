@@ -36,6 +36,7 @@ import {
   COLORMAP_NAMES,
   STRETCH_MODES,
   MAX_BANDS,
+  applyStretch,
   colormapRGB,
   formatDec,
   formatRA,
@@ -75,6 +76,7 @@ import {
 } from './explorer-state.js';
 import { bandsSignature, viewSignature } from './plan.js';
 import { buildShareUrl, decodeShareHash, type ShareState } from './share-url.js';
+import { drawGraticule } from './graticule.js';
 
 /** Merge a decoded shared view state onto a base explorer state, validating each
  *  field against the loaded bands / known modes so a stale or hostile link can't
@@ -99,6 +101,7 @@ function applyShareToState(
     next.colormap = u.cm as ColormapName;
   }
   if (u.n === 0 || u.n === 1) next.northUp = u.n === 1;
+  if (u.g === 0 || u.g === 1) next.graticule = u.g === 1;
   return next;
 }
 
@@ -152,6 +155,45 @@ function gradientCss(name: ColormapName): string {
   return `linear-gradient(90deg,${stops.join(',')})`;
 }
 
+/** A horizontal colorbar (single-band): the colormap gradient (linear in stretched
+ *  output) with data-value ticks placed through the stretch curve, so a glance maps
+ *  colour → value. Returns null for a degenerate range. */
+function Colorbar({
+  min,
+  max,
+  mode,
+  colormap,
+}: {
+  min: number;
+  max: number;
+  mode: StretchMode;
+  colormap: ColormapName;
+}): JSX.Element | null {
+  if (!(max > min)) return null;
+  const N = 5;
+  const ticks = Array.from({ length: N }, (_, i) => {
+    const v = min + ((max - min) * i) / (N - 1);
+    const x = Math.min(1, Math.max(0, applyStretch((v - min) / (max - min), mode)));
+    return { v, x };
+  });
+  return (
+    <div className="fgl-cbar">
+      <div className="fgl-cbar-strip" style={{ background: gradientCss(colormap) }} />
+      <div className="fgl-cbar-axis">
+        {ticks.map((t, i) => (
+          <span
+            key={i}
+            className="fgl-cbar-tick"
+            style={{ left: `${t.x * 100}%`, transform: i === 0 ? 'none' : i === N - 1 ? 'translateX(-100%)' : 'translateX(-50%)' }}
+          >
+            {fmtVal(t.v)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** Log-scaled histogram bars on a canvas; redraws only when its data changes. */
 function Histogram({ counts, color }: { counts: Float32Array; color: string }): JSX.Element {
   const ref = useRef<HTMLCanvasElement | null>(null);
@@ -181,6 +223,45 @@ function Histogram({ counts, color }: { counts: Float32Array; color: string }): 
     }
   }, [counts, color]);
   return <canvas ref={ref} className="fgl-hist" />;
+}
+
+/** A compact numeric input for a stretch limit: commits on blur/Enter, and re-syncs
+ *  to the prop while not being edited (so a slider drag updates the shown value). */
+function NumField({
+  value,
+  onCommit,
+  title,
+}: {
+  value: number;
+  onCommit: (v: number) => void;
+  title: string;
+}): JSX.Element {
+  const [text, setText] = useState('');
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    if (!editing) setText(String(Number(value.toPrecision(6))));
+  }, [value, editing]);
+  const commit = (): void => {
+    const v = Number(text);
+    if (Number.isFinite(v)) onCommit(v);
+    setEditing(false);
+  };
+  return (
+    <input
+      className="fgl-num"
+      type="text"
+      inputMode="decimal"
+      spellCheck={false}
+      title={title}
+      value={text}
+      onFocus={() => setEditing(true)}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+      }}
+    />
+  );
 }
 
 /** A black/white-point control over a band's visible-data histogram. */
@@ -221,7 +302,9 @@ function LimitsControl({
         <span className="fgl-sw" style={{ background: color }} />
         <span className="fgl-dr-nm">{label}</span>
         <span className="fgl-dr-vals">
-          {fmtVal(min)} – {fmtVal(max)}
+          <NumField value={min} title="black point" onCommit={(v) => onChange(Math.min(v, max), max)} />
+          <span className="fgl-dr-dash">–</span>
+          <NumField value={max} title="white point" onCommit={(v) => onChange(min, Math.max(v, min))} />
         </span>
       </div>
       <div className="fgl-dr-track">
@@ -1061,6 +1144,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
       s: state.stretch,
       cm: state.colormap,
       n: state.northUp ? 1 : 0,
+      g: state.graticule ? 1 : 0,
     };
     const v = handle.current?.getViewer() ?? null;
     const wcs = v?.getWcs() ?? null;
@@ -1110,6 +1194,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
             props.onError?.(e);
           }}
         >
+          {state.graticule && <Graticule getViewer={getViewer} store={readout} />}
           <FitsLoadingField active={loading} />
           <div className={`fgl-win${collapsed ? ' collapsed' : ''}`}>
             <div className="fgl-win-head" onClick={() => setCollapsed((c) => !c)}>
@@ -1249,13 +1334,31 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                 </div>
 
                 {state.mode === 'single' && (
-                  <div className="fgl-row" style={{ marginTop: 11 }}>
-                    <span className="fgl-cap-inline">Colormap</span>
-                    <ColormapDropdown
-                      value={state.colormap}
-                      onChange={(name) => setState((s) => ({ ...s, colormap: name }))}
-                    />
-                  </div>
+                  <>
+                    <div className="fgl-row" style={{ marginTop: 11 }}>
+                      <span className="fgl-cap-inline">Colormap</span>
+                      <ColormapDropdown
+                        value={state.colormap}
+                        onChange={(name) => setState((s) => ({ ...s, colormap: name }))}
+                      />
+                    </div>
+                    {state.stretch !== 'trilogy' &&
+                      (() => {
+                        const lim =
+                          limits[state.band] ??
+                          (histos[state.band] !== undefined
+                            ? { min: histos[state.band]!.lo, max: histos[state.band]!.hi }
+                            : undefined);
+                        return lim !== undefined ? (
+                          <Colorbar
+                            min={lim.min}
+                            max={lim.max}
+                            mode={state.stretch}
+                            colormap={state.colormap}
+                          />
+                        ) : null;
+                      })()}
+                  </>
                 )}
               </div>
 
@@ -1267,6 +1370,14 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
                   onClick={() => setState((s) => ({ ...s, northUp: !s.northUp }))}
                 >
                   <span className="fgl-tx">North up</span>
+                  <span className="fgl-switch" />
+                </div>
+                <div className="fgl-row" />
+                <div
+                  className={`fgl-tg${state.graticule ? ' on' : ''}`}
+                  onClick={() => setState((s) => ({ ...s, graticule: !s.graticule }))}
+                >
+                  <span className="fgl-tx">Coordinate grid</span>
                   <span className="fgl-switch" />
                 </div>
                 <div className="fgl-row" />
@@ -1433,6 +1544,32 @@ function ShareMenu({
   );
 }
 
+/** A Canvas2D RA/Dec graticule stacked over the GL canvas; redraws each frame by
+ *  subscribing to the readout store (the per-frame leaf pattern of StatusReadout). */
+function Graticule({
+  getViewer,
+  store,
+}: {
+  getViewer: () => FitsViewerCore | null;
+  store: ReadoutStore;
+}): JSX.Element {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  useSyncExternalStore(
+    (cb) => {
+      store.listeners.add(cb);
+      return (): void => {
+        store.listeners.delete(cb);
+      };
+    },
+    () => store.version,
+    () => 0,
+  );
+  useEffect(() => {
+    drawGraticule(ref.current, getViewer());
+  });
+  return <canvas ref={ref} className="fgl-grat" aria-hidden="true" />;
+}
+
 /** Format a pixel value for the status bar: '—' for no-data / not-resident, else
  *  5 significant figures with trailing zeros trimmed. */
 function formatValue(v: number | null): string {
@@ -1557,7 +1694,17 @@ const STYLE_CSS = `
 .fgl-dr-head{display:flex;align-items:center;gap:7px;margin-bottom:5px;}
 .fgl-sw{width:7px;height:7px;border-radius:2px;}
 .fgl-dr-nm{font-size:10.5px;color:var(--text);flex:1;letter-spacing:.03em;}
-.fgl-dr-vals{font-size:9.5px;color:var(--dim);font-variant-numeric:tabular-nums;}
+.fgl-dr-vals{font-size:9.5px;color:var(--dim);font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:3px;}
+.fgl-dr-dash{color:var(--faint);}
+.fgl-num{width:62px;background:var(--inset);border:1px solid var(--line);border-radius:3px;color:var(--text);
+  font-family:var(--mono);font-size:9.5px;text-align:right;padding:2px 4px;outline:none;font-variant-numeric:tabular-nums;}
+.fgl-num:focus{border-color:var(--gold-d);}
+.fgl-cbar{margin-top:11px;}
+.fgl-cbar-strip{height:12px;border-radius:3px;border:1px solid var(--line2);}
+.fgl-cbar-axis{position:relative;height:13px;margin-top:3px;}
+.fgl-cbar-tick{position:absolute;top:0;font-size:9px;color:var(--dim);font-family:var(--mono);
+  font-variant-numeric:tabular-nums;white-space:nowrap;}
+.fgl-grat{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;}
 .fgl-dr-scanning{font-size:10px;color:var(--faint);padding:6px 0;}
 .fgl-dr-track{position:relative;height:32px;}
 .fgl-hist{position:absolute;inset:0 0 8px;width:100%;height:24px;border:1px solid var(--line);border-radius:3px;background:var(--inset);}

@@ -27,6 +27,8 @@ export interface ShareState {
   cm?: string;
   /** North-up: 1 on, 0 off. */
   n?: 0 | 1;
+  /** Coordinate grid (graticule): 1 on, 0 off. */
+  g?: 0 | 1;
 }
 
 /** UTF-8-safe base64url (no `+`/`/`/`=`), so band names with any character survive. */
