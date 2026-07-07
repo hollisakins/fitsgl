@@ -1,0 +1,30 @@
+name: CI
+
+# Typecheck + tests for fitsgl-core on every push to main and every PR.
+# The publish workflow (publish-core.yml) also gates on these, but this runs
+# them off the release path so regressions surface on PRs, not at `npm publish`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fitsgl-core
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: fitsgl-core/package-lock.json
+
+      - run: npm ci # runs the `prepare` build hook, exercising the dist build too
+
+      - run: npm run typecheck
+
+      - run: npm test

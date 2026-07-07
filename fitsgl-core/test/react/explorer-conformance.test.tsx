@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, waitFor, fireEvent } from '@testing-library/react';
+import { render, waitFor, fireEvent, within, cleanup } from '@testing-library/react';
 
 /**
  * Conformance guard for the SSG/React tier: render <FitsExplorer> (the one control
@@ -84,6 +84,27 @@ const togglePanel = (root: HTMLElement, title: string): void => {
   if (head !== undefined) fireEvent.click(head);
 };
 
+/**
+ * Ensure the Composite panel is open and its grid rendered. Idempotent: entering
+ * RGB mode auto-opens Composite (explorer.tsx `openPanel('composite')`) on an
+ * effect whose timing relative to the test isn't fixed, so a blind `togglePanel`
+ * can race and *close* an already-auto-opened panel. This opens only when the
+ * header is collapsed (aria-expanded guard, never closes) and waits for the grid.
+ */
+const openComposite = async (root: HTMLElement): Promise<void> => {
+  await waitFor(() => {
+    if (root.querySelector('.fgl-grid') === null) {
+      const head = Array.from(root.querySelectorAll('.fgl-panel-head')).find((h) =>
+        h.textContent?.includes('Composite'),
+      ) as HTMLElement | undefined;
+      if (head !== undefined && head.getAttribute('aria-expanded') !== 'true') {
+        fireEvent.click(head);
+      }
+    }
+    expect(root.querySelector('.fgl-grid')).not.toBeNull();
+  });
+};
+
 /** Expand the Display panel's collapsed "Fine adjustment" disclosure (histograms). */
 const expandFine = (root: HTMLElement): void => {
   const head = Array.from(root.querySelectorAll('.fgl-disclose-head')).find((h) =>
@@ -150,6 +171,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Explicit unmount before the next render so document-scoped state can't bleed
+  // across tests (belt-and-suspenders alongside RTL's auto-cleanup).
+  cleanup();
   vi.unstubAllGlobals();
 });
 
@@ -165,8 +189,7 @@ describe('FitsglConfig conformance (every key consumed by <FitsExplorer>)', () =
     // defaultView.mode = rgb -> the rail shows channel pills (not single chips)
     expect(container.querySelector('.fgl-chan')).not.toBeNull();
     // grid.group -> cross-grid band greyed, co-gridded band selectable (Composite panel)
-    togglePanel(container, 'Composite');
-    await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
+    await openComposite(container);
     expect(button(container, 'R = gnd').disabled).toBe(true);
     expect(button(container, 'R = jw_a').disabled).toBe(false);
     // defaultView.stretch.mode -> imperative setStretchMode
@@ -192,7 +215,9 @@ describe('FitsglConfig conformance (every key consumed by <FitsExplorer>)', () =
     // defaultView.mode = single + defaultView.band -> a single-band dataset hides the
     // rail; the band identity surfaces in the status-bar band list instead.
     expect(container.querySelector('.fgl-bandrail')).toBeNull();
-    expect(getByText('B200')).toBeTruthy();
+    // Scope to THIS render (not document.body) and wait for the async band state
+    // to settle to exactly one B200 — the status-bar band identity.
+    await waitFor(() => expect(within(container).getAllByText('B200')).toHaveLength(1));
     // defaultView.colormap -> active colormap swatch (Display panel, default-open)
     expect(activeSwatch(container)).toBe('viridis');
     // defaultView.stretch.mode
