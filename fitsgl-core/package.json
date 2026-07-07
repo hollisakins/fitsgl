@@ -4,6 +4,13 @@
   "type": "module",
   "description": "Browser-side decoder for fpacked FITS tile pyramids (RICE_1 + GZIP_2) over HTTP range requests.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hollisakins/fitsgl.git",
+    "directory": "fitsgl-core"
+  },
+  "homepage": "https://github.com/hollisakins/fitsgl/tree/main/fitsgl-core",
+  "bugs": "https://github.com/hollisakins/fitsgl/issues",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -29,8 +36,13 @@
     "dist",
     "src"
   ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
