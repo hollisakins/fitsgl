@@ -196,6 +196,11 @@ async function main(): Promise<void> {
   });
   controls.setViewer(viewer);
 
+  // Optional region-overlay demo (issue #16): `?regions=1` drops a few world-sized,
+  // rotatable rects + a polygon at the view centre so the new glyph class can be
+  // eyeballed against real tiles (dashed stroke, fill alpha, rotation, hit-test).
+  if (new URLSearchParams(location.search).has('regions')) addDemoRegions(viewer, canvas);
+
   // In dataset mode, hand the controls the bands so the RGB toggle + pickers work.
   if (dataset !== null) {
     controls.setDataset(dataset, pyramids);
@@ -217,6 +222,37 @@ async function main(): Promise<void> {
   };
   window.addEventListener('beforeunload', teardown);
   import.meta.hot?.dispose(teardown);
+}
+
+/** Drop a handful of demo regions centred on the current view, sized to it. */
+function addDemoRegions(viewer: FitsViewer, canvas: HTMLCanvasElement): void {
+  const cam = viewer.getCameraState();
+  if (cam === null || !(cam.zoom > 0)) return;
+  const u = canvas.height / cam.zoom / 6; // ~a sixth of the visible height, world px
+  const cx = cam.centerX;
+  const cy = cam.centerY;
+  viewer.setRegions([
+    // A rotated, translucent-filled rect (an MSA-shutter-like footprint).
+    { id: 'rot', x: cx - u * 1.2, y: cy, width: u, height: u * 0.6, rotationDeg: 30,
+      stroke: '#00e5ff', fill: '#00e5ff33', strokeWidth: 2, data: { kind: 'rect' } },
+    // A dashed rect (a "stuck-closed shutter").
+    { id: 'dash', x: cx + u * 1.2, y: cy, width: u, height: u * 0.6, rotationDeg: -15,
+      stroke: '#ff3366', strokeWidth: 2, dash: [8, 6] as const, data: { kind: 'dashed' } },
+    // A triangular footprint polygon.
+    { shape: 'polygon', id: 'poly', stroke: '#ffd21e', fill: '#ffd21e22', strokeWidth: 2,
+      worldVertices: [
+        { x: cx - u * 0.6, y: cy + u * 1.4 },
+        { x: cx + u * 0.7, y: cy + u * 1.2 },
+        { x: cx + u * 0.2, y: cy + u * 2.4 },
+      ], data: { kind: 'polygon' } },
+  ]);
+  viewer.setRegionHandlers({
+    regionTooltip: (r) => `region ${r.id}`,
+    onRegionClick: (e) => {
+      // eslint-disable-next-line no-console
+      console.log(`clicked region ${e.region.id}`, e.region.data);
+    },
+  });
 }
 
 main().catch((err: unknown) => {

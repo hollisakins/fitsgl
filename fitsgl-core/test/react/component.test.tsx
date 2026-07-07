@@ -31,6 +31,12 @@ const h = vi.hoisted(() => {
     removeMarker = vi.fn(() => true);
     clearMarkers = vi.fn();
     setMarkerHandlers = vi.fn();
+    setRegions = vi.fn((r: unknown[]) => r.map((_, i) => `rid${i}`));
+    addRegions = vi.fn(() => [] as string[]);
+    updateRegion = vi.fn(() => true);
+    removeRegion = vi.fn(() => true);
+    clearRegions = vi.fn();
+    setRegionHandlers = vi.fn();
     autoStretch = vi.fn(() => Promise.resolve(null));
     fitToImage = vi.fn();
     setCenter = vi.fn();

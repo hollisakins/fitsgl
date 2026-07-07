@@ -67,6 +67,18 @@ import { broadPhaseWorldRadius, pickMarker, wasClick } from '../overlay/hit-test
 import { OverlayRenderer } from '../overlay/overlay-renderer.js';
 import { OverlayPopup } from '../overlay/popup.js';
 import {
+  RegionStore,
+  type RegionEvent,
+  type RegionHandlers,
+  type RegionInput,
+  type RegionPatch,
+  type ResolvedRegion,
+} from '../overlay/regions.js';
+import { packRects, packRectOne } from '../overlay/region-pack.js';
+import { buildPolygonFill, buildPolygonStroke } from '../overlay/polygon.js';
+import { pickRegion } from '../overlay/region-hit-test.js';
+import { RegionRenderer } from '../overlay/region-renderer.js';
+import {
   TileManager,
   allLevelTiles,
   buildLevelGeoms,
@@ -194,6 +206,9 @@ export interface CursorInfo {
   /** The topmost marker under the cursor, or null. Correlates the sky readout
    *  with the overlay hit-test in one event (decision D10). */
   marker: ResolvedMarker | null;
+  /** The topmost region (rect/polygon) whose footprint contains the cursor, or
+   *  null. Correlates the readout with the region hit-test (issue #16). */
+  region: ResolvedRegion | null;
 }
 
 /** A point in world (native image-pixel) or drawing-buffer coordinates. */
@@ -372,6 +387,22 @@ export interface FitsViewerOptions {
    * show nothing. The viewer owns one reused popup element.
    */
   markerTooltip?: (m: ResolvedMarker) => string | HTMLElement | null;
+  /**
+   * Region click handler (issue #16). Fires on a non-drag left click whose world
+   * point lies inside a region footprint (and no marker is on top). Settable after
+   * construction via `setRegionHandlers`.
+   */
+  onRegionClick?: (e: RegionEvent) => void;
+  /**
+   * Region hover handler: fires when the topmost region under the pointer
+   * *changes* (with the region, or null on leave). Independent of `onMarkerHover`.
+   */
+  onRegionHover?: (e: RegionEvent | null) => void;
+  /**
+   * Tooltip content for a hovered region. The shared popup prefers a marker
+   * tooltip when a marker is also under the cursor (markers paint on top).
+   */
+  regionTooltip?: (r: ResolvedRegion) => string | HTMLElement | null;
 }
 
 export class FitsViewer {
@@ -497,6 +528,13 @@ export class FitsViewer {
   private grid = new GridIndex([]);
   private readonly popup: OverlayPopup;
   private markerHandlers: MarkerHandlers;
+  // ---- region overlays (issue #16) ---------------------------------------
+  private readonly regionRenderer: RegionRenderer;
+  private readonly regions = new RegionStore();
+  private regionGrid = new GridIndex([]);
+  private regionHandlers: RegionHandlers;
+  /** Id of the region currently hovered, so onRegionHover fires only on change. */
+  private hoveredRegionId: string | null = null;
   /** Latest un-processed pointer sample; picking is coalesced to one rAF. */
   private pendingPointer: { bufX: number; bufY: number; cssX: number; cssY: number; event: MouseEvent } | null = null;
   private pointerScheduled = false;
@@ -651,11 +689,17 @@ export class FitsViewer {
     // Overlay subsystem (M3): the instanced marker renderer + a reused DOM popup.
     // The marker store/grid stay empty until the host adds markers.
     this.overlay = new OverlayRenderer(gl);
+    this.regionRenderer = new RegionRenderer(gl);
     this.popup = new OverlayPopup();
     this.markerHandlers = {
       onMarkerClick: options.onMarkerClick,
       onMarkerHover: options.onMarkerHover,
       markerTooltip: options.markerTooltip,
+    };
+    this.regionHandlers = {
+      onRegionClick: options.onRegionClick,
+      onRegionHover: options.onRegionHover,
+      regionTooltip: options.regionTooltip,
     };
 
     gl.clearColor(BG_COLOR[0], BG_COLOR[1], BG_COLOR[2], 1);
@@ -730,15 +774,24 @@ export class FitsViewer {
       const pressedOnCanvas = this.dragging;
       this.dragging = false;
       if (e.button !== 0 || !pressedOnCanvas) return;
-      const onClick = this.markerHandlers.onMarkerClick;
-      if (onClick === undefined) return;
+      const onMarkerClick = this.markerHandlers.onMarkerClick;
+      const onRegionClick = this.regionHandlers.onRegionClick;
+      if (onMarkerClick === undefined && onRegionClick === undefined) return;
       const p = this.toBufferCoords(e);
-      // Only a press+release that didn't travel (a click, not a pan) can hit a
-      // marker — using mousedown/up rather than the DOM `click`, which can't see
+      // Only a press+release that didn't travel (a click, not a pan) can hit an
+      // overlay — using mousedown/up rather than the DOM `click`, which can't see
       // the drag distance.
       if (!wasClick(this.pressX, this.pressY, p.x, p.y, this.dpr)) return;
-      const marker = this.hitTest(p.x, p.y);
-      if (marker !== null) onClick(this.buildMarkerEvent(marker, e));
+      // A marker (drawn on top) wins over a region under the same click.
+      const marker = onMarkerClick !== undefined ? this.hitTest(p.x, p.y) : null;
+      if (marker !== null) {
+        onMarkerClick?.(this.buildMarkerEvent(marker, e));
+        return;
+      }
+      if (onRegionClick !== undefined) {
+        const region = this.regionHitTest(p.x, p.y);
+        if (region !== null) onRegionClick(this.buildRegionEvent(region, e));
+      }
     };
     this.onWheel = (e) => {
       e.preventDefault();
@@ -1227,6 +1280,89 @@ export class FitsViewer {
     if (handlers.markerTooltip === undefined) this.popup.hide();
   }
 
+  // ---- region overlays (issue #16) ---------------------------------------
+
+  /**
+   * Add regions (rotatable rects and/or polygons), returning the resolved id of
+   * each input in order. Sky-geometry regions require a usable WCS — a region that
+   * cannot be placed is dropped (its id is still returned, but a later
+   * `updateRegion`/`removeRegion` on it is a no-op). Throws on a duplicate id.
+   */
+  addRegions(regions: RegionInput[]): string[] {
+    const ids = this.regions.add(regions, this.wcs);
+    this.rebuildRegionGrid();
+    this.rebuildRegionBuffers();
+    this.requestRender();
+    return ids;
+  }
+
+  /** Replace all regions (clear + add). Returns the new ids. */
+  setRegions(regions: RegionInput[]): string[] {
+    const ids = this.regions.replace(regions, this.wcs);
+    this.clearRegionHoverState();
+    this.rebuildRegionGrid();
+    this.rebuildRegionBuffers();
+    this.requestRender();
+    return ids;
+  }
+
+  /**
+   * Patch one region by id (style, geometry, or data). Returns whether the id
+   * existed. A style-only change to a rect is O(1) (one instance slot re-uploaded);
+   * a geometry change, or any change to a polygon, rebuilds the affected buffers.
+   */
+  updateRegion(id: string, patch: RegionPatch): boolean {
+    const res = this.regions.update(id, patch, this.wcs);
+    if (res === null) return false;
+    const region = this.regions.at(res.index);
+    // A style-only rect edit can patch its single instance slot in place; anything
+    // that changes geometry (or touches a polygon, or flips shape) rebuilds. The
+    // instance index is the number of rects packed before this one (rects are
+    // packed in store order) — O(index), no allocation.
+    if (!res.geometryChanged && region !== undefined && region.shape === 'rect') {
+      const list = this.regions.list();
+      let instanceIndex = 0;
+      for (let i = 0; i < res.index; i++) if (list[i].shape === 'rect') instanceIndex++;
+      this.regionRenderer.updateRect(instanceIndex, packRectOne(region));
+    } else {
+      if (res.geometryChanged) this.rebuildRegionGrid();
+      this.rebuildRegionBuffers();
+    }
+    this.requestRender();
+    return true;
+  }
+
+  /** Remove one region by id. Returns whether it existed. */
+  removeRegion(id: string): boolean {
+    if (!this.regions.remove(id)) return false;
+    if (this.hoveredRegionId === id) this.clearRegionHoverState();
+    this.rebuildRegionGrid();
+    this.rebuildRegionBuffers();
+    this.requestRender();
+    return true;
+  }
+
+  /** Remove all regions. */
+  clearRegions(): void {
+    if (this.regions.count === 0) return;
+    this.regions.clear();
+    this.clearRegionHoverState();
+    this.rebuildRegionGrid();
+    this.rebuildRegionBuffers();
+    this.requestRender();
+  }
+
+  /**
+   * Set the region interaction handlers (click / hover / tooltip), replacing any
+   * previously set. A React wrapper can call this each render with fresh closures.
+   */
+  setRegionHandlers(handlers: RegionHandlers): void {
+    this.regionHandlers = handlers;
+    if (handlers.regionTooltip === undefined && this.markerHandlers.markerTooltip === undefined) {
+      this.popup.hide();
+    }
+  }
+
   /** The orientation matrix to apply this frame (identity when North-up is off). */
   private currentOrientation(): Mat2 {
     return this.northUpEnabled && this.wcs !== null ? this.northUpMatrix : IDENTITY_MAT2;
@@ -1390,6 +1526,7 @@ export class FitsViewer {
     for (const m of this.bandManagers) m.destroy();
     this.clearColormapTexture();
     this.overlay.destroy(); // marker program, VAO, instance + quad buffers
+    this.regionRenderer.destroy(); // rect + polygon programs, VAOs, buffers
     this.popup.destroy(); // remove the popup DOM node
     this.gl.deleteProgram(this.program);
     this.gl.deleteVertexArray(this.vao);
@@ -1719,11 +1856,12 @@ export class FitsViewer {
 
     for (const m of this.bandManagers) m.evict(MAX_IDLE_FRAMES);
 
-    // Markers draw on top of the tiles, sharing the oriented transform so they
-    // stay registered under pan/zoom and North-up (decision D10). The marker pass
-    // binds its own program/VAO; the next frame's tile pass rebinds the tile
-    // program/VAO at the top of draw().
-    this.overlay.draw({
+    // Overlays draw on top of the tiles, sharing the oriented transform so they
+    // stay registered under pan/zoom and North-up. Regions (world-sized footprints)
+    // paint first; markers (point glyphs) paint on top. Each pass binds its own
+    // program/VAO; the next frame's tile pass rebinds the tile program/VAO at the
+    // top of draw().
+    const overlayView = {
       centerX: this.camera.centerX,
       centerY: this.camera.centerY,
       zoom: this.camera.zoom,
@@ -1731,7 +1869,9 @@ export class FitsViewer {
       viewportHeight: this.canvas.height,
       orient,
       pixelRatio: this.dpr,
-    });
+    };
+    this.regionRenderer.draw(overlayView);
+    this.overlay.draw(overlayView);
 
     if (this.onFrame !== undefined) {
       try {
@@ -2308,7 +2448,9 @@ export class FitsViewer {
     return (
       this.onCursor !== undefined ||
       this.markerHandlers.onMarkerHover !== undefined ||
-      this.markerHandlers.markerTooltip !== undefined
+      this.markerHandlers.markerTooltip !== undefined ||
+      this.regionHandlers.onRegionHover !== undefined ||
+      this.regionHandlers.regionTooltip !== undefined
     );
   }
 
@@ -2332,6 +2474,19 @@ export class FitsViewer {
     const radius = broadPhaseWorldRadius(this.markers.maxSize, this.dpr, this.camera.zoom);
     const candidates = this.grid.query(world.x, world.y, radius);
     return pickMarker(candidates, this.markers.list(), this.camera, orient, bufX, bufY, this.dpr);
+  }
+
+  /**
+   * Topmost region whose footprint contains a drawing-buffer point, or null.
+   * Broad phase: the region grid over centres, queried with the store's max
+   * bound-radius (so a large region is never culled). Narrow phase: an exact
+   * point-in-area test in world space (`pickRegion`) — orientation/zoom-free.
+   */
+  private regionHitTest(bufX: number, bufY: number): ResolvedRegion | null {
+    if (this.regions.count === 0) return null;
+    const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
+    const candidates = this.regionGrid.query(world.x, world.y, this.regions.maxBoundRadius);
+    return pickRegion(candidates, this.regions.list(), world.x, world.y);
   }
 
   /** Once-per-frame: emit the cursor readout and the marker hover/tooltip. */
@@ -2366,6 +2521,7 @@ export class FitsViewer {
     const value: number | null = values[0] ?? null;
 
     const marker = this.hitTest(p.bufX, p.bufY);
+    const region = this.regionHitTest(p.bufX, p.bufY);
 
     this.onCursor?.({
       worldX: world.x,
@@ -2378,23 +2534,30 @@ export class FitsViewer {
       level,
       native: level === 0,
       marker,
+      region,
     });
 
-    // Hover fires only when the topmost marker changes; the popup follows the
-    // cursor while a marker stays hovered.
+    // Marker hover fires only when the topmost marker changes.
     const id = marker?.id ?? null;
     if (id !== this.hoveredId) {
       this.hoveredId = id;
       this.markerHandlers.onMarkerHover?.(marker === null ? null : this.buildMarkerEvent(marker, p.event));
     }
-    const tooltip = this.markerHandlers.markerTooltip;
-    if (marker !== null && tooltip !== undefined) {
-      const content = tooltip(marker);
-      if (content !== null) this.popup.show(content, p.event.clientX, p.event.clientY);
-      else this.popup.hide();
-    } else {
-      this.popup.hide();
+    // Region hover is an independent channel, firing on topmost-region change.
+    const rid = region?.id ?? null;
+    if (rid !== this.hoveredRegionId) {
+      this.hoveredRegionId = rid;
+      this.regionHandlers.onRegionHover?.(region === null ? null : this.buildRegionEvent(region, p.event));
     }
+
+    // One shared popup: a marker tooltip wins over a region tooltip (markers on top).
+    const mTip = this.markerHandlers.markerTooltip;
+    const rTip = this.regionHandlers.regionTooltip;
+    let content: string | HTMLElement | null = null;
+    if (marker !== null && mTip !== undefined) content = mTip(marker);
+    else if (region !== null && rTip !== undefined) content = rTip(region);
+    if (content !== null) this.popup.show(content, p.event.clientX, p.event.clientY);
+    else this.popup.hide();
   }
 
   private buildMarkerEvent(marker: ResolvedMarker, e: MouseEvent): MarkerEvent {
@@ -2405,6 +2568,25 @@ export class FitsViewer {
     const bufY = cssY * (this.canvas.height / (rect.height || 1));
     const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
     return { marker, worldX: world.x, worldY: world.y, screenX: cssX, screenY: cssY, originalEvent: e };
+  }
+
+  private buildRegionEvent(region: ResolvedRegion, e: MouseEvent): RegionEvent {
+    const rect = this.canvas.getBoundingClientRect();
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+    const bufX = cssX * (this.canvas.width / (rect.width || 1));
+    const bufY = cssY * (this.canvas.height / (rect.height || 1));
+    const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
+    return { region, worldX: world.x, worldY: world.y, screenX: cssX, screenY: cssY, originalEvent: e };
+  }
+
+  /** Drop any active region hover (mirror of `clearHoverState` for regions). */
+  private clearRegionHoverState(): void {
+    if (this.hoveredRegionId !== null) {
+      this.hoveredRegionId = null;
+      this.regionHandlers.onRegionHover?.(null);
+    }
+    this.popup.hide();
   }
 
   /**
@@ -2427,5 +2609,20 @@ export class FitsViewer {
 
   private rebuildOverlayBuffer(): void {
     this.overlay.setInstances(packInstances(this.markers.list()), this.markers.count);
+  }
+
+  private rebuildRegionGrid(): void {
+    // The grid indexes region CENTRES; the broad phase queries with the store's
+    // max bound-radius so a body-overlapping-cursor region is never culled.
+    this.regionGrid = new GridIndex(
+      this.regions.list().map((r) => ({ x: r.centerX, y: r.centerY })),
+    );
+  }
+
+  private rebuildRegionBuffers(): void {
+    const rects = this.regions.rects().map((r) => r.rect);
+    this.regionRenderer.setRects(packRects(rects), rects.length);
+    const polys = this.regions.polygons().map((p) => p.polygon);
+    this.regionRenderer.setPolygons(buildPolygonFill(polys), buildPolygonStroke(polys));
   }
 }
