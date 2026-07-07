@@ -215,9 +215,13 @@ describe('FitsglConfig conformance (every key consumed by <FitsExplorer>)', () =
     // defaultView.mode = single + defaultView.band -> a single-band dataset hides the
     // rail; the band identity surfaces in the status-bar band list instead.
     expect(container.querySelector('.fgl-bandrail')).toBeNull();
-    // Scope to THIS render (not document.body) and wait for the async band state
-    // to settle to exactly one B200 — the status-bar band identity.
-    await waitFor(() => expect(within(container).getAllByText('B200')).toHaveLength(1));
+    // The band identity surfaces in the status-bar band list. (It also appears in
+    // the Display panel's per-band stretch row, so scope the assertion to the
+    // status bar rather than the whole render — document.body-scoped or
+    // whole-container queries race with that second, post-readyTick node.)
+    await waitFor(() =>
+      expect(within(container.querySelector('.fgl-status') as HTMLElement).getByText('B200')).toBeTruthy(),
+    );
     // defaultView.colormap -> active colormap swatch (Display panel, default-open)
     expect(activeSwatch(container)).toBe('viridis');
     // defaultView.stretch.mode
