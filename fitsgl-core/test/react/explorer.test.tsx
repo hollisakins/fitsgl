@@ -63,13 +63,26 @@ const BANDS: ExplorerBand[] = [
 const button = (root: HTMLElement, name: string): HTMLButtonElement =>
   Array.from(root.querySelectorAll('button')).find((b) => b.getAttribute('aria-label') === name) as HTMLButtonElement;
 
-/** Click a docked inspector panel's header by title (e.g. expand the collapsed
- *  Composite/View panel — Tier-2 sections that start collapsed). */
-const togglePanel = (root: HTMLElement, title: string): void => {
-  const head = Array.from(root.querySelectorAll('.fgl-panel-head')).find((h) =>
-    h.textContent?.includes(title),
-  ) as HTMLElement | undefined;
-  if (head !== undefined) fireEvent.click(head);
+/**
+ * Ensure the Composite panel is open and its grid rendered. Idempotent by design:
+ * entering RGB mode auto-opens Composite (explorer.tsx `openPanel('composite')`),
+ * and that runs on an effect whose timing relative to the test is not fixed. A
+ * blind `togglePanel` therefore races — if the auto-open lands first, a toggle
+ * *closes* the panel and the grid never appears. This opens only when the header
+ * is collapsed (aria-expanded guard, never closes) and waits for the grid.
+ */
+const openComposite = async (root: HTMLElement): Promise<void> => {
+  await waitFor(() => {
+    if (root.querySelector('.fgl-grid') === null) {
+      const head = Array.from(root.querySelectorAll('.fgl-panel-head')).find((h) =>
+        h.textContent?.includes('Composite'),
+      ) as HTMLElement | undefined;
+      if (head !== undefined && head.getAttribute('aria-expanded') !== 'true') {
+        fireEvent.click(head);
+      }
+    }
+    expect(root.querySelector('.fgl-grid')).not.toBeNull();
+  });
 };
 
 /** The active band chip's label (band rail, single mode). */
@@ -105,8 +118,7 @@ describe('<FitsExplorer>', () => {
     );
     await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
     // The R/G/B assignment lives in the (collapsed) Composite panel now — expand it.
-    togglePanel(container, 'Composite');
-    await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
+    await openComposite(container);
     // Active group is 0 (the JWST bands) — Subaru (group 1) must be disabled,
     // a co-gridded JWST band must remain selectable.
     expect(button(container, 'R = subaru_r').disabled).toBe(true);
@@ -119,8 +131,7 @@ describe('<FitsExplorer>', () => {
       <FitsExplorer bands={BANDS} defaultView={{ mode: 'rgb', r: 'f444w', g: 'f277w', b: 'f150w' }} title="set" />,
     );
     await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
-    togglePanel(container, 'Composite');
-    await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
+    await openComposite(container);
     // Reassign R to f150w; the status-bar band list updates.
     act(() => {
       fireEvent.click(button(container, 'R = f150w'));
@@ -146,8 +157,7 @@ describe('<FitsExplorer>', () => {
     const { container, getByText } = render(<FitsExplorer config={config} />);
     await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
     expect(getByText('My Dataset')).toBeTruthy(); // title from config.dataset.title
-    togglePanel(container, 'Composite');
-    await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
+    await openComposite(container);
     expect(button(container, 'R = subaru_r').disabled).toBe(true); // cross-grid greyed
     expect(button(container, 'R = f150w').disabled).toBe(false);
   });

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, waitFor, fireEvent } from '@testing-library/react';
+import { render, waitFor, fireEvent, within, cleanup } from '@testing-library/react';
 
 /**
  * Conformance guard for the SSG/React tier: render <FitsExplorer> (the one control
@@ -76,13 +76,36 @@ const button = (root: HTMLElement, name: string): HTMLButtonElement =>
 const northUpToggle = (root: HTMLElement): Element =>
   Array.from(root.querySelectorAll('.fgl-tg')).find((e) => e.textContent?.includes('North up')) as Element;
 
-/** Expand a collapsed inspector panel (Composite/View start collapsed). */
-const togglePanel = (root: HTMLElement, title: string): void => {
-  const head = Array.from(root.querySelectorAll('.fgl-panel-head')).find((h) =>
-    h.textContent?.includes(title),
-  ) as HTMLElement | undefined;
-  if (head !== undefined) fireEvent.click(head);
+/**
+ * Ensure an inspector panel is open and its content present. Idempotent by design:
+ * some panels auto-open on state changes (entering RGB mode auto-opens Composite,
+ * explorer.tsx `openPanel('composite')`) and panel content renders only after async
+ * effects settle, so a blind toggle races — if the panel is already open a toggle
+ * *closes* it, and asserting right after a toggle can beat the content. This clicks
+ * the header only when collapsed (aria-expanded guard, never closes) and waits until
+ * `ready(root)` holds.
+ */
+const openPanelUntil = async (
+  root: HTMLElement,
+  title: string,
+  ready: (root: HTMLElement) => boolean,
+): Promise<void> => {
+  await waitFor(() => {
+    if (!ready(root)) {
+      const head = Array.from(root.querySelectorAll('.fgl-panel-head')).find((h) =>
+        h.textContent?.includes(title),
+      ) as HTMLElement | undefined;
+      if (head !== undefined && head.getAttribute('aria-expanded') !== 'true') {
+        fireEvent.click(head);
+      }
+    }
+    expect(ready(root)).toBe(true);
+  });
 };
+
+const hasGrid = (root: HTMLElement): boolean => root.querySelector('.fgl-grid') !== null;
+const hasNorthUp = (root: HTMLElement): boolean =>
+  Array.from(root.querySelectorAll('.fgl-tg')).some((e) => e.textContent?.includes('North up') === true);
 
 /** Expand the Display panel's collapsed "Fine adjustment" disclosure (histograms). */
 const expandFine = (root: HTMLElement): void => {
@@ -150,6 +173,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Explicit unmount before the next render so document-scoped state can't bleed
+  // across tests (belt-and-suspenders alongside RTL's auto-cleanup).
+  cleanup();
   vi.unstubAllGlobals();
 });
 
@@ -165,15 +191,13 @@ describe('FitsglConfig conformance (every key consumed by <FitsExplorer>)', () =
     // defaultView.mode = rgb -> the rail shows channel pills (not single chips)
     expect(container.querySelector('.fgl-chan')).not.toBeNull();
     // grid.group -> cross-grid band greyed, co-gridded band selectable (Composite panel)
-    togglePanel(container, 'Composite');
-    await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
+    await openPanelUntil(container, 'Composite', hasGrid);
     expect(button(container, 'R = gnd').disabled).toBe(true);
     expect(button(container, 'R = jw_a').disabled).toBe(false);
     // defaultView.stretch.mode -> imperative setStretchMode
     await waitFor(() => expect(h.core.setStretchMode).toHaveBeenCalledWith('log'));
     // defaultView.northUp = false -> North-up toggle NOT on (default would be on)
-    togglePanel(container, 'View');
-    await waitFor(() => expect(northUpToggle(container)).not.toBeUndefined());
+    await openPanelUntil(container, 'View', hasNorthUp);
     expect(northUpToggle(container).className).not.toContain('on');
     // dataset.catalog.url -> fetched
     expect(fetchMock).toHaveBeenCalledWith('https://example.test/catalog.csv');
@@ -192,14 +216,19 @@ describe('FitsglConfig conformance (every key consumed by <FitsExplorer>)', () =
     // defaultView.mode = single + defaultView.band -> a single-band dataset hides the
     // rail; the band identity surfaces in the status-bar band list instead.
     expect(container.querySelector('.fgl-bandrail')).toBeNull();
-    expect(getByText('B200')).toBeTruthy();
+    // The band identity surfaces in the status-bar band list. (It also appears in
+    // the Display panel's per-band stretch row, so scope the assertion to the
+    // status bar rather than the whole render — document.body-scoped or
+    // whole-container queries race with that second, post-readyTick node.)
+    await waitFor(() =>
+      expect(within(container.querySelector('.fgl-status') as HTMLElement).getByText('B200')).toBeTruthy(),
+    );
     // defaultView.colormap -> active colormap swatch (Display panel, default-open)
     expect(activeSwatch(container)).toBe('viridis');
     // defaultView.stretch.mode
     await waitFor(() => expect(h.core.setStretchMode).toHaveBeenCalledWith('asinh'));
     // defaultView.northUp = true -> North-up toggle on (View panel)
-    togglePanel(container, 'View');
-    await waitFor(() => expect(northUpToggle(container)).not.toBeUndefined());
+    await openPanelUntil(container, 'View', hasNorthUp);
     expect(northUpToggle(container).className).toContain('on');
   });
 
