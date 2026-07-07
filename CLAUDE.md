@@ -98,6 +98,16 @@ cd demo && npm install && npm run build-pyramid && npm run dev
 npm --prefix viewer run build-vendor
 ```
 
+**Releasing `@fitsgl/core` to npm:** bump `fitsgl-core/package.json` `version`,
+then push a matching `core-v<version>` tag — `.github/workflows/publish-core.yml`
+runs typecheck + tests and `npm publish` (public, with provenance) from
+`fitsgl-core/`. The tag prefix keeps it distinct from any `fitsgl-py` release. A
+`prepare` hook builds `dist/` (gitignored) at pack time; the `core-v*` tag must
+equal the package version or the workflow fails. Needs the `NPM_TOKEN` repo
+secret. npm can't consume the `fitsgl-core/` subdir as a git dep — the published
+package is the supported consumption path (pnpm/yarn can pin a git subdir; see
+`docs/core-integration.md`).
+
 ## Conventions
 
 - **Decode correctness is gated by tests against astropy-generated fixtures.**

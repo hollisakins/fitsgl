@@ -20,14 +20,31 @@ bundler assumptions). The `./react` subpath declares `react` and `@types/react`
 (>=18) as *optional* peer dependencies — you only need them if you use that
 subpath.
 
+### Installing from a git ref (before/without a published version)
+
+`@fitsgl/core` lives in the `fitsgl-core/` **subdirectory** of the
+`hollisakins/fitsgl` monorepo. It carries a `prepare` hook, so a git install
+builds `dist/` on the fly — but only with a package manager that can target a
+repo subdirectory. **pnpm** and **yarn** can; pin a commit with:
+
+```jsonc
+// package.json (pnpm / yarn) — pins fitsgl-core at a commit
+"@fitsgl/core": "github:hollisakins/fitsgl#<sha>&path:/fitsgl-core"
+```
+
+**npm cannot install from a git subdirectory**, so npm consumers must use the
+published package (`npm install @fitsgl/core` above). This is the recommended
+path for everyone regardless of package manager.
+
 ## Entry points
 
-The package exposes three subpaths:
+The package exposes four subpaths:
 
 | Subpath | What it is | Use when |
 | --- | --- | --- |
 | `@fitsgl/core` | Core: manifest/dataset loaders, `TilePyramid` (tiles over range requests), the vanilla WebGL2 `FitsViewer`, plus stretch/colormap/WCS/overlay math. The frozen public API. | You want a framework-agnostic viewer, or you're building your own React/Vue/etc. wrapper. |
 | `@fitsgl/core/react` | React components: `<FitsExplorer>` (batteries-included viewer + control panel) and `<FitsViewer>` (bare canvas component + ref handle). | You have a React app — this is the easiest path. |
+| `@fitsgl/core/worker` | The stateless tile-decode worker entry, wired via `new Worker(new URL('@fitsgl/core/worker', import.meta.url), { type: 'module' })`. The core auto-spawns its own worker by default; point at this only when supplying a custom `workerFactory` (e.g. a bundler that needs an explicit worker URL). | You bundle your own decode worker instead of the built-in one. |
 | `@fitsgl/core/internal` | Lower-level building blocks (RICE/fpack decoders, worker glue, tile-selection helpers). **No semver guarantee** — see the warning below. | Almost never. Tools/tests/advanced hosts only. |
 
 ## A FitsGL dataset on the wire
