@@ -63,19 +63,35 @@ const BANDS: ExplorerBand[] = [
 const button = (root: HTMLElement, name: string): HTMLButtonElement =>
   Array.from(root.querySelectorAll('button')).find((b) => b.getAttribute('aria-label') === name) as HTMLButtonElement;
 
+/** Click a docked inspector panel's header by title (e.g. expand the collapsed
+ *  Composite/View panel — Tier-2 sections that start collapsed). */
+const togglePanel = (root: HTMLElement, title: string): void => {
+  const head = Array.from(root.querySelectorAll('.fgl-panel-head')).find((h) =>
+    h.textContent?.includes(title),
+  ) as HTMLElement | undefined;
+  if (head !== undefined) fireEvent.click(head);
+};
+
+/** The active band chip's label (band rail, single mode). */
+const activeChip = (root: HTMLElement): string | null =>
+  root.querySelector('.fgl-chip.on')?.textContent?.trim() ?? null;
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
 
 describe('<FitsExplorer>', () => {
-  it('renders the control panel and status bar without WebGL', async () => {
+  it('renders the shell (band rail, tool rail, inspector, status) without WebGL', async () => {
     const { container, getByText } = render(<FitsExplorer bands={BANDS} title="COSMOS-Web" />);
     await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
-    expect(getByText('Display')).toBeTruthy();
+    expect(getByText('Display')).toBeTruthy(); // the default-open inspector panel
     expect(getByText('FITSGL')).toBeTruthy();
     expect(getByText('COSMOS-Web')).toBeTruthy();
-    // Single-band default: the band <select> is shown.
-    expect(container.querySelector('select')).not.toBeNull();
+    // Band identity is the always-on rail now (≥2 bands), with the first band active.
+    expect(container.querySelector('.fgl-bandrail')).not.toBeNull();
+    expect(activeChip(container)).toContain('F150W');
+    expect(container.querySelector('.fgl-toolrail')).not.toBeNull();
+    expect(container.querySelector('.fgl-inspector')).not.toBeNull();
   });
 
   it('sets the stretch mode imperatively once the viewer is ready', async () => {
@@ -87,6 +103,9 @@ describe('<FitsExplorer>', () => {
     const { container } = render(
       <FitsExplorer bands={BANDS} defaultView={{ mode: 'rgb', r: 'f444w', g: 'f277w', b: 'f150w' }} />,
     );
+    await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+    // The R/G/B assignment lives in the (collapsed) Composite panel now — expand it.
+    togglePanel(container, 'Composite');
     await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
     // Active group is 0 (the JWST bands) — Subaru (group 1) must be disabled,
     // a co-gridded JWST band must remain selectable.
@@ -99,6 +118,8 @@ describe('<FitsExplorer>', () => {
     const { container, getByText } = render(
       <FitsExplorer bands={BANDS} defaultView={{ mode: 'rgb', r: 'f444w', g: 'f277w', b: 'f150w' }} title="set" />,
     );
+    await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+    togglePanel(container, 'Composite');
     await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
     // Reassign R to f150w; the status-bar band list updates.
     act(() => {
@@ -123,22 +144,25 @@ describe('<FitsExplorer>', () => {
       defaultView: { mode: 'rgb', r: 'f444w', g: 'f277w', b: 'f150w' },
     };
     const { container, getByText } = render(<FitsExplorer config={config} />);
-    await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
     expect(getByText('My Dataset')).toBeTruthy(); // title from config.dataset.title
+    togglePanel(container, 'Composite');
+    await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
     expect(button(container, 'R = subaru_r').disabled).toBe(true); // cross-grid greyed
     expect(button(container, 'R = f150w').disabled).toBe(false);
   });
 
-  it('toggles between single and RGB layer modes', async () => {
+  it('toggles single↔RGB via the band-rail RGB toggle (and reveals Composite)', async () => {
     const { container } = render(<FitsExplorer bands={BANDS} />);
-    await waitFor(() => expect(container.querySelector('select')).not.toBeNull());
-    const rgbBtn = Array.from(container.querySelectorAll('.fgl-seg button')).find(
-      (b) => b.textContent === 'RGB',
-    ) as HTMLButtonElement;
+    await waitFor(() => expect(container.querySelector('.fgl-bandrail')).not.toBeNull());
+    const rgbBtn = container.querySelector('.fgl-rgbtoggle') as HTMLButtonElement;
+    expect(rgbBtn).not.toBeNull();
     act(() => {
       fireEvent.click(rgbBtn);
     });
+    // Entering RGB flips the toggle on and auto-expands the Composite panel.
     await waitFor(() => expect(container.querySelector('.fgl-grid')).not.toBeNull());
     expect(rgbBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(container.querySelector('.fgl-chan')).not.toBeNull(); // rail shows channel pills
   });
 });
