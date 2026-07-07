@@ -2,16 +2,25 @@ import { describe, it, expect } from 'vitest';
 import {
   activeBandNames,
   bandForRole,
+  bandRailModel,
+  canComposite,
+  clampInspectorWidth,
   defaultExplorerState,
+  defaultLayoutState,
   defaultViewFromDataset,
   deriveViewerConfig,
   explorerBandsFromConfig,
   explorerBandsFromDataset,
   gridGroupOf,
+  hasZscalePreset,
   isBandSelectableForRgb,
   isTrilogyComposite,
+  parseLayoutState,
   rainbowAction,
   rgbActiveGroup,
+  serializeLayoutState,
+  INSPECTOR_MAX_WIDTH,
+  INSPECTOR_MIN_WIDTH,
   trilogyComposite,
   type ExplorerBand,
   type ExplorerState,
@@ -288,5 +297,95 @@ describe('defaultViewFromDataset', () => {
   });
   it('falls back to single when there is no default_rgb', () => {
     expect(defaultViewFromDataset({ ...DATASET, default_rgb: null })).toEqual({ mode: 'single' });
+  });
+});
+
+describe('canComposite', () => {
+  it('is true when some grid group has ≥2 bands', () => {
+    expect(canComposite(BANDS)).toBe(true); // group 0 has four
+  });
+  it('is false for a single band', () => {
+    expect(canComposite([band('only', 0)])).toBe(false);
+  });
+  it('is false when every band sits in its own grid group', () => {
+    expect(canComposite([band('a', 0), band('b', 1), band('c', 2)])).toBe(false);
+  });
+});
+
+describe('bandRailModel', () => {
+  it('hides the rail for a single-band dataset', () => {
+    const one = [band('only', 0)];
+    const model = bandRailModel(one, defaultExplorerState(one));
+    expect(model.show).toBe(false);
+    expect(model.canComposite).toBe(false);
+  });
+
+  it('marks the active chip and assigns number-key hints (1–9, then 0)', () => {
+    const many = Array.from({ length: 11 }, (_, i) => band(`b${i}`, 0));
+    const state: ExplorerState = { ...defaultExplorerState(many), mode: 'single', band: 'b2' };
+    const model = bandRailModel(many, state);
+    expect(model.show).toBe(true);
+    expect(model.channels).toBeNull();
+    expect(model.chips[2]).toMatchObject({ name: 'b2', active: true, keyHint: 3 });
+    expect(model.chips[0].keyHint).toBe(1);
+    expect(model.chips[9].keyHint).toBe(0); // the 10th+ band gets no key hint
+    expect(model.chips.filter((c) => c.active)).toHaveLength(1);
+  });
+
+  it('exposes the compact R/G/B channel mapping in RGB mode', () => {
+    const state: ExplorerState = {
+      ...defaultExplorerState(BANDS),
+      mode: 'rgb',
+      rgb: { r: 'f444w', g: 'f277w', b: 'f150w' },
+    };
+    const model = bandRailModel(BANDS, state);
+    expect(model.chips.every((c) => !c.active)).toBe(true); // single chips inactive in RGB
+    expect(model.channels).toEqual([
+      { role: 'r', name: 'f444w', label: 'f444w' },
+      { role: 'g', name: 'f277w', label: 'f277w' },
+      { role: 'b', name: 'f150w', label: 'f150w' },
+    ]);
+  });
+});
+
+describe('hasZscalePreset', () => {
+  const withZ: ExplorerBand[] = [
+    { name: 'a', tiles: ['/a'], gridGroup: 0, zscale: [1, 9] },
+    { name: 'b', tiles: ['/b'], gridGroup: 0 },
+  ];
+  it('is true when the active single band carries zscale cuts', () => {
+    expect(hasZscalePreset(withZ, { ...defaultExplorerState(withZ), mode: 'single', band: 'a' })).toBe(true);
+    expect(hasZscalePreset(withZ, { ...defaultExplorerState(withZ), mode: 'single', band: 'b' })).toBe(false);
+  });
+  it('is true when any RGB channel carries zscale cuts', () => {
+    const state: ExplorerState = { ...defaultExplorerState(withZ), mode: 'rgb', rgb: { r: 'b', g: 'b', b: 'a' } };
+    expect(hasZscalePreset(withZ, state)).toBe(true);
+  });
+});
+
+describe('layout state (chrome persistence)', () => {
+  it('clamps inspector width to the sane range and rounds', () => {
+    expect(clampInspectorWidth(10)).toBe(INSPECTOR_MIN_WIDTH);
+    expect(clampInspectorWidth(9999)).toBe(INSPECTOR_MAX_WIDTH);
+    expect(clampInspectorWidth(300.6)).toBe(301);
+    expect(clampInspectorWidth(Number.NaN)).toBeGreaterThanOrEqual(INSPECTOR_MIN_WIDTH);
+  });
+
+  it('round-trips through serialize/parse', () => {
+    const s = { ...defaultLayoutState(), width: 410, shelved: true, collapsed: { display: true, composite: false, view: true, 'display.fine': false } };
+    expect(parseLayoutState(serializeLayoutState(s))).toEqual(s);
+  });
+
+  it('falls back to defaults for null / malformed / partial input', () => {
+    const d = defaultLayoutState();
+    expect(parseLayoutState(null)).toEqual(d);
+    expect(parseLayoutState('not json')).toEqual(d);
+    expect(parseLayoutState('123')).toEqual(d);
+    // partial: width applied + clamped, unknown collapsed keys ignored, known merged
+    const partial = parseLayoutState(JSON.stringify({ width: 5000, collapsed: { view: false, bogus: true } }));
+    expect(partial.width).toBe(INSPECTOR_MAX_WIDTH);
+    expect(partial.shelved).toBe(d.shelved);
+    expect(partial.collapsed.view).toBe(false);
+    expect(partial.collapsed).not.toHaveProperty('bogus');
   });
 });

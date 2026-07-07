@@ -25,6 +25,8 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
+  ReactNode,
+  SVGProps,
 } from 'react';
 
 import { FitsViewer } from './index.js';
@@ -62,19 +64,30 @@ import {
 } from '../index.js';
 import {
   activeBandNames,
+  bandRailModel,
+  clampInspectorWidth,
   defaultExplorerState,
   defaultViewFromConfig,
   deriveViewerConfig,
   explorerBandsFromConfig,
   groupBands,
+  hasZscalePreset,
   isBandSelectableForRgb,
   isTrilogyComposite,
+  parseLayoutState,
   rainbowAction,
   rgbActiveGroup,
+  serializeLayoutState,
   trilogyComposite,
+  INSPECTOR_MAX_WIDTH,
+  INSPECTOR_MIN_WIDTH,
+  type BandRailModel,
   type ExplorerBand,
   type ExplorerDefaultView,
   type ExplorerState,
+  type LayoutState,
+  type PanelId,
+  type PointerToolMode,
 } from './explorer-state.js';
 import { bandsSignature, viewSignature } from './plan.js';
 import { buildShareUrl, decodeShareHash, type ShareState } from './share-url.js';
@@ -110,6 +123,22 @@ function applyShareToState(
 
 const CH_COLOR = { r: '#ff6b6b', g: '#56d089', b: '#5c8cff' } as const;
 type Role = 'r' | 'g' | 'b';
+
+/** Global localStorage key for the inspector/shell layout chrome (width, collapse,
+ *  shelve). One key, shared across datasets — a workspace set up once carries over. */
+const LAYOUT_KEY = 'fitsgl:layout';
+/** Viewport width at/below which the inspector auto-shelves (overlay on open). */
+const NARROW_QUERY = '(max-width: 640px)';
+
+/** Read the persisted layout chrome, tolerating SSR / no-localStorage / quota. */
+function readLayoutRaw(): string | null {
+  try {
+    if (typeof window === 'undefined' || window.localStorage == null) return null;
+    return window.localStorage.getItem(LAYOUT_KEY);
+  } catch {
+    return null;
+  }
+}
 
 export interface FitsExplorerProps {
   /** Turnkey: a producer `FitsglConfig` (e.g. from `loadFitsglConfig`). Supplies
@@ -721,49 +750,80 @@ function TrilogyWeightMatrix({
   );
 }
 
-/** The preview-keeping colormap dropdown (single-band mode). */
-function ColormapDropdown({
+/** One-click colormap swatches (single-band mode): a chip per bundled colormap,
+ *  active highlighted. Replaces the old dropdown — colormap is touched every band
+ *  flip, so it earns always-visible Tier-1 chrome rather than a click-to-open menu. */
+function ColormapSwatches({
   value,
   onChange,
 }: {
   value: ColormapName;
   onChange: (name: ColormapName) => void;
 }): JSX.Element {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent): void => {
-      if (rootRef.current !== null && !rootRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
-  }, [open]);
   return (
-    <div className="fgl-cm" ref={rootRef}>
-      <button type="button" className="fgl-cm-trigger" onClick={() => setOpen((o) => !o)}>
-        <span className="fgl-cm-bar" style={{ background: gradientCss(value) }} />
-        <span className="fgl-cm-nm">{value}</span>
-        <span className="fgl-chev">▾</span>
-      </button>
-      {open && (
-        <div className="fgl-cm-menu">
-          {COLORMAP_NAMES.map((name) => (
-            <div
-              key={name}
-              className={`fgl-cm-opt${name === value ? ' on' : ''}`}
-              onClick={() => {
-                onChange(name);
-                setOpen(false);
-              }}
-            >
-              <span className="fgl-cm-bar" style={{ background: gradientCss(name) }} />
-              <span className="fgl-cm-nm">{name}</span>
-            </div>
-          ))}
-        </div>
-      )}
+    <div className="fgl-swatches">
+      {COLORMAP_NAMES.map((name) => (
+        <button
+          key={name}
+          type="button"
+          className={`fgl-swatch${name === value ? ' on' : ''}`}
+          aria-pressed={name === value}
+          title={name}
+          onClick={() => onChange(name)}
+        >
+          <span className="fgl-swatch-bar" style={{ background: gradientCss(name) }} />
+          <span className="fgl-swatch-nm">{name}</span>
+        </button>
+      ))}
     </div>
+  );
+}
+
+/** One-click stretch-mode buttons (DS9 "Scale") — replaces the old <select>. */
+function ScaleButtons({
+  value,
+  onChange,
+}: {
+  value: StretchMode;
+  onChange: (mode: StretchMode) => void;
+}): JSX.Element {
+  return (
+    <div className="fgl-seg fgl-seg-wrap">
+      {STRETCH_MODES.map((m) => (
+        <button key={m} type="button" aria-pressed={value === m} onClick={() => onChange(m)}>
+          {m}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** A labelled on/off switch (View toggles). A real `role="switch"` button so it is
+ *  keyboard-reachable + announced; `disabled` dims it and blocks the toggle. */
+function ToggleSwitch({
+  label,
+  on,
+  disabled,
+  onToggle,
+}: {
+  label: string;
+  on: boolean;
+  disabled?: boolean;
+  onToggle: () => void;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      aria-label={label}
+      disabled={disabled === true}
+      className={`fgl-tg${on ? ' on' : ''}${disabled === true ? ' off' : ''}`}
+      onClick={onToggle}
+    >
+      <span className="fgl-tx">{label}</span>
+      <span className="fgl-switch" />
+    </button>
   );
 }
 
@@ -828,6 +888,316 @@ function RgbRow({
       })}
     </>
   );
+}
+
+// ---------------------------------------------------------------------------
+// App-shell chrome: left tool rail, top band rail, docked inspector. All inline
+// zero-dep SVG (same approach as `Knob`); no component library, no new deps.
+// ---------------------------------------------------------------------------
+
+/** Shared attributes for the 16px line icons (stroke = currentColor). */
+const ICON: SVGProps<SVGSVGElement> = {
+  width: 16,
+  height: 16,
+  viewBox: '0 0 16 16',
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 1.5,
+  strokeLinecap: 'round',
+  strokeLinejoin: 'round',
+  'aria-hidden': true,
+  focusable: false,
+};
+const IconPan = (): JSX.Element => (
+  <svg {...ICON}>
+    <path d="M8 1.5v13M1.5 8h13" />
+    <path d="M8 1.5 6 3.5M8 1.5l2 2M8 14.5l-2-2M8 14.5l2-2M1.5 8l2-2M1.5 8l2 2M14.5 8l-2-2M14.5 8l-2 2" />
+  </svg>
+);
+const IconRuler = (): JSX.Element => (
+  <svg {...ICON}>
+    <g transform="rotate(45 8 8)">
+      <rect x="1.5" y="6" width="13" height="4" rx="0.6" />
+      <path d="M4 6v1.6M6.5 6v2.2M9 6v1.6M11.5 6v2.2" />
+    </g>
+  </svg>
+);
+const IconFit = (): JSX.Element => (
+  <svg {...ICON}>
+    <path d="M2.5 5.5v-3h3M13.5 5.5v-3h-3M2.5 10.5v3h3M13.5 10.5v3h-3" />
+  </svg>
+);
+const IconImage = (): JSX.Element => (
+  <svg {...ICON}>
+    <rect x="2" y="3" width="12" height="10" rx="1.2" />
+    <circle cx="5.6" cy="6.4" r="1.1" />
+    <path d="M2.5 12.5 6.5 8.5l2.4 2.4 2.2-2.2 3 3" />
+  </svg>
+);
+const IconHeader = (): JSX.Element => (
+  <svg {...ICON}>
+    <path d="M3 3.5h10M3 6.5h10M3 9.5h7M3 12.5h4" />
+  </svg>
+);
+const IconDisplay = (): JSX.Element => (
+  <svg {...ICON}>
+    <path d="M3 5h5.5M11.5 5H13M3 11h1.5M7.5 11H13" />
+    <circle cx="9.7" cy="5" r="1.6" />
+    <circle cx="6" cy="11" r="1.6" />
+  </svg>
+);
+const IconComposite = (): JSX.Element => (
+  <svg {...ICON}>
+    <circle cx="6" cy="6.4" r="3.3" />
+    <circle cx="10" cy="6.4" r="3.3" />
+    <circle cx="8" cy="9.8" r="3.3" />
+  </svg>
+);
+const IconView = (): JSX.Element => (
+  <svg {...ICON}>
+    <path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8Z" />
+    <circle cx="8" cy="8" r="1.8" />
+  </svg>
+);
+
+/** One left-rail button — a cursor mode (mutually exclusive, `on`) or an action. */
+function ToolButton({
+  on,
+  label,
+  shortcut,
+  onClick,
+  children,
+}: {
+  on?: boolean;
+  label: string;
+  shortcut?: string;
+  onClick: () => void;
+  children: ReactNode;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      className={`fgl-tool${on === true ? ' on' : ''}`}
+      title={shortcut === undefined ? label : `${label}  ·  ${shortcut}`}
+      aria-label={label}
+      aria-pressed={on}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Left tool rail: cursor modes (top) + momentary frame actions (bottom). */
+function ToolRail({
+  tool,
+  onTool,
+  onFit,
+  onSavePng,
+  onHeader,
+  hasHeader,
+}: {
+  tool: PointerToolMode;
+  onTool: (mode: PointerToolMode) => void;
+  onFit: () => void;
+  onSavePng: () => void;
+  onHeader: () => void;
+  hasHeader: boolean;
+}): JSX.Element {
+  return (
+    <div className="fgl-toolrail">
+      <div className="fgl-toolgroup">
+        <ToolButton on={tool === 'pan'} label="Pan" shortcut="Esc" onClick={() => onTool('pan')}>
+          <IconPan />
+        </ToolButton>
+        <ToolButton on={tool === 'ruler'} label="Ruler" shortcut="M" onClick={() => onTool('ruler')}>
+          <IconRuler />
+        </ToolButton>
+      </div>
+      <div className="fgl-toolfill" />
+      <div className="fgl-toolgroup">
+        <ToolButton label="Fit to view" onClick={onFit}>
+          <IconFit />
+        </ToolButton>
+        <ToolButton label="Save PNG" onClick={onSavePng}>
+          <IconImage />
+        </ToolButton>
+        {hasHeader && (
+          <ToolButton label="FITS header" onClick={onHeader}>
+            <IconHeader />
+          </ToolButton>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Tier-0 band rail above the canvas: identity of what's on screen. Single mode
+ *  shows selectable chips (number-key shortcuts); RGB mode shows the compact
+ *  channel mapping (click → opens the Composite panel). */
+function BandRail({
+  model,
+  onPickBand,
+  onMode,
+  onOpenComposite,
+}: {
+  model: BandRailModel;
+  onPickBand: (name: string) => void;
+  onMode: (mode: 'single' | 'rgb') => void;
+  onOpenComposite: () => void;
+}): JSX.Element {
+  return (
+    <div className="fgl-bandrail">
+      <span className="fgl-bandrail-cap">bands</span>
+      <div className="fgl-bandrail-list">
+        {model.mode === 'single'
+          ? model.chips.map((c) => (
+              <button
+                key={c.name}
+                type="button"
+                className={`fgl-chip${c.active ? ' on' : ''}`}
+                aria-pressed={c.active}
+                title={c.keyHint > 0 ? `${c.label}  ·  key ${c.keyHint}` : c.label}
+                onClick={() => onPickBand(c.name)}
+              >
+                {c.keyHint > 0 && <span className="fgl-chip-key">{c.keyHint}</span>}
+                {c.label}
+              </button>
+            ))
+          : model.channels?.map((ch) => (
+              <button
+                key={ch.role}
+                type="button"
+                className="fgl-chan"
+                title={`${ch.role.toUpperCase()} = ${ch.label}  ·  edit in Composite`}
+                onClick={onOpenComposite}
+              >
+                <span className="fgl-chan-role" style={{ color: CH_COLOR[ch.role] }}>
+                  {ch.role.toUpperCase()}
+                </span>
+                <span className="fgl-chan-band">{ch.label}</span>
+              </button>
+            ))}
+      </div>
+      {model.canComposite && (
+        <button
+          type="button"
+          className={`fgl-rgbtoggle${model.mode === 'rgb' ? ' on' : ''}`}
+          aria-pressed={model.mode === 'rgb'}
+          onClick={() => onMode(model.mode === 'single' ? 'rgb' : 'single')}
+        >
+          RGB
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** A docked inspector panel definition — the registry the shell maps over (so a
+ *  future Frames model can add sections without a layout rewrite). */
+interface InspectorPanel {
+  id: PanelId;
+  title: string;
+  icon: ReactNode;
+  body: ReactNode;
+}
+
+/** How the inspector renders: docked (resizable), shelved to its icon rail (wide),
+ *  or shelved-with-overlay (narrow viewports). */
+type InspectorMode = 'docked' | 'shelved' | 'narrow';
+
+/** The docked right inspector: stacked, independently-collapsible panels; a
+ *  shelf-to-icon-rail control; and (on narrow viewports) an overlay drawer. */
+function Inspector({
+  panels,
+  mode,
+  narrowOpen,
+  collapsed,
+  onCollapseInspector,
+  onExpandInspector,
+  onShelfIcon,
+  onToggleCollapse,
+  onCloseOverlay,
+}: {
+  panels: InspectorPanel[];
+  mode: InspectorMode;
+  narrowOpen: boolean;
+  collapsed: Record<string, boolean>;
+  onCollapseInspector: () => void;
+  onExpandInspector: () => void;
+  onShelfIcon: (id: PanelId) => void;
+  onToggleCollapse: (id: string) => void;
+  onCloseOverlay: () => void;
+}): JSX.Element {
+  const docked = (overlay: boolean): JSX.Element => (
+    <aside className={`fgl-inspector${overlay ? ' overlay' : ''}`}>
+      <div className="fgl-inspector-head">
+        <span className="fgl-inspector-ttl">Inspector</span>
+        <button
+          type="button"
+          className="fgl-shelf-btn"
+          title={overlay ? 'Close' : 'Collapse inspector'}
+          aria-label={overlay ? 'Close inspector' : 'Collapse inspector'}
+          onClick={overlay ? onCloseOverlay : onCollapseInspector}
+        >
+          {overlay ? '×' : '⟩'}
+        </button>
+      </div>
+      <div className="fgl-inspector-body">
+        {panels.map((p) => {
+          const c = collapsed[p.id] === true;
+          return (
+            <section key={p.id} className={`fgl-panel${c ? ' collapsed' : ''}`}>
+              <button type="button" className="fgl-panel-head" aria-expanded={!c} onClick={() => onToggleCollapse(p.id)}>
+                <span className="fgl-win-ttl">{p.title}</span>
+                <span className="fgl-chev">▾</span>
+              </button>
+              {!c && <div className="fgl-panel-body">{p.body}</div>}
+            </section>
+          );
+        })}
+      </div>
+    </aside>
+  );
+
+  if (mode === 'docked') return docked(false);
+
+  const shelf = (
+    <div className="fgl-inspector shelved">
+      <button
+        type="button"
+        className="fgl-shelf-btn fgl-shelf-top"
+        title="Expand inspector"
+        aria-label="Expand inspector"
+        onClick={onExpandInspector}
+      >
+        ⟨
+      </button>
+      {panels.map((p) => (
+        <button
+          key={p.id}
+          type="button"
+          className="fgl-shelf-btn"
+          title={p.title}
+          aria-label={p.title}
+          onClick={() => onShelfIcon(p.id)}
+        >
+          {p.icon}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (mode === 'narrow' && narrowOpen) {
+    return (
+      <>
+        {shelf}
+        <div className="fgl-inspector-backdrop" onClick={onCloseOverlay} />
+        {docked(true)}
+      </>
+    );
+  }
+  return shelf;
 }
 
 /**
@@ -897,7 +1267,13 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     const base = defaultExplorerState(bands, initialView);
     return urlState !== null ? applyShareToState(base, urlState, bands) : base;
   });
-  const [collapsed, setCollapsed] = useState(false);
+  // Inspector/shell chrome (width + collapse + shelve), persisted globally; the
+  // view state above is never persisted (that stays the on-demand share link's job).
+  const [layout, setLayout] = useState<LayoutState>(() => parseLayoutState(readLayoutRaw()));
+  // Narrow viewports auto-shelve the inspector to its icon rail; opening a panel
+  // then floats it as an overlay (`narrowOpen`) instead of crushing the canvas.
+  const [narrow, setNarrow] = useState(false);
+  const [narrowOpen, setNarrowOpen] = useState(false);
   const [readyTick, setReadyTick] = useState(0);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [headerOpen, setHeaderOpen] = useState(false);
@@ -924,6 +1300,68 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   // inventory changes (a new config); a live scan still refines on the next frame.
   useEffect(() => {
     setHistos(precomputedHistos(bands));
+  }, [bands]);
+
+  // Persist the inspector/shell chrome whenever it changes (fail-safe; private mode
+  // or quota just means it doesn't stick). The read happens once in the initializer.
+  useEffect(() => {
+    try {
+      if (typeof window === 'undefined' || window.localStorage == null) return;
+      window.localStorage.setItem(LAYOUT_KEY, serializeLayoutState(layout));
+    } catch {
+      /* no-op: storage unavailable */
+    }
+  }, [layout]);
+
+  // Track the narrow-viewport breakpoint. jsdom lacks matchMedia, so the guard keeps
+  // `narrow` false in tests (desktop-docked path) — no behavioural change there.
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia(NARROW_QUERY);
+    const onChange = (): void => {
+      setNarrow(mq.matches);
+      if (!mq.matches) setNarrowOpen(false); // leaving narrow: don't keep a stale overlay armed
+    };
+    onChange();
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  // Tear down an in-flight gutter drag if the component unmounts mid-resize, so the
+  // window listeners + body cursor never leak (the drag's own `up` handler clears it).
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => dragCleanupRef.current?.(), []);
+
+  // Keyboard shortcuts: 1–9 select a band (drops RGB→single for fast blink
+  // inspection); M toggles the ruler; Esc returns to pan / closes the overlay.
+  // Suppressed while typing in a field or when a modifier is held. Re-subscribed on
+  // a band-inventory change so the number→band map stays current.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const t = e.target;
+      if (
+        t instanceof HTMLElement &&
+        (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.key >= '1' && e.key <= '9') {
+        const b = bands[e.key.charCodeAt(0) - 49]; // '1' → index 0
+        if (b !== undefined) {
+          e.preventDefault();
+          setState((s) => ({ ...s, mode: 'single', band: b.name }));
+        }
+      } else if (e.key === 'm' || e.key === 'M') {
+        e.preventDefault();
+        setState((s) => ({ ...s, tool: s.tool === 'ruler' ? 'pan' : 'ruler' }));
+      } else if (e.key === 'Escape') {
+        setState((s) => (s.tool === 'pan' ? s : { ...s, tool: 'pan' }));
+        setNarrowOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, [bands]);
 
   const viewerConfig = useMemo(() => deriveViewerConfig(bands, state), [bands, state]);
@@ -1001,12 +1439,13 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   useEffect(() => {
     const h = handle.current;
     if (h === null || readyTick === 0) return;
-    h.setTool(state.ruler ? rulerTool : null);
-    if (!state.ruler && readout.ruler !== null) {
+    const rulerOn = state.tool === 'ruler';
+    h.setTool(rulerOn ? rulerTool : null);
+    if (!rulerOn && readout.ruler !== null) {
       readout.ruler = null;
       emitReadout(readout);
     }
-  }, [state.ruler, rulerTool, readyTick, readout]);
+  }, [state.tool, rulerTool, readyTick, readout]);
 
   // Apply a shared link's camera once, after the first frame (the construction-time
   // fitToImage has run by then, so this overrides it to the shared sky position).
@@ -1108,43 +1547,49 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     }
   }, [state, readyTick, getViewer]);
 
+  // Auto-stretch the data in view to a percentile window (fractions 0–1; omit for
+  // the viewer default 1–99%), then read the applied range(s) + visible histogram
+  // back into the panel. Shared by `seed()` and the one-click Limits presets.
+  const applyAutoStretch = useCallback(
+    async (pLo?: number, pHi?: number): Promise<void> => {
+      const v = getViewer();
+      if (v === null) return;
+      const [auto, hist] = await Promise.all([v.autoStretch(pLo, pHi), v.visibleHistogram()]);
+      setLimits((prev) => {
+        if (auto === null) return prev;
+        const next = { ...prev };
+        if (auto.mode === 'single') next[state.band] = { min: auto.min, max: auto.max };
+        else
+          for (const role of ['r', 'g', 'b'] as const) {
+            const r = auto[role];
+            if (r !== null) next[state.rgb[role]] = { min: r[0], max: r[1] };
+          }
+        return next;
+      });
+      setHistos((prev) => {
+        if (hist === null) return prev;
+        const next = { ...prev };
+        if (hist.mode === 'single') next[state.band] = hist.band;
+        else {
+          if (hist.r !== null) next[state.rgb.r] = hist.r;
+          if (hist.g !== null) next[state.rgb.g] = hist.g;
+          if (hist.b !== null) next[state.rgb.b] = hist.b;
+        }
+        return next;
+      });
+    },
+    [getViewer, state.band, state.rgb.r, state.rgb.g, state.rgb.b],
+  );
+
   const seed = useCallback(async (): Promise<void> => {
     const v = getViewer();
     if (v === null) return;
-    // Trilogy drives its levels from precomputed global stats; still seed the
-    // panel histograms below for display. Fall through to percentile only when
-    // trilogy could not apply (mode mid-switch or no precomputed stats).
+    // Trilogy drives its levels from precomputed global stats (no per-channel
+    // sliders, hence no histogram readback). Fall through to the percentile
+    // auto-stretch only when trilogy could not apply (mode mid-switch / no stats).
     const trilogyApplied = state.stretch === 'trilogy' && applyTrilogyFromStats(v);
-    // Trilogy has no per-channel limit sliders, so skip the percentile auto-stretch
-    // AND the histogram readback when it applied (in the weighted composite the
-    // histogram would describe the wrong band — the panel doesn't show it anyway).
-    const [auto, hist] = await Promise.all([
-      trilogyApplied ? Promise.resolve(null) : v.autoStretch(),
-      trilogyApplied ? Promise.resolve(null) : v.visibleHistogram(),
-    ]);
-    setLimits((prev) => {
-      if (auto === null) return prev;
-      const next = { ...prev };
-      if (auto.mode === 'single') next[state.band] = { min: auto.min, max: auto.max };
-      else
-        for (const role of ['r', 'g', 'b'] as const) {
-          const r = auto[role];
-          if (r !== null) next[state.rgb[role]] = { min: r[0], max: r[1] };
-        }
-      return next;
-    });
-    setHistos((prev) => {
-      if (hist === null) return prev;
-      const next = { ...prev };
-      if (hist.mode === 'single') next[state.band] = hist.band;
-      else {
-        if (hist.r !== null) next[state.rgb.r] = hist.r;
-        if (hist.g !== null) next[state.rgb.g] = hist.g;
-        if (hist.b !== null) next[state.rgb.b] = hist.b;
-      }
-      return next;
-    });
-  }, [getViewer, state.mode, state.band, state.rgb.r, state.rgb.g, state.rgb.b, state.stretch, applyTrilogyFromStats]);
+    if (!trilogyApplied) await applyAutoStretch();
+  }, [getViewer, state.stretch, applyTrilogyFromStats, applyAutoStretch]);
 
   const onFrame = (info: ViewerFrameInfo): void => {
     // Same change-guard the old setState had: a pan (level/zoom/northUp all
@@ -1195,10 +1640,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
       }
     }
   };
-  const hasZscale =
-    state.mode === 'single'
-      ? zscaleOf(state.band) !== undefined
-      : (['r', 'g', 'b'] as const).some((role) => zscaleOf(state.rgb[role]) !== undefined);
+  const hasZscale = hasZscalePreset(bands, state);
 
   // Build a shareable link to the CURRENT view on demand (the right-click menu),
   // sky-anchoring the camera so the link survives a rebuild. The URL is never
@@ -1241,12 +1683,251 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const containerStyle =
     props.style === undefined ? ROOT_STYLE : { ...ROOT_STYLE, ...props.style };
 
-  // Right-click over the image opens the share menu; over the control panel the
-  // native menu is left alone (so inputs keep paste/select).
+  // Right-click over the canvas opens the share menu. The inspector + rails are
+  // outside the stage now, so this only ever fires over real image pixels.
   const onStageContextMenu = (e: ReactMouseEvent): void => {
-    if ((e.target as HTMLElement).closest('.fgl-win') !== null) return;
     e.preventDefault();
     setMenu({ x: e.clientX, y: e.clientY });
+  };
+
+  // ---- band rail + inspector handlers ---------------------------------------
+  const rail = bandRailModel(bands, state);
+  const pickBand = (name: string): void => setState((s) => ({ ...s, mode: 'single', band: name }));
+  const toggleCollapse = (id: string): void =>
+    setLayout((l) => ({ ...l, collapsed: { ...l.collapsed, [id]: !(l.collapsed[id] === true) } }));
+  // Reveal a panel: un-shelve + un-collapse it (and pop the overlay on narrow).
+  const openPanel = (id: PanelId): void => {
+    setLayout((l) => ({ ...l, shelved: false, collapsed: { ...l.collapsed, [id]: false } }));
+    if (narrow) setNarrowOpen(true);
+  };
+  const setMode = (mode: 'single' | 'rgb'): void => {
+    setState((s) => ({ ...s, mode }));
+    if (mode === 'rgb') openPanel('composite'); // entering RGB reveals its setup
+  };
+  const collapseInspector = (): void => {
+    if (narrow) setNarrowOpen(false);
+    else setLayout((l) => ({ ...l, shelved: true }));
+  };
+  const expandInspector = (): void => {
+    if (narrow) setNarrowOpen(true);
+    else setLayout((l) => ({ ...l, shelved: false }));
+  };
+  // Drag the gutter to resize the inspector (clamped + persisted). Dragging left
+  // (decreasing clientX) widens it, since the inspector sits to the gutter's right.
+  const onGutterDown = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = layout.width;
+    const move = (ev: PointerEvent): void =>
+      setLayout((l) => {
+        const next = clampInspectorWidth(startW + (startX - ev.clientX));
+        return l.width === next ? l : { ...l, width: next };
+      });
+    const up = (): void => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      document.body.style.cursor = '';
+      dragCleanupRef.current = null;
+    };
+    dragCleanupRef.current = up;
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    document.body.style.cursor = 'col-resize';
+  };
+  // Keyboard resize: ArrowLeft widens (gutter sits left of the inspector), ArrowRight
+  // narrows; Shift = coarse. Mirrors the drag direction + clamp.
+  const onGutterKey = (e: ReactKeyboardEvent<HTMLDivElement>): void => {
+    const step = e.shiftKey ? 24 : 8;
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      setLayout((l) => ({ ...l, width: clampInspectorWidth(l.width + step) }));
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      setLayout((l) => ({ ...l, width: clampInspectorWidth(l.width - step) }));
+    }
+  };
+
+  const savePng = (): void => {
+    const url = handle.current?.exportPNG();
+    if (url === null || url === undefined) return;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(title ?? 'fitsgl').replace(/\s+/g, '_')}.png`;
+    a.click();
+  };
+
+  // ---- inspector panel registry (the shell maps over this) ------------------
+  const triMissing = activeBands.some((n) => bands.find((b) => b.name === n)?.trilogy === undefined);
+  const fineCollapsed = layout.collapsed['display.fine'] === true;
+
+  const displayBody = (
+    <>
+      <div className="fgl-sub">
+        <span className="fgl-cap">Scale</span>
+        <ScaleButtons value={state.stretch} onChange={(m) => setState((s) => ({ ...s, stretch: m }))} />
+      </div>
+
+      <div className="fgl-sub">
+        <span className="fgl-cap">Limits</span>
+        {state.stretch === 'trilogy' ? (
+          <div className="fgl-note">Levels set from precomputed trilogy stats.</div>
+        ) : (
+          <div className="fgl-presets">
+            <button type="button" className="fgl-preset" onClick={() => void applyAutoStretch()}>
+              auto
+            </button>
+            {hasZscale && (
+              <button type="button" className="fgl-preset" title="Whole-image DS9/IRAF zscale cuts" onClick={applyZscale}>
+                zscale
+              </button>
+            )}
+            <button type="button" className="fgl-preset" title="Full data min–max in view" onClick={() => void applyAutoStretch(0, 1)}>
+              minmax
+            </button>
+            <button type="button" className="fgl-preset" title="0.25–99.75% in view" onClick={() => void applyAutoStretch(0.0025, 0.9975)}>
+              99.5%
+            </button>
+          </div>
+        )}
+      </div>
+
+      {state.mode === 'single' && (
+        <div className="fgl-sub">
+          <span className="fgl-cap">Colormap</span>
+          <ColormapSwatches value={state.colormap} onChange={(name) => setState((s) => ({ ...s, colormap: name }))} />
+          {state.stretch !== 'trilogy' &&
+            (() => {
+              const lim =
+                limits[state.band] ??
+                (histos[state.band] !== undefined
+                  ? { min: histos[state.band]!.lo, max: histos[state.band]!.hi }
+                  : undefined);
+              return lim !== undefined ? (
+                <Colorbar min={lim.min} max={lim.max} mode={state.stretch} colormap={state.colormap} />
+              ) : null;
+            })()}
+        </div>
+      )}
+
+      <div className={`fgl-disclose${fineCollapsed ? ' collapsed' : ''}`}>
+        <button
+          type="button"
+          className="fgl-disclose-head"
+          aria-expanded={!fineCollapsed}
+          onClick={() => toggleCollapse('display.fine')}
+        >
+          <span className="fgl-cap">Fine adjustment</span>
+          <span className="fgl-chev">▾</span>
+        </button>
+        {!fineCollapsed && (
+          <div className="fgl-disclose-body">
+            {state.stretch === 'trilogy' ? (
+              <TrilogyControls
+                params={state.trilogyParams}
+                missing={triMissing}
+                onChange={(patch) => setState((s) => ({ ...s, trilogyParams: { ...s.trilogyParams, ...patch } }))}
+              />
+            ) : state.mode === 'single' ? (
+              <LimitsControl
+                histo={histos[state.band]}
+                value={limits[state.band]}
+                color="#e0ad4d"
+                label={bands.find((b) => b.name === state.band)?.label ?? state.band}
+                onChange={(min, max) => setLimit(state.band, min, max)}
+              />
+            ) : (
+              (['r', 'g', 'b'] as const).map((role) => {
+                const bn = state.rgb[role];
+                return (
+                  <LimitsControl
+                    key={role}
+                    histo={histos[bn]}
+                    value={limits[bn]}
+                    color={CH_COLOR[role]}
+                    label={`${role.toUpperCase()} · ${bands.find((b) => b.name === bn)?.label ?? bn}`}
+                    onChange={(min, max) => setLimit(bn, min, max, role)}
+                  />
+                );
+              })
+            )}
+          </div>
+        )}
+      </div>
+    </>
+  );
+
+  const compositeBody =
+    state.mode === 'single' ? (
+      <div className="fgl-note">Switch to RGB (band rail) to composite co-gridded bands into colour.</div>
+    ) : state.stretch === 'trilogy' ? (
+      <TrilogyWeightMatrix
+        bands={bands}
+        state={state}
+        onApply={(entries) =>
+          setState((s) => {
+            const weights = { ...s.weights };
+            for (const e of entries) weights[e.band] = e.weight;
+            return { ...s, weights, weightBands: entries.map((e) => e.band) };
+          })
+        }
+        onRainbow={() =>
+          setState((s) => {
+            const patch = rainbowAction(bands, rgbActiveGroup(bands, s.rgb));
+            return { ...s, weights: { ...s.weights, ...patch.weights }, weightBands: patch.weightBands };
+          })
+        }
+      />
+    ) : (
+      <>
+        <RgbGrid
+          bands={bands}
+          rgb={state.rgb}
+          onPick={(role, band) => setState((s) => ({ ...s, rgb: { ...s.rgb, [role]: band } }))}
+        />
+        <div className="fgl-note">RGB requires co-gridded bands — cross-grid filters grey out.</div>
+      </>
+    );
+
+  const viewBody = (
+    <>
+      <ToggleSwitch
+        label="North up"
+        on={state.northUp}
+        onToggle={() => setState((s) => ({ ...s, northUp: !s.northUp }))}
+      />
+      <ToggleSwitch
+        label="Coordinate grid"
+        on={state.graticule}
+        onToggle={() => setState((s) => ({ ...s, graticule: !s.graticule }))}
+      />
+      <ToggleSwitch
+        label="Catalog overlay"
+        on={state.overlay}
+        disabled={markers.length === 0}
+        onToggle={() => setState((s) => ({ ...s, overlay: !s.overlay }))}
+      />
+      <div className="fgl-sub">
+        <span className="fgl-cap">Go to</span>
+        <GotoBox onGo={goTo} />
+      </div>
+    </>
+  );
+
+  const panels: InspectorPanel[] = [
+    { id: 'display', title: 'Display', icon: <IconDisplay />, body: displayBody },
+    { id: 'composite', title: 'Composite', icon: <IconComposite />, body: compositeBody },
+    { id: 'view', title: 'View', icon: <IconView />, body: viewBody },
+  ];
+
+  const inspectorMode: InspectorMode = narrow ? 'narrow' : layout.shelved ? 'shelved' : 'docked';
+  // Docked: 4 tracks — the resize gutter <div> is the 3rd in-flow child. Shelved/narrow:
+  // the gutter isn't rendered, so use a 3-track template; otherwise the shelf rail (the
+  // 3rd in-flow child) auto-places into the gutter track and a 4th empty track strands it.
+  const shellStyle: CSSProperties = {
+    gridTemplateColumns:
+      inspectorMode === 'docked'
+        ? `auto minmax(0,1fr) 6px ${layout.width}px`
+        : 'auto minmax(0,1fr) 38px',
   };
 
   return (
@@ -1257,269 +1938,72 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
       {headerOpen && headerUrl !== null && (
         <HeaderPanel url={headerUrl} title={headerLabel} onClose={() => setHeaderOpen(false)} />
       )}
-      <div className="fgl-stage" onContextMenu={onStageContextMenu}>
-        <FitsViewer
-          config={viewerConfig}
-          ref={handle}
-          tileOptions={props.tileOptions}
-          textureBudget={props.textureBudget}
-          hiDpiLevels={props.hiDpiLevels}
-          markerTooltip={props.markerTooltip}
-          onMarkerClick={props.onMarkerClick}
-          onCursor={onCursor}
-          onFrame={onFrame}
-          onReady={() => setReadyTick((t) => t + 1)}
-          onError={(e) => {
-            setLoading(false);
-            props.onError?.(e);
-          }}
-        >
-          {state.graticule && <Graticule getViewer={getViewer} store={readout} />}
-          {state.ruler && <RulerOverlay getViewer={getViewer} store={readout} />}
-          <FitsLoadingField active={loading} />
-          <div className={`fgl-win${collapsed ? ' collapsed' : ''}`}>
-            <div className="fgl-win-head" onClick={() => setCollapsed((c) => !c)}>
-              <span className="fgl-win-ttl">Display</span>
-              <span className="fgl-chev">▾</span>
-            </div>
-            <div className="fgl-win-body">
-              {/* go to coordinates */}
-              <div className="fgl-sec">
-                <span className="fgl-cap">Go to</span>
-                <GotoBox onGo={goTo} />
-              </div>
-
-              {/* layers */}
-              <div className="fgl-sec">
-                <span className="fgl-cap">Layers</span>
-                <div className="fgl-seg">
-                  {(['single', 'rgb'] as const).map((m) => (
-                    <button
-                      key={m}
-                      type="button"
-                      aria-pressed={state.mode === m}
-                      onClick={() => setState((s) => ({ ...s, mode: m }))}
-                    >
-                      {m === 'single' ? 'Single' : 'RGB'}
-                    </button>
-                  ))}
-                </div>
-                {state.mode === 'single' ? (
-                  <div className="fgl-sel" style={{ marginTop: 9 }}>
-                    <select
-                      value={state.band}
-                      onChange={(e) => setState((s) => ({ ...s, band: e.target.value }))}
-                    >
-                      {bands.map((b) => (
-                        <option key={b.name} value={b.name}>
-                          {b.label ?? b.name}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                ) : state.stretch === 'trilogy' ? (
-                  <div className="fgl-note" style={{ marginTop: 11 }}>
-                    Trilogy composite — choose bands &amp; weights under Scaling below.
-                  </div>
-                ) : (
-                  <div style={{ marginTop: 11 }}>
-                    <RgbGrid
-                      bands={bands}
-                      rgb={state.rgb}
-                      onPick={(role, band) => setState((s) => ({ ...s, rgb: { ...s.rgb, [role]: band } }))}
-                    />
-                    <div className="fgl-note">RGB requires co-gridded bands — cross-grid filters grey out.</div>
-                  </div>
-                )}
-              </div>
-
-              {/* scaling */}
-              <div className="fgl-sec">
-                <span className="fgl-cap">Scaling</span>
-                <div className="fgl-row">
-                  <span className="fgl-cap-inline">Stretch</span>
-                  <div className="fgl-sel">
-                    <select
-                      value={state.stretch}
-                      onChange={(e) => setState((s) => ({ ...s, stretch: e.target.value as StretchMode }))}
-                    >
-                      {STRETCH_MODES.map((m) => (
-                        <option key={m} value={m}>
-                          {m}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                <div className="fgl-limits">
-                  {state.stretch === 'trilogy' ? (
-                    <>
-                      {state.mode === 'rgb' && (
-                        <TrilogyWeightMatrix
-                          bands={bands}
-                          state={state}
-                          onApply={(entries) =>
-                            setState((s) => {
-                              const weights = { ...s.weights };
-                              for (const e of entries) weights[e.band] = e.weight;
-                              return { ...s, weights, weightBands: entries.map((e) => e.band) };
-                            })
-                          }
-                          onRainbow={() =>
-                            setState((s) => {
-                              const patch = rainbowAction(bands, rgbActiveGroup(bands, s.rgb));
-                              return { ...s, weights: { ...s.weights, ...patch.weights }, weightBands: patch.weightBands };
-                            })
-                          }
-                        />
-                      )}
-                      <TrilogyControls
-                        params={state.trilogyParams}
-                        missing={activeBandNames(state).some(
-                          (n) => bands.find((b) => b.name === n)?.trilogy === undefined,
-                        )}
-                        onChange={(patch) =>
-                          setState((s) => ({ ...s, trilogyParams: { ...s.trilogyParams, ...patch } }))
-                        }
-                      />
-                    </>
-                  ) : state.mode === 'single' ? (
-                    <LimitsControl
-                      histo={histos[state.band]}
-                      value={limits[state.band]}
-                      color="#e0ad4d"
-                      label={bands.find((b) => b.name === state.band)?.label ?? state.band}
-                      onChange={(min, max) => setLimit(state.band, min, max)}
-                    />
-                  ) : (
-                    (['r', 'g', 'b'] as const).map((role) => {
-                      const bn = state.rgb[role];
-                      return (
-                        <LimitsControl
-                          key={role}
-                          histo={histos[bn]}
-                          value={limits[bn]}
-                          color={CH_COLOR[role]}
-                          label={`${role.toUpperCase()} · ${bands.find((b) => b.name === bn)?.label ?? bn}`}
-                          onChange={(min, max) => setLimit(bn, min, max, role)}
-                        />
-                      );
-                    })
-                  )}
-                  {state.stretch !== 'trilogy' && (
-                    <div className="fgl-btn-row" style={{ marginTop: 3 }}>
-                      <button type="button" className="fgl-auto" onClick={() => void seed()}>
-                        Auto-stretch visible
-                      </button>
-                      {hasZscale && (
-                        <button type="button" className="fgl-auto" onClick={applyZscale} title="Whole-image DS9/IRAF zscale cuts">
-                          zscale
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {state.mode === 'single' && (
-                  <>
-                    <div className="fgl-row" style={{ marginTop: 11 }}>
-                      <span className="fgl-cap-inline">Colormap</span>
-                      <ColormapDropdown
-                        value={state.colormap}
-                        onChange={(name) => setState((s) => ({ ...s, colormap: name }))}
-                      />
-                    </div>
-                    {state.stretch !== 'trilogy' &&
-                      (() => {
-                        const lim =
-                          limits[state.band] ??
-                          (histos[state.band] !== undefined
-                            ? { min: histos[state.band]!.lo, max: histos[state.band]!.hi }
-                            : undefined);
-                        return lim !== undefined ? (
-                          <Colorbar
-                            min={lim.min}
-                            max={lim.max}
-                            mode={state.stretch}
-                            colormap={state.colormap}
-                          />
-                        ) : null;
-                      })()}
-                  </>
-                )}
-              </div>
-
-              {/* view */}
-              <div className="fgl-sec">
-                <span className="fgl-cap">View</span>
-                <div
-                  className={`fgl-tg${state.northUp ? ' on' : ''}`}
-                  onClick={() => setState((s) => ({ ...s, northUp: !s.northUp }))}
-                >
-                  <span className="fgl-tx">North up</span>
-                  <span className="fgl-switch" />
-                </div>
-                <div className="fgl-row" />
-                <div
-                  className={`fgl-tg${state.graticule ? ' on' : ''}`}
-                  onClick={() => setState((s) => ({ ...s, graticule: !s.graticule }))}
-                >
-                  <span className="fgl-tx">Coordinate grid</span>
-                  <span className="fgl-switch" />
-                </div>
-                <div className="fgl-row" />
-                <div
-                  className={`fgl-tg${state.overlay ? ' on' : ''}${markers.length === 0 ? ' off' : ''}`}
-                  onClick={() => markers.length > 0 && setState((s) => ({ ...s, overlay: !s.overlay }))}
-                >
-                  <span className="fgl-tx">Catalog overlay</span>
-                  <span className="fgl-switch" />
-                </div>
-              </div>
-
-              {/* tools */}
-              <div className="fgl-sec">
-                <span className="fgl-cap">Tools</span>
-                <div
-                  className={`fgl-tg${state.ruler ? ' on' : ''}`}
-                  onClick={() => setState((s) => ({ ...s, ruler: !s.ruler }))}
-                >
-                  <span className="fgl-tx">Ruler</span>
-                  <span className="fgl-switch" />
-                </div>
-                <div className="fgl-note">Drag across the image to measure separation &amp; position angle.</div>
-              </div>
-
-              <div className="fgl-sec">
-                <div className="fgl-btn-row">
-                  <button type="button" className="fgl-reset" onClick={() => handle.current?.fitToImage()}>
-                    Fit to image
-                  </button>
-                  <button
-                    type="button"
-                    className="fgl-reset"
-                    onClick={() => {
-                      const url = handle.current?.exportPNG();
-                      if (url === null || url === undefined) return;
-                      const a = document.createElement('a');
-                      a.href = url;
-                      a.download = `${(title ?? 'fitsgl').replace(/\s+/g, '_')}.png`;
-                      a.click();
-                    }}
-                  >
-                    Save PNG
-                  </button>
-                  {headerUrl !== null && (
-                    <button type="button" className="fgl-reset" onClick={() => setHeaderOpen(true)}>
-                      Header
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
+      <div className="fgl-shell" style={shellStyle}>
+        <ToolRail
+          tool={state.tool}
+          onTool={(t) => setState((s) => ({ ...s, tool: t }))}
+          onFit={() => handle.current?.fitToImage()}
+          onSavePng={savePng}
+          onHeader={() => setHeaderOpen(true)}
+          hasHeader={headerUrl !== null}
+        />
+        <div className="fgl-main">
+          {rail.show && (
+            <BandRail
+              model={rail}
+              onPickBand={pickBand}
+              onMode={setMode}
+              onOpenComposite={() => openPanel('composite')}
+            />
+          )}
+          <div className="fgl-stage" onContextMenu={onStageContextMenu}>
+            <FitsViewer
+              config={viewerConfig}
+              ref={handle}
+              tileOptions={props.tileOptions}
+              textureBudget={props.textureBudget}
+              hiDpiLevels={props.hiDpiLevels}
+              markerTooltip={props.markerTooltip}
+              onMarkerClick={props.onMarkerClick}
+              onCursor={onCursor}
+              onFrame={onFrame}
+              onReady={() => setReadyTick((t) => t + 1)}
+              onError={(e) => {
+                setLoading(false);
+                props.onError?.(e);
+              }}
+            >
+              {state.graticule && <Graticule getViewer={getViewer} store={readout} />}
+              {state.tool === 'ruler' && <RulerOverlay getViewer={getViewer} store={readout} />}
+              <FitsLoadingField active={loading} />
+            </FitsViewer>
           </div>
-        </FitsViewer>
+        </div>
+        {inspectorMode === 'docked' && (
+          <div
+            className="fgl-gutter"
+            onPointerDown={onGutterDown}
+            onKeyDown={onGutterKey}
+            tabIndex={0}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize inspector"
+            aria-valuemin={INSPECTOR_MIN_WIDTH}
+            aria-valuemax={INSPECTOR_MAX_WIDTH}
+            aria-valuenow={layout.width}
+          />
+        )}
+        <Inspector
+          panels={panels}
+          mode={inspectorMode}
+          narrowOpen={narrowOpen}
+          collapsed={layout.collapsed}
+          onCollapseInspector={collapseInspector}
+          onExpandInspector={expandInspector}
+          onShelfIcon={openPanel}
+          onToggleCollapse={toggleCollapse}
+          onCloseOverlay={() => setNarrowOpen(false)}
+        />
       </div>
 
       {/* status bar */}
@@ -1541,6 +2025,10 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
         <span className="fgl-item">
           <i>stretch</i>
           <b>{state.stretch}</b>
+        </span>
+        <span className="fgl-item">
+          <i>tool</i>
+          <b>{state.tool}</b>
         </span>
         <span className="fgl-spacer" />
         <StatusReadout store={readout} />
@@ -1886,38 +2374,105 @@ function ensureStyles(): void {
 }
 
 const STYLE_CSS = `
+/* ---- tokens (unchanged visual language) -------------------------------- */
 .fgl-explorer{--win:#0e1320;--inset:#080b12;--line:rgba(150,170,210,.11);--line2:rgba(150,170,210,.2);
   --text:#cdd5e3;--dim:#828ca3;--faint:#566073;--gold:#e0ad4d;--gold-d:#7d6630;
   --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
   color:var(--text);font-family:var(--mono);font-size:12.5px;}
 .fgl-explorer *{box-sizing:border-box;}
-.fgl-stage{flex:1;position:relative;min-height:0;}
-.fgl-win{position:absolute;top:13px;left:13px;width:300px;z-index:5;
-  background:color-mix(in srgb,var(--win) 94%,transparent);border:1px solid var(--line2);border-radius:5px;
-  backdrop-filter:blur(8px);box-shadow:0 10px 30px rgba(0,0,0,.45);}
-.fgl-win-head{display:flex;align-items:center;justify-content:space-between;padding:9px 12px;cursor:pointer;
-  user-select:none;border-bottom:1px solid var(--line);}
-.fgl-win.collapsed .fgl-win-head{border-bottom:0;}
-.fgl-win-ttl{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);}
 .fgl-chev{color:var(--gold);font-size:10px;transition:transform .2s;}
-.fgl-win.collapsed .fgl-chev{transform:rotate(-90deg);}
-.fgl-win.collapsed .fgl-win-body{display:none;}
-.fgl-win-body{max-height:calc(100% - 40px);overflow-y:auto;}
-.fgl-sec{padding:13px;border-bottom:1px solid var(--line);}
-.fgl-sec:last-child{border-bottom:0;}
+.fgl-win-ttl{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);}
 .fgl-cap{display:block;font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);margin-bottom:9px;}
-.fgl-cap-inline{font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);min-width:52px;}
-.fgl-row{display:flex;align-items:center;gap:9px;}
+
+/* ---- app shell: tool-rail | main(band-rail + canvas) | gutter | inspector */
+.fgl-shell{flex:1;min-height:0;display:grid;position:relative;}
+.fgl-main{display:flex;flex-direction:column;min-width:0;min-height:0;position:relative;}
+.fgl-stage{flex:1;position:relative;min-height:0;min-width:0;}
+
+/* ---- left tool rail (cursor modes + frame actions) --------------------- */
+.fgl-toolrail{display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 6px;
+  background:#0b0f18;border-right:1px solid var(--line2);}
+.fgl-toolgroup{display:flex;flex-direction:column;gap:4px;}
+.fgl-toolrail .fgl-toolgroup:last-child{border-top:1px solid var(--line);padding-top:8px;}
+.fgl-toolfill{flex:1;}
+.fgl-tool{width:30px;height:30px;display:flex;align-items:center;justify-content:center;background:transparent;
+  border:1px solid transparent;border-radius:5px;color:var(--dim);cursor:pointer;padding:0;}
+.fgl-tool:hover{color:var(--text);background:var(--inset);}
+.fgl-tool.on{color:var(--gold);border-color:var(--gold-d);background:rgba(224,173,77,.1);}
+
+/* ---- top band rail (Tier-0 identity) ---------------------------------- */
+.fgl-bandrail{flex:none;display:flex;align-items:center;gap:9px;padding:7px 11px;
+  background:#0b0f18;border-bottom:1px solid var(--line2);}
+.fgl-bandrail-cap{flex:none;font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);}
+.fgl-bandrail-list{flex:1;min-width:0;display:flex;align-items:center;gap:5px;flex-wrap:nowrap;overflow-x:auto;}
+.fgl-chip{flex:none;display:inline-flex;align-items:center;gap:5px;background:var(--inset);border:1px solid var(--line2);
+  border-radius:4px;color:var(--dim);font-family:var(--mono);font-size:11px;letter-spacing:.04em;padding:5px 9px;cursor:pointer;white-space:nowrap;}
+.fgl-chip:hover{color:var(--text);border-color:var(--dim);}
+.fgl-chip.on{background:var(--gold);border-color:var(--gold);color:#161003;font-weight:500;}
+.fgl-chip-key{font-size:8.5px;opacity:.55;font-variant-numeric:tabular-nums;}
+.fgl-chan{flex:none;display:inline-flex;align-items:center;gap:6px;background:var(--inset);border:1px solid var(--line2);
+  border-radius:4px;padding:4px 9px;cursor:pointer;white-space:nowrap;}
+.fgl-chan:hover{border-color:var(--dim);}
+.fgl-chan-role{font-size:10px;font-weight:700;letter-spacing:.06em;}
+.fgl-chan-band{font-size:11px;color:var(--text);}
+.fgl-rgbtoggle{flex:none;margin-left:auto;background:transparent;border:1px solid var(--line2);color:var(--dim);
+  font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer;}
+.fgl-rgbtoggle:hover{border-color:var(--gold-d);color:var(--gold);}
+.fgl-rgbtoggle.on{background:var(--gold);border-color:var(--gold);color:#161003;font-weight:600;}
+
+/* ---- resize gutter ---------------------------------------------------- */
+.fgl-gutter{cursor:col-resize;position:relative;background:transparent;outline:none;}
+.fgl-gutter::after{content:"";position:absolute;top:0;bottom:0;left:50%;width:1px;background:var(--line2);transform:translateX(-50%);}
+.fgl-gutter:hover::after{background:var(--gold-d);width:2px;}
+.fgl-gutter:focus-visible::after{background:var(--gold);width:2px;}
+
+/* ---- docked inspector + panels + shelf -------------------------------- */
+.fgl-inspector{display:flex;flex-direction:column;min-height:0;background:var(--win);border-left:1px solid var(--line2);overflow:hidden;}
+.fgl-inspector.shelved{align-items:center;gap:4px;padding:8px 0;background:#0b0f18;}
+.fgl-inspector.overlay{position:absolute;top:0;right:0;bottom:0;width:min(86vw,340px);z-index:30;box-shadow:-12px 0 40px rgba(0,0,0,.5);}
+.fgl-inspector-backdrop{position:absolute;inset:0;z-index:25;background:rgba(2,4,8,.4);}
+.fgl-inspector-head{flex:none;display:flex;align-items:center;justify-content:space-between;padding:9px 12px;border-bottom:1px solid var(--line2);}
+.fgl-inspector-ttl{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);}
+.fgl-inspector-body{flex:1;min-height:0;overflow-y:auto;}
+.fgl-shelf-btn{display:flex;align-items:center;justify-content:center;width:28px;height:28px;background:transparent;
+  border:1px solid transparent;border-radius:5px;color:var(--dim);cursor:pointer;padding:0;font-size:13px;}
+.fgl-shelf-btn:hover{color:var(--gold);background:var(--inset);}
+.fgl-shelf-top{margin-bottom:8px;}
+.fgl-panel{border-bottom:1px solid var(--line);}
+.fgl-panel-head{display:flex;align-items:center;justify-content:space-between;width:100%;padding:10px 12px;cursor:pointer;
+  user-select:none;background:transparent;border:0;font-family:var(--mono);color:inherit;text-align:left;}
+.fgl-panel.collapsed .fgl-chev{transform:rotate(-90deg);}
+.fgl-panel-body{padding:0 12px 14px;}
+.fgl-panel-body>.fgl-tg{padding:7px 0;}
+.fgl-panel-body>.fgl-note:first-child{margin-top:0;}
+.fgl-sub{margin-top:14px;}
+.fgl-sub:first-child{margin-top:11px;}
+.fgl-presets{display:flex;flex-wrap:wrap;gap:5px;}
+.fgl-preset{flex:1;min-width:54px;background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
+  font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:7px 6px;border-radius:4px;cursor:pointer;}
+.fgl-preset:hover{border-color:var(--gold-d);color:var(--gold);}
+.fgl-swatches{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;}
+.fgl-swatch{display:flex;flex-direction:column;gap:3px;background:transparent;border:1px solid var(--line2);border-radius:4px;padding:4px;cursor:pointer;}
+.fgl-swatch:hover{border-color:var(--dim);}
+.fgl-swatch.on{border-color:var(--gold);}
+.fgl-swatch-bar{height:14px;border-radius:2px;border:1px solid rgba(0,0,0,.3);}
+.fgl-swatch-nm{font-size:9px;color:var(--dim);text-align:center;letter-spacing:.02em;}
+.fgl-swatch.on .fgl-swatch-nm{color:var(--gold);}
+.fgl-disclose{margin-top:14px;border-top:1px solid var(--line);padding-top:11px;}
+.fgl-disclose-head{display:flex;align-items:center;justify-content:space-between;width:100%;cursor:pointer;user-select:none;
+  background:transparent;border:0;font-family:var(--mono);color:inherit;text-align:left;padding:0;}
+.fgl-disclose-head .fgl-cap{margin-bottom:0;}
+.fgl-disclose.collapsed .fgl-chev{transform:rotate(-90deg);}
+.fgl-disclose-body{margin-top:11px;}
+
+/* ---- segmented buttons (Scale) ---------------------------------------- */
 .fgl-seg{display:flex;gap:2px;background:var(--inset);border:1px solid var(--line);border-radius:4px;padding:2px;}
+.fgl-seg.fgl-seg-wrap{flex-wrap:wrap;}
 .fgl-seg button{flex:1;border:0;background:transparent;color:var(--dim);font-family:var(--mono);font-size:11px;
   letter-spacing:.06em;padding:6px 4px;border-radius:3px;cursor:pointer;}
+.fgl-seg.fgl-seg-wrap button{flex:1 0 auto;padding:6px 9px;}
 .fgl-seg button:hover{color:var(--text);}
 .fgl-seg button[aria-pressed="true"]{background:var(--gold);color:#161003;font-weight:500;}
-.fgl-sel{position:relative;flex:1;}
-.fgl-sel::after{content:"▾";position:absolute;right:11px;top:50%;transform:translateY(-50%);color:var(--gold);pointer-events:none;font-size:10px;}
-.fgl-sel select{width:100%;appearance:none;background:var(--inset);color:var(--text);border:1px solid var(--line2);
-  border-radius:4px;padding:8px 11px;font-family:var(--mono);font-size:12px;cursor:pointer;}
-.fgl-sel select:focus{outline:none;border-color:var(--gold-d);}
 .fgl-grid{display:grid;gap:6px 5px;align-items:center;}
 .fgl-bandhead{font-size:9px;color:var(--dim);text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .fgl-chlab{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;letter-spacing:.08em;}
@@ -1930,7 +2485,6 @@ const STYLE_CSS = `
 .fgl-radio.on::after{content:"";position:absolute;inset:3px;border-radius:50%;background:currentColor;}
 .fgl-radio.disabled{opacity:.16;cursor:not-allowed;}
 .fgl-note{margin-top:9px;font-size:9.5px;color:var(--faint);line-height:1.5;}
-.fgl-limits{margin-top:11px;}
 .fgl-dr{margin-bottom:11px;}
 .fgl-dr-head{display:flex;align-items:center;gap:7px;margin-bottom:5px;}
 .fgl-sw{width:7px;height:7px;border-radius:2px;}
@@ -1970,9 +2524,6 @@ const STYLE_CSS = `
 .fgl-range{position:absolute;left:0;right:0;bottom:-3px;width:100%;height:16px;margin:0;appearance:none;background:none;pointer-events:none;}
 .fgl-range::-webkit-slider-thumb{appearance:none;pointer-events:auto;width:10px;height:17px;border-radius:2px;background:var(--gold);border:1px solid #161003;cursor:ew-resize;}
 .fgl-range::-moz-range-thumb{pointer-events:auto;width:10px;height:17px;border-radius:2px;border:1px solid #161003;background:var(--gold);cursor:ew-resize;}
-.fgl-auto{width:100%;margin-top:3px;background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
-  font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:7px;border-radius:4px;cursor:pointer;}
-.fgl-auto:hover{border-color:var(--gold-d);color:var(--gold);}
 .fgl-tri{display:flex;flex-direction:column;gap:7px;}
 .fgl-tri-warn{font-size:9.5px;line-height:1.4;color:var(--gold);background:rgba(224,173,77,.08);
   border:1px solid var(--gold-d);border-radius:4px;padding:5px 7px;}
@@ -2009,31 +2560,14 @@ const STYLE_CSS = `
 .fgl-rainbow{background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
   font-size:9px;letter-spacing:.1em;text-transform:uppercase;padding:4px 9px;border-radius:4px;cursor:pointer;}
 .fgl-rainbow:hover{border-color:var(--gold-d);color:var(--gold);}
-.fgl-cm{position:relative;flex:1;}
-.fgl-cm-trigger{display:flex;align-items:center;gap:9px;width:100%;cursor:pointer;background:var(--inset);
-  border:1px solid var(--line2);border-radius:4px;padding:6px 9px;}
-.fgl-cm-bar{flex:1;height:13px;border-radius:2px;border:1px solid rgba(0,0,0,.3);}
-.fgl-cm-nm{font-size:11px;color:var(--text);min-width:54px;text-align:left;}
-.fgl-cm-menu{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:8;background:var(--win);
-  border:1px solid var(--line2);border-radius:4px;padding:4px;box-shadow:0 8px 20px rgba(0,0,0,.5);max-height:200px;overflow-y:auto;}
-.fgl-cm-opt{display:flex;align-items:center;gap:9px;padding:5px 6px;border-radius:3px;cursor:pointer;}
-.fgl-cm-opt:hover{background:rgba(150,170,210,.08);}
-.fgl-cm-opt.on{background:rgba(224,173,77,.12);}
-.fgl-cm-opt .fgl-cm-nm{color:var(--dim);}
-.fgl-cm-opt.on .fgl-cm-nm{color:var(--gold);}
-.fgl-tg{display:flex;align-items:center;justify-content:space-between;cursor:pointer;}
-.fgl-tg.off{opacity:.4;cursor:not-allowed;}
+.fgl-tg{display:flex;align-items:center;justify-content:space-between;cursor:pointer;width:100%;
+  background:transparent;border:0;font-family:var(--mono);color:inherit;text-align:left;padding:0;}
+.fgl-tg.off,.fgl-tg:disabled{opacity:.4;cursor:not-allowed;}
 .fgl-tx{font-size:11.5px;color:var(--text);letter-spacing:.03em;}
 .fgl-switch{width:34px;height:19px;border-radius:10px;background:var(--inset);border:1px solid var(--line2);position:relative;transition:.18s;flex:none;}
 .fgl-switch::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:var(--dim);transition:.18s;}
 .fgl-tg.on .fgl-switch{background:var(--gold);border-color:var(--gold);}
 .fgl-tg.on .fgl-switch::after{left:17px;background:#161003;}
-.fgl-reset{width:100%;background:transparent;border:1px solid var(--line2);color:var(--dim);font-family:var(--mono);
-  font-size:10px;letter-spacing:.14em;text-transform:uppercase;padding:9px;border-radius:4px;cursor:pointer;}
-.fgl-reset:hover{border-color:var(--gold-d);color:var(--gold);}
-.fgl-btn-row{display:flex;gap:7px;}
-.fgl-btn-row .fgl-reset{flex:1;}
-.fgl-btn-row .fgl-auto{flex:1;margin-top:0;}
 .fgl-goto{display:flex;gap:6px;}
 .fgl-goto-in{flex:1;min-width:0;background:var(--inset);border:1px solid var(--line2);border-radius:4px;color:var(--text);
   font-family:var(--mono);font-size:11px;padding:7px 8px;outline:none;}

@@ -74,6 +74,15 @@ export interface ExplorerDefaultView {
   northUp?: boolean;
 }
 
+/** Mutually-exclusive cursor mode the left tool rail selects (extensible: future
+ *  region/marker tools add members here and a rail button, wired through
+ *  `handle.setTool`). `'pan'` is the default (no pointer tool installed). */
+export type PointerToolMode = 'pan' | 'ruler';
+
+/** Inspector panel ids (the registry the shell maps over) + the one nested
+ *  disclosure (`display.fine`), used as keys in the persisted collapsed map. */
+export type PanelId = 'display' | 'composite' | 'view';
+
 /** The live, user-mutable view state the component holds. */
 export interface ExplorerState {
   mode: 'single' | 'rgb';
@@ -99,8 +108,8 @@ export interface ExplorerState {
   overlay: boolean;
   /** RA/Dec coordinate grid (graticule) overlay. */
   graticule: boolean;
-  /** Ruler / measure tool active (drag the image to measure distance + PA). */
-  ruler: boolean;
+  /** Active cursor mode (left tool rail). `'ruler'` measures distance + PA on drag. */
+  tool: PointerToolMode;
 }
 
 /** A band's grid group, defaulting to 0 (one group / single-grid dataset). */
@@ -207,7 +216,7 @@ export function defaultExplorerState(
     northUp: dv?.northUp ?? true,
     overlay: false,
     graticule: false,
-    ruler: false,
+    tool: 'pan',
   };
 }
 
@@ -384,4 +393,150 @@ export function defaultViewFromDataset(dataset: DatasetManifest): ExplorerDefaul
   const rgb = dataset.default_rgb;
   if (rgb === null) return { mode: 'single' };
   return { mode: 'rgb', r: rgb.r, g: rgb.g, b: rgb.b };
+}
+
+// ---------------------------------------------------------------------------
+// Band rail + tool + layout — pure UI-state decision logic for the app shell.
+// Kept here (not in explorer.tsx) so it unit-tests under Node, per the repo's
+// pure-logic / side-effect split. The band rail is modelled on the ACTIVE
+// SOURCE's bands (a "frame seam"): there is one source today, but a future
+// Frames model passes a different frame's bands/state to the same helpers with
+// no rail rewrite.
+// ---------------------------------------------------------------------------
+
+/** Whether any co-gridded group holds ≥2 bands — i.e. an RGB composite is
+ *  possible at all (the band rail shows its RGB toggle only when this is true). */
+export function canComposite(bands: readonly ExplorerBand[]): boolean {
+  const counts = new Map<number, number>();
+  for (const b of bands) {
+    const g = gridGroupOf(b);
+    counts.set(g, (counts.get(g) ?? 0) + 1);
+  }
+  for (const n of counts.values()) if (n >= 2) return true;
+  return false;
+}
+
+/** One selectable band chip in single mode. `keyHint` is the 1-based number-key
+ *  shortcut (1–9), or 0 when the band is past the 9th (no key bound). */
+export interface BandChip {
+  name: string;
+  label: string;
+  active: boolean;
+  keyHint: number;
+}
+
+/** The compact R/G/B → band mapping shown on the rail in RGB mode (selection +
+ *  mode only — detailed assignment lives in the inspector's Composite panel). */
+export interface BandRailChannel {
+  role: 'r' | 'g' | 'b';
+  name: string;
+  label: string;
+}
+
+/** Everything the band rail needs to render, derived from the active source's
+ *  inventory + view state. `show` is false for a single-band dataset (the rail
+ *  is hidden and the band name surfaces in the status bar instead). */
+export interface BandRailModel {
+  show: boolean;
+  mode: 'single' | 'rgb';
+  canComposite: boolean;
+  chips: BandChip[];
+  channels: BandRailChannel[] | null;
+}
+
+/** Pure: derive the band-rail model from the inventory + live state. */
+export function bandRailModel(bands: readonly ExplorerBand[], state: ExplorerState): BandRailModel {
+  const labelOf = (name: string): string => find(bands, name)?.label ?? name;
+  const chips: BandChip[] = bands.map((b, i) => ({
+    name: b.name,
+    label: b.label ?? b.name,
+    active: state.mode === 'single' && state.band === b.name,
+    keyHint: i < 9 ? i + 1 : 0,
+  }));
+  const channels: BandRailChannel[] | null =
+    state.mode === 'rgb'
+      ? (['r', 'g', 'b'] as const).map((role) => ({ role, name: state.rgb[role], label: labelOf(state.rgb[role]) }))
+      : null;
+  return {
+    show: bands.length >= 2,
+    mode: state.mode,
+    canComposite: canComposite(bands),
+    chips,
+    channels,
+  };
+}
+
+/** Whether the active band(s) carry precomputed zscale cuts — drives whether the
+ *  Display panel's "zscale" limit preset is offered. */
+export function hasZscalePreset(bands: readonly ExplorerBand[], state: ExplorerState): boolean {
+  const names = state.mode === 'single' ? [state.band] : [state.rgb.r, state.rgb.g, state.rgb.b];
+  return names.some((n) => find(bands, n)?.zscale !== undefined);
+}
+
+// ---- inspector layout chrome (persisted to localStorage, global key) -------
+
+/** Persisted inspector/shell chrome state — width, shelved, per-section collapse.
+ *  Distinct from `ExplorerState` (which is the view): this is the workspace
+ *  arrangement, never part of a shareable view link. */
+export interface LayoutState {
+  /** Inspector column width in px (clamped to [MIN, MAX]). */
+  width: number;
+  /** Whole inspector collapsed to its right-edge icon rail. */
+  shelved: boolean;
+  /** Collapsed flag per panel id (and the `display.fine` nested disclosure). */
+  collapsed: Record<string, boolean>;
+}
+
+export const INSPECTOR_MIN_WIDTH = 244;
+export const INSPECTOR_MAX_WIDTH = 520;
+const INSPECTOR_DEFAULT_WIDTH = 320;
+const LAYOUT_SCHEMA = 1;
+
+/** Clamp (and integer-round) a proposed inspector width to the sane range. */
+export function clampInspectorWidth(px: number): number {
+  if (!Number.isFinite(px)) return INSPECTOR_DEFAULT_WIDTH;
+  return Math.max(INSPECTOR_MIN_WIDTH, Math.min(INSPECTOR_MAX_WIDTH, Math.round(px)));
+}
+
+/** The default layout: Display open (Tier-1), Composite/View + fine-adjust
+ *  collapsed (Tier-2), inspector expanded at the default width. */
+export function defaultLayoutState(): LayoutState {
+  return {
+    width: INSPECTOR_DEFAULT_WIDTH,
+    shelved: false,
+    collapsed: { display: false, composite: true, view: true, 'display.fine': true },
+  };
+}
+
+/** Serialize layout chrome for localStorage (schema-tagged). */
+export function serializeLayoutState(state: LayoutState): string {
+  return JSON.stringify({ v: LAYOUT_SCHEMA, width: state.width, shelved: state.shelved, collapsed: state.collapsed });
+}
+
+/**
+ * Parse persisted layout chrome, fail-safe: any malformed/partial/hostile value
+ * falls back to the default (per field), so a corrupt localStorage entry can
+ * never break the shell. Unknown collapsed keys are ignored; known keys merge.
+ */
+export function parseLayoutState(raw: string | null): LayoutState {
+  const base = defaultLayoutState();
+  if (raw === null) return base;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(raw);
+  } catch {
+    return base;
+  }
+  if (typeof obj !== 'object' || obj === null) return base;
+  const o = obj as Record<string, unknown>;
+  const width = typeof o.width === 'number' ? clampInspectorWidth(o.width) : base.width;
+  const shelved = typeof o.shelved === 'boolean' ? o.shelved : base.shelved;
+  const collapsed = { ...base.collapsed };
+  if (typeof o.collapsed === 'object' && o.collapsed !== null) {
+    const c = o.collapsed as Record<string, unknown>;
+    for (const key of Object.keys(collapsed)) {
+      if (typeof c[key] === 'boolean') collapsed[key] = c[key];
+    }
+  }
+  return { width, shelved, collapsed };
 }
