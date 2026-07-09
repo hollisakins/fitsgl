@@ -14,7 +14,7 @@
  */
 
 import { createProgram } from '../renderer/gl-util.js';
-import type { OverlayView } from './overlay-renderer.js';
+import { getViewUniforms, setViewUniforms, type OverlayView, type ViewUniforms } from './overlay-renderer.js';
 import { REGION_RECT_VERT } from './shaders/region-rect.vert.js';
 import { REGION_RECT_FRAG } from './shaders/region-rect.frag.js';
 import { REGION_POLY_FILL_VERT } from './shaders/region-poly-fill.vert.js';
@@ -48,25 +48,6 @@ import {
 const QUAD = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
 const F = 4; // bytes per float
 
-/** The view uniforms every region program shares. */
-interface RegionUniforms {
-  center: WebGLUniformLocation | null;
-  zoom: WebGLUniformLocation | null;
-  viewport: WebGLUniformLocation | null;
-  orient: WebGLUniformLocation | null;
-  pixelRatio: WebGLUniformLocation | null;
-}
-
-function uniforms(gl: WebGL2RenderingContext, program: WebGLProgram): RegionUniforms {
-  return {
-    center: gl.getUniformLocation(program, 'u_center'),
-    zoom: gl.getUniformLocation(program, 'u_zoom'),
-    viewport: gl.getUniformLocation(program, 'u_viewport'),
-    orient: gl.getUniformLocation(program, 'u_orient'),
-    pixelRatio: gl.getUniformLocation(program, 'u_pixelRatio'),
-  };
-}
-
 export class RegionRenderer {
   private readonly gl: WebGL2RenderingContext;
 
@@ -74,19 +55,19 @@ export class RegionRenderer {
   private readonly rectVao: WebGLVertexArrayObject;
   private readonly rectQuad: WebGLBuffer;
   private readonly rectInstances: WebGLBuffer;
-  private readonly rectU: RegionUniforms;
+  private readonly rectU: ViewUniforms;
   private rectCount = 0;
 
   private readonly fillProgram: WebGLProgram;
   private readonly fillVao: WebGLVertexArrayObject;
   private readonly fillBuffer: WebGLBuffer;
-  private readonly fillU: RegionUniforms;
+  private readonly fillU: ViewUniforms;
   private fillCount = 0;
 
   private readonly strokeProgram: WebGLProgram;
   private readonly strokeVao: WebGLVertexArrayObject;
   private readonly strokeBuffer: WebGLBuffer;
-  private readonly strokeU: RegionUniforms;
+  private readonly strokeU: ViewUniforms;
   private strokeCount = 0;
 
   constructor(gl: WebGL2RenderingContext) {
@@ -113,7 +94,7 @@ export class RegionRenderer {
     instanceAttrib(gl, 5, 4, stride, R_OFFSET_FILL);
     instanceAttrib(gl, 6, 4, stride, R_OFFSET_STROKE);
     instanceAttrib(gl, 7, 3, stride, R_OFFSET_STYLE);
-    this.rectU = uniforms(gl, this.rectProgram);
+    this.rectU = getViewUniforms(gl, this.rectProgram);
 
     // ---- polygon fill ----
     this.fillProgram = createProgram(gl, REGION_POLY_FILL_VERT, REGION_POLY_FILL_FRAG);
@@ -125,7 +106,7 @@ export class RegionRenderer {
     const fStride = FILL_VERTEX_FLOATS * F;
     vertexAttrib(gl, 0, 2, fStride, FILL_OFFSET_POS);
     vertexAttrib(gl, 1, 4, fStride, FILL_OFFSET_COLOR);
-    this.fillU = uniforms(gl, this.fillProgram);
+    this.fillU = getViewUniforms(gl, this.fillProgram);
 
     // ---- polygon stroke ----
     this.strokeProgram = createProgram(gl, REGION_POLY_STROKE_VERT, REGION_POLY_STROKE_FRAG);
@@ -141,7 +122,7 @@ export class RegionRenderer {
     vertexAttrib(gl, 3, 2, sStride, STROKE_OFFSET_ARC);
     vertexAttrib(gl, 4, 4, sStride, STROKE_OFFSET_COLOR);
     vertexAttrib(gl, 5, 3, sStride, STROKE_OFFSET_STYLE);
-    this.strokeU = uniforms(gl, this.strokeProgram);
+    this.strokeU = getViewUniforms(gl, this.strokeProgram);
 
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
@@ -188,31 +169,22 @@ export class RegionRenderer {
 
     if (this.rectCount > 0) {
       gl.useProgram(this.rectProgram);
-      this.setView(this.rectU, view);
+      setViewUniforms(this.gl, this.rectU, view);
       gl.bindVertexArray(this.rectVao);
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.rectCount);
     }
     if (this.fillCount > 0) {
       gl.useProgram(this.fillProgram);
-      this.setView(this.fillU, view);
+      setViewUniforms(this.gl, this.fillU, view);
       gl.bindVertexArray(this.fillVao);
       gl.drawArrays(gl.TRIANGLES, 0, this.fillCount);
     }
     if (this.strokeCount > 0) {
       gl.useProgram(this.strokeProgram);
-      this.setView(this.strokeU, view);
+      setViewUniforms(this.gl, this.strokeU, view);
       gl.bindVertexArray(this.strokeVao);
       gl.drawArrays(gl.TRIANGLES, 0, this.strokeCount);
     }
-  }
-
-  private setView(u: RegionUniforms, view: OverlayView): void {
-    const gl = this.gl;
-    gl.uniform2f(u.center, view.centerX, view.centerY);
-    gl.uniform1f(u.zoom, view.zoom);
-    gl.uniform2f(u.viewport, view.viewportWidth, view.viewportHeight);
-    gl.uniform4f(u.orient, view.orient[0], view.orient[1], view.orient[2], view.orient[3]);
-    if (u.pixelRatio !== null) gl.uniform1f(u.pixelRatio, view.pixelRatio);
   }
 
   destroy(): void {

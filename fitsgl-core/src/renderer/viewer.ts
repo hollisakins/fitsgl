@@ -535,6 +535,9 @@ export class FitsViewer {
   private regionHandlers: RegionHandlers;
   /** Id of the region currently hovered, so onRegionHover fires only on change. */
   private hoveredRegionId: string | null = null;
+  /** Which channel's tooltip the single shared popup is currently showing (so a
+   *  mutation/handler-swap on one channel never tears down the other's tooltip). */
+  private popupOwner: 'marker' | 'region' | null = null;
   /** Latest un-processed pointer sample; picking is coalesced to one rAF. */
   private pendingPointer: { bufX: number; bufY: number; cssX: number; cssY: number; event: MouseEvent } | null = null;
   private pointerScheduled = false;
@@ -782,8 +785,10 @@ export class FitsViewer {
       // overlay — using mousedown/up rather than the DOM `click`, which can't see
       // the drag distance.
       if (!wasClick(this.pressX, this.pressY, p.x, p.y, this.dpr)) return;
-      // A marker (drawn on top) wins over a region under the same click.
-      const marker = onMarkerClick !== undefined ? this.hitTest(p.x, p.y) : null;
+      // Markers paint on top, so a marker under the click always wins: it blocks the
+      // region beneath it even when no onMarkerClick is registered (the click is
+      // consumed by the marker, not passed through to the region).
+      const marker = this.hitTest(p.x, p.y);
       if (marker !== null) {
         onMarkerClick?.(this.buildMarkerEvent(marker, e));
         return;
@@ -826,6 +831,7 @@ export class FitsViewer {
       this.pendingPointer = null;
       this.onCursor?.(null);
       this.clearHoverState();
+      this.clearRegionHoverState();
     };
     this.onKeyDown = (e) => {
       // Let browser/OS shortcuts (Cmd/Ctrl/Alt combos) pass through untouched.
@@ -1277,7 +1283,9 @@ export class FitsViewer {
    */
   setMarkerHandlers(handlers: MarkerHandlers): void {
     this.markerHandlers = handlers;
-    if (handlers.markerTooltip === undefined) this.popup.hide();
+    // Drop the popup only if it was showing a marker tooltip that no longer exists
+    // — never a live region tooltip.
+    if (handlers.markerTooltip === undefined && this.popupOwner === 'marker') this.hidePopup();
   }
 
   // ---- region overlays (issue #16) ---------------------------------------
@@ -1314,19 +1322,25 @@ export class FitsViewer {
   updateRegion(id: string, patch: RegionPatch): boolean {
     const res = this.regions.update(id, patch, this.wcs);
     if (res === null) return false;
+    if (res.geometryChanged) this.rebuildRegionGrid(); // any centre move re-grids
     const region = this.regions.at(res.index);
-    // A style-only rect edit can patch its single instance slot in place; anything
-    // that changes geometry (or touches a polygon, or flips shape) rebuilds. The
-    // instance index is the number of rects packed before this one (rects are
-    // packed in store order) — O(index), no allocation.
-    if (!res.geometryChanged && region !== undefined && region.shape === 'rect') {
+    if (region === undefined || res.shapeChanged) {
+      // A rect<->polygon flip changes both the rect instance set and the polygon
+      // set, so rebuild both buffers.
+      this.rebuildRegionBuffers();
+    } else if (region.shape === 'rect') {
+      // A rect edit — style OR geometry — patches its single instance slot in place;
+      // the other rects and ALL polygons are untouched (no re-pack, no
+      // re-triangulation). The instance index is the number of rects packed before
+      // this one (rects pack in store order) — O(index), no allocation.
       const list = this.regions.list();
       let instanceIndex = 0;
       for (let i = 0; i < res.index; i++) if (list[i].shape === 'rect') instanceIndex++;
       this.regionRenderer.updateRect(instanceIndex, packRectOne(region));
     } else {
-      if (res.geometryChanged) this.rebuildRegionGrid();
-      this.rebuildRegionBuffers();
+      // A polygon edit (style bakes into the vertex colours, so even a restyle
+      // rebuilds) touches only the polygon buffers; the rect instances stay put.
+      this.rebuildPolygonBuffers();
     }
     this.requestRender();
     return true;
@@ -1358,9 +1372,9 @@ export class FitsViewer {
    */
   setRegionHandlers(handlers: RegionHandlers): void {
     this.regionHandlers = handlers;
-    if (handlers.regionTooltip === undefined && this.markerHandlers.markerTooltip === undefined) {
-      this.popup.hide();
-    }
+    // Drop the popup only if it was showing a region tooltip that no longer exists
+    // — never a live marker tooltip.
+    if (handlers.regionTooltip === undefined && this.popupOwner === 'region') this.hidePopup();
   }
 
   /** The orientation matrix to apply this frame (identity when North-up is off). */
@@ -2550,43 +2564,67 @@ export class FitsViewer {
       this.regionHandlers.onRegionHover?.(region === null ? null : this.buildRegionEvent(region, p.event));
     }
 
-    // One shared popup: a marker tooltip wins over a region tooltip (markers on top).
+    // One shared popup: a marker tooltip wins over a region tooltip (markers paint
+    // on top), but a marker that declines a tooltip (returns null) falls THROUGH to
+    // the region under it rather than blanking it.
     const mTip = this.markerHandlers.markerTooltip;
     const rTip = this.regionHandlers.regionTooltip;
     let content: string | HTMLElement | null = null;
-    if (marker !== null && mTip !== undefined) content = mTip(marker);
-    else if (region !== null && rTip !== undefined) content = rTip(region);
-    if (content !== null) this.popup.show(content, p.event.clientX, p.event.clientY);
-    else this.popup.hide();
+    let owner: 'marker' | 'region' | null = null;
+    if (marker !== null && mTip !== undefined) {
+      content = mTip(marker);
+      if (content !== null) owner = 'marker';
+    }
+    if (content === null && region !== null && rTip !== undefined) {
+      content = rTip(region);
+      if (content !== null) owner = 'region';
+    }
+    if (content !== null) {
+      this.popup.show(content, p.event.clientX, p.event.clientY);
+      this.popupOwner = owner;
+    } else {
+      this.hidePopup();
+    }
+  }
+
+  /**
+   * A pointer event's world position + canvas-relative CSS position — the shared
+   * geometry both overlay event builders (marker + region) need. One
+   * `getBoundingClientRect` + projection, so a DPR/border fix lives in one place.
+   */
+  private pointerGeom(e: MouseEvent): { worldX: number; worldY: number; screenX: number; screenY: number } {
+    const rect = this.canvas.getBoundingClientRect();
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+    const bufX = cssX * (this.canvas.width / (rect.width || 1));
+    const bufY = cssY * (this.canvas.height / (rect.height || 1));
+    const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
+    return { worldX: world.x, worldY: world.y, screenX: cssX, screenY: cssY };
   }
 
   private buildMarkerEvent(marker: ResolvedMarker, e: MouseEvent): MarkerEvent {
-    const rect = this.canvas.getBoundingClientRect();
-    const cssX = e.clientX - rect.left;
-    const cssY = e.clientY - rect.top;
-    const bufX = cssX * (this.canvas.width / (rect.width || 1));
-    const bufY = cssY * (this.canvas.height / (rect.height || 1));
-    const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
-    return { marker, worldX: world.x, worldY: world.y, screenX: cssX, screenY: cssY, originalEvent: e };
+    return { marker, ...this.pointerGeom(e), originalEvent: e };
   }
 
   private buildRegionEvent(region: ResolvedRegion, e: MouseEvent): RegionEvent {
-    const rect = this.canvas.getBoundingClientRect();
-    const cssX = e.clientX - rect.left;
-    const cssY = e.clientY - rect.top;
-    const bufX = cssX * (this.canvas.width / (rect.width || 1));
-    const bufY = cssY * (this.canvas.height / (rect.height || 1));
-    const world = screenToWorld(this.camera, this.currentOrientation(), bufX, bufY);
-    return { region, worldX: world.x, worldY: world.y, screenX: cssX, screenY: cssY, originalEvent: e };
+    return { region, ...this.pointerGeom(e), originalEvent: e };
   }
 
-  /** Drop any active region hover (mirror of `clearHoverState` for regions). */
+  /** Hide the shared popup and forget who owned it. */
+  private hidePopup(): void {
+    this.popup.hide();
+    this.popupOwner = null;
+  }
+
+  /** Drop any active region hover (mirror of `clearHoverState` for regions). Only
+   *  hides the shared popup if it is showing a REGION tooltip, so a region mutation
+   *  never tears down an active marker tooltip. */
   private clearRegionHoverState(): void {
     if (this.hoveredRegionId !== null) {
       this.hoveredRegionId = null;
       this.regionHandlers.onRegionHover?.(null);
     }
-    this.popup.hide();
+    if (this.popupOwner === 'region') this.hidePopup();
   }
 
   /**
@@ -2600,7 +2638,9 @@ export class FitsViewer {
       this.hoveredId = null;
       this.markerHandlers.onMarkerHover?.(null);
     }
-    this.popup.hide();
+    // Only hide the shared popup if it is showing a MARKER tooltip, so a marker
+    // mutation never tears down an active region tooltip.
+    if (this.popupOwner === 'marker') this.hidePopup();
   }
 
   private rebuildGrid(): void {
@@ -2620,8 +2660,16 @@ export class FitsViewer {
   }
 
   private rebuildRegionBuffers(): void {
+    this.rebuildRectBuffer();
+    this.rebuildPolygonBuffers();
+  }
+
+  private rebuildRectBuffer(): void {
     const rects = this.regions.rects().map((r) => r.rect);
     this.regionRenderer.setRects(packRects(rects), rects.length);
+  }
+
+  private rebuildPolygonBuffers(): void {
     const polys = this.regions.polygons().map((p) => p.polygon);
     this.regionRenderer.setPolygons(buildPolygonFill(polys), buildPolygonStroke(polys));
   }

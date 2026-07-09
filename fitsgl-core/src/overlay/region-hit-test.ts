@@ -13,7 +13,7 @@
  * `region-hit-test.test.ts` pins the superset relationship against a brute oracle.
  */
 
-import type { ResolvedPolygon, ResolvedRect, ResolvedRegion } from './regions.js';
+import type { RegionShape, ResolvedPolygon, ResolvedRect, ResolvedRegion } from './regions.js';
 
 /** Whether world point `(wx, wy)` lies inside a rotated rectangle. */
 export function pointInRect(rect: ResolvedRect, wx: number, wy: number): boolean {
@@ -47,8 +47,20 @@ export function pointInRegion(region: ResolvedRegion, wx: number, wy: number): b
 }
 
 /**
- * The topmost region (highest store index = drawn last / on top) containing the
- * world point, among `candidates` (store indices from the broad phase), or null.
+ * A region's z-order key for picking, matching `RegionRenderer.draw`'s PAINT order
+ * (all rects first, then all polygons; within a shape, later store index paints on
+ * top). So polygons rank above rects regardless of store index, and the topmost
+ * *painted* region under the cursor is the candidate with the largest key. Keeping
+ * this in lockstep with the draw order is what makes the clicked/hovered region the
+ * one the user actually sees on top when a rect and a polygon overlap.
+ */
+function paintKey(shape: RegionShape, index: number, count: number): number {
+  return (shape === 'polygon' ? count : 0) + index; // index < count → the two bands are disjoint
+}
+
+/**
+ * The topmost region (by paint order) containing the world point, among
+ * `candidates` (store indices from the broad phase), or null.
  */
 export function pickRegion(
   candidates: readonly number[],
@@ -57,14 +69,15 @@ export function pickRegion(
   wy: number,
 ): ResolvedRegion | null {
   let best: ResolvedRegion | null = null;
-  let bestIndex = -1;
+  let bestKey = -1;
   for (const i of candidates) {
-    if (i <= bestIndex) continue;
     const r = regions[i];
     if (r === undefined) continue;
+    const key = paintKey(r.shape, i, regions.length);
+    if (key <= bestKey) continue;
     if (pointInRegion(r, wx, wy)) {
       best = r;
-      bestIndex = i;
+      bestKey = key;
     }
   }
   return best;

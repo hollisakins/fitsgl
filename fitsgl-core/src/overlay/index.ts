@@ -48,7 +48,6 @@ export { OverlayPopup } from './popup.js';
 export {
   RegionStore,
   REGION_SHAPES,
-  REGION_SHAPE_IDS,
   isRegionShape,
   inferRegionShape,
   resolveRect,

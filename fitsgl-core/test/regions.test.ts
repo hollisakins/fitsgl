@@ -8,7 +8,6 @@ import {
   isRegionShape,
   resolveRect,
   resolvePolygon,
-  REGION_SHAPE_IDS,
   DEFAULT_REGION_STROKE,
   DEFAULT_REGION_FILL,
   DEFAULT_REGION_STROKE_WIDTH,
@@ -45,6 +44,15 @@ function sepArcsec(wcs: TanWcs, a: { x: number; y: number }, b: { x: number; y: 
 function mid(a: { x: number; y: number }, b: { x: number; y: number }): { x: number; y: number } {
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
 }
+/** The four world corners of a resolved rect (BL, BR, TR, TL in (u, v)), derived
+ *  from centre + half-extents + axes — matching the rect vertex shader. */
+function cornersOf(r: ResolvedRect): Array<{ x: number; y: number }> {
+  const c = (su: number, sv: number): { x: number; y: number } => ({
+    x: r.centerX + su * r.halfW * r.axisU[0] + sv * r.halfH * r.axisV[0],
+    y: r.centerY + su * r.halfW * r.axisU[1] + sv * r.halfH * r.axisV[1],
+  });
+  return [c(-1, -1), c(1, -1), c(1, 1), c(-1, 1)];
+}
 
 describe('region shape inference', () => {
   it('is rect by default, polygon when vertices are present', () => {
@@ -59,9 +67,6 @@ describe('region shape inference', () => {
     expect(isRegionShape('rect')).toBe(true);
     expect(isRegionShape('polygon')).toBe(true);
     expect(isRegionShape('circle')).toBe(false);
-  });
-  it('pins the shape ids', () => {
-    expect(REGION_SHAPE_IDS).toEqual({ rect: 0, polygon: 1 });
   });
 });
 
@@ -89,14 +94,31 @@ describe('resolveRect — world geometry', () => {
   it('places the four corners at ±halfW·U ±halfH·V', () => {
     const r = resolveRect({ x: -0.5, y: -0.5, width: 4, height: 2 }, null, STYLE, 'a') as ResolvedRect;
     // corners order: BL, BR, TR, TL in (u, v)
-    expect(r.corners[0]).toEqual({ x: -2, y: -1 });
-    expect(r.corners[2]).toEqual({ x: 2, y: 1 });
+    const corners = cornersOf(r);
+    expect(corners[0]).toEqual({ x: -2, y: -1 });
+    expect(corners[2]).toEqual({ x: 2, y: 1 });
   });
 });
 
 describe('resolveRect — sky geometry (WCS)', () => {
   it('drops a sky rect when there is no WCS', () => {
     expect(resolveRect({ ra: 150, dec: 2.2, widthArcsec: 60, heightArcsec: 60 }, null, STYLE, 'a')).toBeNull();
+  });
+
+  it('drops a sky rect on a non-square-pixel (anisotropic) WCS, but keeps a sky polygon', () => {
+    const cfg = wcsFix.configs.find((c) => c.name === 'axis_aligned');
+    if (cfg === undefined) throw new Error('fixture axis_aligned missing');
+    // Dec pixel scale 2x the RA scale — a sky rect can't be faithfully sized.
+    const aniso = parseWcs({ ...cfg.wcs, CDELT2: 2.0 }) as TanWcs;
+    expect(resolveRect({ ra: 150, dec: 2.2, widthArcsec: 60, heightArcsec: 60 }, aniso, STYLE, 'a')).toBeNull();
+    // Sky POLYGONS project each vertex independently, so they are unaffected.
+    const poly = resolvePolygon(
+      { vertices: [{ ra: 150, dec: 2.2 }, { ra: 150.02, dec: 2.2 }, { ra: 150.02, dec: 2.22 }] },
+      aniso,
+      STYLE,
+      'p',
+    );
+    expect(poly).not.toBeNull();
   });
 
   for (const name of ['axis_aligned', 'rolled_30', 'mirror_parity']) {
@@ -111,10 +133,11 @@ describe('resolveRect — sky geometry (WCS)', () => {
       expect(r.centerY).toBeCloseTo(center.y, 6);
 
       // Corner mid-points along each axis.
-      const topMid = mid(r.corners[2], r.corners[3]); // +axisV edge
-      const botMid = mid(r.corners[0], r.corners[1]); // −axisV edge
-      const rightMid = mid(r.corners[1], r.corners[2]); // +axisU edge
-      const leftMid = mid(r.corners[0], r.corners[3]); // −axisU edge
+      const corners = cornersOf(r);
+      const topMid = mid(corners[2], corners[3]); // +axisV edge
+      const botMid = mid(corners[0], corners[1]); // −axisV edge
+      const rightMid = mid(corners[1], corners[2]); // +axisU edge
+      const leftMid = mid(corners[0], corners[3]); // −axisU edge
 
       // Angular full extents match the requested arcsec (independent of WCS roll/parity).
       expect(sepArcsec(wcs, topMid, botMid)).toBeCloseTo(H, 3);
@@ -132,7 +155,7 @@ describe('resolveRect — sky geometry (WCS)', () => {
   it('paDeg=0 points the height axis North (increasing Dec)', () => {
     const wcs = wcsByName('axis_aligned');
     const r = resolveRect({ ra: 150, dec: 2.2, paDeg: 0, widthArcsec: 60, heightArcsec: 60 }, wcs, STYLE, 'a') as ResolvedRect;
-    const topMid = mid(r.corners[2], r.corners[3]);
+    const topMid = mid(cornersOf(r)[2], cornersOf(r)[3]);
     const center = pixToSky(wcs, r.centerX, r.centerY);
     const top = pixToSky(wcs, topMid.x, topMid.y);
     expect(top.dec).toBeGreaterThan(center.dec);
@@ -246,5 +269,42 @@ describe('RegionStore', () => {
     expect(styled.strokeWidth).toBe(3);
     expect(styled.dashOn).toBe(6);
     expect(styled.dashOff).toBe(4);
+  });
+
+  it('a world-geometry patch supersedes a sky-origin region (and vice versa)', () => {
+    const wcs = wcsByName('axis_aligned');
+    const s = new RegionStore();
+    s.add([{ id: 'a', ra: 150, dec: 2.2, widthArcsec: 60, heightArcsec: 60 }], wcs);
+    const skyCenter = (s.get('a') as ResolvedRect).centerX;
+
+    // Patch to a world-pixel position: without clearing the stale ra/dec the sky
+    // branch would win and this patch would be silently ignored.
+    const res = s.update('a', { x: 10, y: 20, width: 4, height: 2 }, wcs);
+    expect(res).not.toBeNull();
+    const world = s.get('a') as ResolvedRect;
+    expect(world.centerX).toBe(10.5);
+    expect(world.centerY).toBe(20.5);
+    expect(world.halfW).toBe(2);
+    expect(world.halfH).toBe(1);
+    expect(world.centerX).not.toBe(skyCenter);
+
+    // And back: a sky patch supersedes the now-world region.
+    s.update('a', { ra: 150, dec: 2.2, widthArcsec: 60, heightArcsec: 60 }, wcs);
+    const back = s.get('a') as ResolvedRect;
+    expect(back.centerX).toBeCloseTo(skyToPix(wcs, 150, 2.2).x, 6);
+  });
+
+  it('a size-only patch stays in the region’s current coordinate family', () => {
+    const wcs = wcsByName('axis_aligned');
+    const s = new RegionStore();
+    s.add([{ id: 'a', ra: 150, dec: 2.2, widthArcsec: 60, heightArcsec: 60 }], wcs);
+    const halfW0 = (s.get('a') as ResolvedRect).halfW;
+    // widthArcsec is the sky-family size field; the rect stays a sky rect, moves
+    // nowhere, and doubling widthArcsec doubles the world half-width.
+    const res = s.update('a', { widthArcsec: 120 }, wcs);
+    expect(res).not.toBeNull();
+    const r = s.get('a') as ResolvedRect;
+    expect(r.centerX).toBeCloseTo(skyToPix(wcs, 150, 2.2).x, 6);
+    expect(r.halfW).toBeCloseTo(halfW0 * 2, 6);
   });
 });

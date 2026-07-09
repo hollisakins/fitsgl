@@ -63,6 +63,20 @@ describe('pickRegion', () => {
     expect(pickRegion([0, 1], regions, -5, 0)?.id).toBe('rect');
     expect(pickRegion([0, 1], regions, 5, 4)?.id).toBe('tri');
   });
+
+  it('matches paint order: an overlapping polygon wins over a rect even at a LOWER store index', () => {
+    // Store order: polygon first (index 0), rect second (index 1); both cover the
+    // origin. RegionRenderer paints all rects then all polygons, so the polygon is
+    // visually on top despite its lower index — pickRegion must return it.
+    const regions = [
+      worldPoly([[-3, -3], [3, -3], [3, 3], [-3, 3]], 'poly'),
+      worldRect(0, 0, 4, 4, 0, 'rect'),
+    ];
+    expect(pickRegion([0, 1], regions, 0, 0)?.id).toBe('poly');
+    // Within one shape, the higher store index (drawn last) still wins.
+    const rects = [worldRect(0, 0, 4, 4, 0, 'under'), worldRect(0, 0, 4, 4, 0, 'over')];
+    expect(pickRegion([0, 1], rects, 0, 0)?.id).toBe('over');
+  });
 });
 
 describe('broad-phase superset (grid vs brute oracle)', () => {

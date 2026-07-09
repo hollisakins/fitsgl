@@ -31,6 +31,39 @@ export interface OverlayView {
   pixelRatio: number;
 }
 
+/**
+ * The five view uniforms every overlay program shares (markers AND regions). One
+ * source of truth for the locate + upload so a change — e.g. the row-major-Mat2 vs
+ * GLSL `mat2` transpose convention in `u_orient` — stays consistent across both
+ * renderers. A program that omits one (e.g. the poly-fill shader has no
+ * `u_pixelRatio`) simply gets a null location, and `gl.uniform*` ignores null.
+ */
+export interface ViewUniforms {
+  center: WebGLUniformLocation | null;
+  zoom: WebGLUniformLocation | null;
+  viewport: WebGLUniformLocation | null;
+  orient: WebGLUniformLocation | null;
+  pixelRatio: WebGLUniformLocation | null;
+}
+
+export function getViewUniforms(gl: WebGL2RenderingContext, program: WebGLProgram): ViewUniforms {
+  return {
+    center: gl.getUniformLocation(program, 'u_center'),
+    zoom: gl.getUniformLocation(program, 'u_zoom'),
+    viewport: gl.getUniformLocation(program, 'u_viewport'),
+    orient: gl.getUniformLocation(program, 'u_orient'),
+    pixelRatio: gl.getUniformLocation(program, 'u_pixelRatio'),
+  };
+}
+
+export function setViewUniforms(gl: WebGL2RenderingContext, u: ViewUniforms, view: OverlayView): void {
+  gl.uniform2f(u.center, view.centerX, view.centerY);
+  gl.uniform1f(u.zoom, view.zoom);
+  gl.uniform2f(u.viewport, view.viewportWidth, view.viewportHeight);
+  gl.uniform4f(u.orient, view.orient[0], view.orient[1], view.orient[2], view.orient[3]);
+  gl.uniform1f(u.pixelRatio, view.pixelRatio);
+}
+
 const QUAD = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
 const BYTES_PER_FLOAT = 4;
 
@@ -42,11 +75,7 @@ export class OverlayRenderer {
   private readonly instanceBuffer: WebGLBuffer;
   private count = 0;
 
-  private readonly uCenter: WebGLUniformLocation | null;
-  private readonly uZoom: WebGLUniformLocation | null;
-  private readonly uViewport: WebGLUniformLocation | null;
-  private readonly uOrient: WebGLUniformLocation | null;
-  private readonly uPixelRatio: WebGLUniformLocation | null;
+  private readonly viewU: ViewUniforms;
 
   constructor(gl: WebGL2RenderingContext) {
     this.gl = gl;
@@ -90,11 +119,7 @@ export class OverlayRenderer {
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-    this.uCenter = gl.getUniformLocation(this.program, 'u_center');
-    this.uZoom = gl.getUniformLocation(this.program, 'u_zoom');
-    this.uViewport = gl.getUniformLocation(this.program, 'u_viewport');
-    this.uOrient = gl.getUniformLocation(this.program, 'u_orient');
-    this.uPixelRatio = gl.getUniformLocation(this.program, 'u_pixelRatio');
+    this.viewU = getViewUniforms(gl, this.program);
   }
 
   /** Replace the whole instance buffer (add/remove/replace). `data` is `count*9` floats. */
@@ -127,11 +152,7 @@ export class OverlayRenderer {
     const gl = this.gl;
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
-    gl.uniform2f(this.uCenter, view.centerX, view.centerY);
-    gl.uniform1f(this.uZoom, view.zoom);
-    gl.uniform2f(this.uViewport, view.viewportWidth, view.viewportHeight);
-    gl.uniform4f(this.uOrient, view.orient[0], view.orient[1], view.orient[2], view.orient[3]);
-    gl.uniform1f(this.uPixelRatio, view.pixelRatio);
+    setViewUniforms(gl, this.viewU, view);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.count);
   }
 

@@ -1,8 +1,10 @@
 /**
  * Polygon-stroke fragment shader (GLSL ES 3.00) — AA width + screen-constant dash.
  *
- * `v_edge` is the signed distance from the edge centreline (buffer px); the stroke
- * fades over the outer ~1px for antialiasing. `v_s` is the arc-length position in
+ * `v_edge` is the signed distance from the edge centreline (buffer px). Coverage is
+ * a `fwidth`-scaled 1px ramp of the box distance `v_half - |v_edge|` (matching the
+ * rect fragment's AA), so the interior is fully opaque and only the outer ~1px
+ * fades — a thin (<=1px) stroke no longer under-fills at its centre. `v_s` is the arc-length position in
  * buffer px, so dashes are a constant on-screen length at every zoom (the pattern
  * flows continuously across an edge; it may double up slightly in the extended
  * join region, which reads fine for opaque strokes). Straight-alpha output for the
@@ -21,7 +23,8 @@ in float v_dashOff;
 out vec4 outColor;
 
 void main() {
-  float cov = 1.0 - smoothstep(v_half - 1.0, v_half, abs(v_edge));
+  float aa = max(fwidth(v_edge), 1e-4);
+  float cov = clamp((v_half - abs(v_edge)) / aa + 0.5, 0.0, 1.0);
   float period = v_dashOn + v_dashOff;
   if (v_dashOn > 0.0 && period > 0.0) {
     float f = fract(v_s / period) * period;

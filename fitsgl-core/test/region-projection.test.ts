@@ -67,9 +67,12 @@ describe('rect vertex shader — projects corners to the same NDC as the tile pa
       [1, 1],
       [-1, 1],
     ];
-    r.corners.forEach((corner, i) => {
-      const expected = projectWorldToNdc(view, orient, corner.x, corner.y);
-      const got = shaderRectCornerNdc(orient, r, quads[i][0], quads[i][1]);
+    quads.forEach(([qx, qy]) => {
+      // The resolved corner in world space (centre ± halfW·U ± halfH·V).
+      const cornerX = r.centerX + qx * r.halfW * r.axisU[0] + qy * r.halfH * r.axisV[0];
+      const cornerY = r.centerY + qx * r.halfW * r.axisU[1] + qy * r.halfH * r.axisV[1];
+      const expected = projectWorldToNdc(view, orient, cornerX, cornerY);
+      const got = shaderRectCornerNdc(orient, r, qx, qy);
       expect(got.x).toBeCloseTo(expected.x, 10);
       expect(got.y).toBeCloseTo(expected.y, 10);
     });

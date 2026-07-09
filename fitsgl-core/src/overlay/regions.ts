@@ -47,9 +47,6 @@ import { parseColor, type ColorInput, type ColorTuple } from './markers.js';
 export const REGION_SHAPES = ['rect', 'polygon'] as const;
 export type RegionShape = (typeof REGION_SHAPES)[number];
 
-/** Shape ids carried alongside the geometry (parallels marker `SHAPE_IDS`). */
-export const REGION_SHAPE_IDS: Record<RegionShape, number> = { rect: 0, polygon: 1 };
-
 /** Default region style — a visible amber stroke, no fill, solid, 1.5px. */
 export const DEFAULT_REGION_STROKE: ColorTuple = [1, 0.8, 0, 1];
 /** Default fill: fully transparent (a region is an outline unless the caller fills it). */
@@ -167,8 +164,6 @@ export interface ResolvedRect extends ResolvedRegionBase {
   /** Unit world-space direction of the +width (`axisU`) and +height (`axisV`) axes. */
   readonly axisU: readonly [number, number];
   readonly axisV: readonly [number, number];
-  /** The four world corners (±halfW·axisU ±halfH·axisV), for hit-testing. */
-  readonly corners: readonly [RegionPoint, RegionPoint, RegionPoint, RegionPoint];
 }
 
 /** A resolved polygon: world vertices (already projected from sky if that was the input). */
@@ -228,12 +223,27 @@ function skyBasis(
   const nHat: readonly [number, number] = [nx / nLen, ny / nLen];
   const pixPerDeg = nLen / eps;
 
-  // +RA (East) direction, only to fix the handedness of the perpendicular.
+  // +RA (East) direction: fixes the handedness of the perpendicular AND lets us
+  // assert the frame is square-pixel (see below).
   const cosDec = Math.cos(dec * DEG);
   const dRa = Math.abs(cosDec) > 1e-8 ? eps / cosDec : eps;
   const pE = skyToPix(wcs, ra + dRa, dec);
   const ex = pE.x - c.x;
   const ey = pE.y - c.y;
+  const eLen = Math.hypot(ex, ey);
+  if (!(eLen > 0) || !Number.isFinite(eLen)) return null;
+
+  // A sky RECT is sized from a single (North) pixel scale with orthonormal axes, so
+  // it is only faithful on a *square-pixel* WCS: the local North and East pixel
+  // scales must match and be perpendicular. That holds for the ICRS+TAN square-pixel
+  // mosaics fitsgl builds (SIP/TPV are already rejected upstream); rather than
+  // silently drawing a wrongly-sized footprint on an anisotropic or sheared frame,
+  // reject it here so the caller drops the region and warns. (Sky *polygons* project
+  // each vertex independently and are unaffected, so this guard is rect-only.)
+  const eastPerDeg = eLen / dRa;
+  const scaleSkew = Math.abs(eastPerDeg - pixPerDeg) / pixPerDeg;
+  const perpCos = Math.abs((nHat[0] * ex + nHat[1] * ey) / eLen); // |cos∠(N, E)|
+  if (scaleSkew > 1e-2 || perpCos > 1e-2) return null;
 
   // Rotating North +90° CCW gives one perpendicular; pick the sense pointing East.
   const ccw: readonly [number, number] = [-nHat[1], nHat[0]];
@@ -252,10 +262,6 @@ function rectFrom(
   axisV: readonly [number, number],
   style: ResolvedStyle,
 ): ResolvedRect {
-  const corner = (su: number, sv: number): RegionPoint => ({
-    x: centerX + su * halfW * axisU[0] + sv * halfH * axisV[0],
-    y: centerY + su * halfW * axisU[1] + sv * halfH * axisV[1],
-  });
   return {
     id,
     shape: 'rect',
@@ -267,7 +273,6 @@ function rectFrom(
     halfH,
     axisU,
     axisV,
-    corners: [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)],
   };
 }
 
@@ -451,7 +456,8 @@ export class RegionStore {
       this.warnedDrop = true;
       console.warn(
         'FitsViewer overlay: dropped region(s) that could not be placed ' +
-          '(sky geometry with no WCS, a non-finite projection, or a polygon with < 3 vertices).',
+          '(sky geometry with no WCS, a non-finite projection, a non-square-pixel ' +
+          'WCS for a sky rect, or a polygon with < 3 vertices).',
       );
     }
     return ids;
@@ -478,6 +484,22 @@ export class RegionStore {
     const index = this.idToIndex.get(id);
     if (index === undefined) return null;
     const merged: RegionInput = { ...this.inputs[index], ...patch, id };
+    // A geometry patch supersedes the other coordinate family. Without this, a
+    // stale `ra`/`dec` (or sky `vertices`) surviving from the original input would
+    // keep resolve*() on the sky branch and silently ignore a world-pixel patch
+    // (and vice versa). Switching families requires supplying the new anchor
+    // (`x`/`y`, `ra`/`dec`, or the vertex list); a size-only patch stays in the
+    // region's current family.
+    if (patch.x !== undefined || patch.y !== undefined) {
+      merged.ra = undefined;
+      merged.dec = undefined;
+    }
+    if (patch.ra !== undefined || patch.dec !== undefined) {
+      merged.x = undefined;
+      merged.y = undefined;
+    }
+    if (patch.worldVertices !== undefined) merged.vertices = undefined;
+    if (patch.vertices !== undefined) merged.worldVertices = undefined;
     const resolved = this.build(id, merged, wcs);
     if (resolved === null) return null;
     const prev = this.regions[index] as ResolvedRegion;
