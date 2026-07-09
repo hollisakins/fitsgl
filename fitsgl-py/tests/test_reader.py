@@ -26,7 +26,7 @@ from fitsgl.fpack_index import (
     SupertileIndex,
     coalesce_ranges,
 )
-from fitsgl.manifest import LevelInfo, SupertileInfo, read_manifest
+from fitsgl.manifest import LevelInfo, Manifest, SupertileInfo, read_manifest
 from fitsgl.synthetic import generate_synthetic_mosaic
 from fitsgl.tiles import (
     PixelBBox,
@@ -202,8 +202,9 @@ def test_resolve_supertile_gap_returns_none():
 # --------------------------------------------------------------------------- #
 def test_tiles_for_pixel_bbox_basic(manifest):
     z0 = next(lv for lv in manifest.levels if lv.z == 0)
+    ts = manifest.fpack_tile_size
     # A box spanning pixels [100, 600) x [100, 300) touches tile cols 0..2, rows 0..1.
-    tiles = tiles_for_pixel_bbox(z0, PixelBBox(100, 100, 600, 300))
+    tiles = tiles_for_pixel_bbox(z0, PixelBBox(100, 100, 600, 300), tile_size=ts)
     coords = {(t.tile_x, t.tile_y) for t in tiles}
     assert coords == {(x, y) for y in (0, 1) for x in (0, 1, 2)}
 
@@ -211,39 +212,52 @@ def test_tiles_for_pixel_bbox_basic(manifest):
 def test_tiles_for_pixel_bbox_boundary_no_bleed(manifest):
     z0 = next(lv for lv in manifest.levels if lv.z == 0)
     # A box ending exactly on the 256 boundary must not pull in the next column.
-    tiles = tiles_for_pixel_bbox(z0, PixelBBox(0, 0, 256, 256))
+    tiles = tiles_for_pixel_bbox(z0, PixelBBox(0, 0, 256, 256), tile_size=256)
     assert {(t.tile_x, t.tile_y) for t in tiles} == {(0, 0)}
-    tiles = tiles_for_pixel_bbox(z0, PixelBBox(0, 0, 257, 256))
+    tiles = tiles_for_pixel_bbox(z0, PixelBBox(0, 0, 257, 256), tile_size=256)
     assert {(t.tile_x, t.tile_y) for t in tiles} == {(0, 0), (1, 0)}
 
 
 def test_tiles_for_pixel_bbox_clamps_and_empties(manifest):
     z0 = next(lv for lv in manifest.levels if lv.z == 0)
+    ts = manifest.fpack_tile_size
     h, w = z0.shape
     # Fully outside -> empty.
-    assert tiles_for_pixel_bbox(z0, PixelBBox(w + 10, 0, w + 20, 10)) == []
-    assert tiles_for_pixel_bbox(z0, PixelBBox(10, 10, 10, 10)) == []  # degenerate
+    assert tiles_for_pixel_bbox(z0, PixelBBox(w + 10, 0, w + 20, 10), tile_size=ts) == []
+    assert tiles_for_pixel_bbox(z0, PixelBBox(10, 10, 10, 10), tile_size=ts) == []  # degenerate
     # A box past the image edge clamps to the last tile.
-    tiles = tiles_for_pixel_bbox(z0, PixelBBox(w - 5, h - 5, w + 100, h + 100))
+    tiles = tiles_for_pixel_bbox(z0, PixelBBox(w - 5, h - 5, w + 100, h + 100), tile_size=ts)
     n_tx, n_ty = level_tile_grid(z0)
     assert {(t.tile_x, t.tile_y) for t in tiles} == {(n_tx - 1, n_ty - 1)}
 
 
+def test_tiles_for_pixel_bbox_requires_tile_size(manifest):
+    """tile_size is a required keyword — omitting it must raise, never silently
+    assume 256 (the footgun that mis-tiles a non-256 dataset)."""
+    z0 = next(lv for lv in manifest.levels if lv.z == 0)
+    with pytest.raises(TypeError):
+        tiles_for_pixel_bbox(z0, PixelBBox(0, 0, 256, 256))  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        tile_pixel_bounds(z0, 0, 0)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        pixel_to_tile(z0, 0, 0)  # type: ignore[call-arg]
+
+
 def test_tile_pixel_bounds_partial_edge(manifest):
     z2 = next(lv for lv in manifest.levels if lv.z == 2)  # 256x256 -> 1 tile
-    b = tile_pixel_bounds(z2, 0, 0)
+    b = tile_pixel_bounds(z2, 0, 0, tile_size=256)
     assert (b.x0, b.y0, b.x1, b.y1) == (0, 0, 256, 256)
 
 
 def test_pixel_to_tile(manifest):
     z0 = next(lv for lv in manifest.levels if lv.z == 0)
-    origin = pixel_to_tile(z0, 0, 0)
+    origin = pixel_to_tile(z0, 0, 0, tile_size=256)
     assert origin is not None and (origin.tile_x, origin.tile_y) == (0, 0)
-    t = pixel_to_tile(z0, 300, 100)
+    t = pixel_to_tile(z0, 300, 100, tile_size=256)
     assert t is not None and (t.tile_x, t.tile_y) == (1, 0)
-    assert pixel_to_tile(z0, -1, 0) is None
+    assert pixel_to_tile(z0, -1, 0, tile_size=256) is None
     h, w = z0.shape
-    assert pixel_to_tile(z0, w, 0) is None
+    assert pixel_to_tile(z0, w, 0, tile_size=256) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -257,11 +271,15 @@ def _supertile_paths(outdir, manifest):
     return out
 
 
+_ZQUANTIZ_TO_METHOD = {"SUBTRACTIVE_DITHER_1": 1, "SUBTRACTIVE_DITHER_2": 2}
+
+
 def _assert_byte_ranges_match_astropy(outdir, manifest):
     """Every tile's byte range extracts exactly the bytes astropy reads for it,
     and tile_dims/n_pixels/params agree with astropy's own decode — checked on
     every supertile of every level."""
     checked_tiles = 0
+    saw_partial_edge = False
     for path in _supertile_paths(outdir, manifest):
         raw = path.read_bytes()
         idx = SupertileIndex.open_local(str(path))
@@ -270,11 +288,21 @@ def _assert_byte_ranges_match_astropy(outdir, manifest):
         # array it would decode; the decoded image gives each tile's true pixels.
         with fits.open(path, disable_image_compression=True) as hdul:
             rec = hdul[1].data
+            hdr = hdul[1].header
             comp = rec["COMPRESSED_DATA"]
             zscale = rec["ZSCALE"]
             zzero = rec["ZZERO"]
+            has_zblank_col = "ZBLANK" in rec.columns.names
         with fits.open(path) as hdul:
             image = np.asarray(hdul[1].data)  # (rows, cols) = (znaxis2, znaxis1)
+
+        # Decode params reported by the module must match the file's own header —
+        # these (dither method/seed, blank sentinel, block size) drive a
+        # self-decoding consumer and are otherwise unexercised.
+        exp_method = _ZQUANTIZ_TO_METHOD.get(hdr.get("ZQUANTIZ"), -1)
+        exp_zdither0 = int(hdr.get("ZDITHER0", 0) or 0)
+        exp_block = int(hdr.get("ZBLOCKSIZE", 32) or 32)
+        exp_zblank_hdr = hdr.get("ZBLANK")
 
         assert idx.n_tiles_x * idx.n_tiles_y == len(comp)
         for ly in range(idx.n_tiles_y):
@@ -286,16 +314,33 @@ def _assert_byte_ranges_match_astropy(outdir, manifest):
                 assert got == want, f"{path.name} tile ({lx},{ly}) byte range mismatch"
                 # tile_dims must equal the tile's true (partial-edge-aware) shape.
                 w, h = idx.tile_dims(lx, ly)
+                # Independent spec-formula recomputation (NOT re-using the (w,h)
+                # tile_dims returned): pins the value even where numpy would clamp
+                # an over-large slice, so an under-reported interior tile fails.
+                exp_w = min(idx.ztile1, idx.znaxis1 - lx * idx.ztile1)
+                exp_h = min(idx.ztile2, idx.znaxis2 - ly * idx.ztile2)
+                assert (w, h) == (exp_w, exp_h), f"{path.name} tile ({lx},{ly}) dims"
                 sub = image[ly * idx.ztile2 : ly * idx.ztile2 + h, lx * idx.ztile1 : lx * idx.ztile1 + w]
-                assert (w, h) == (sub.shape[1], sub.shape[0]), f"{path.name} tile ({lx},{ly}) dims"
+                assert (w, h) == (sub.shape[1], sub.shape[0]), f"{path.name} tile ({lx},{ly}) sub"
+                if w < idx.ztile1 or h < idx.ztile2:
+                    saw_partial_edge = True
                 params = idx.tile_params(lx, ly)
                 assert params.tile_index == row
                 assert params.n_pixels == w * h
                 assert params.compression_type == "RICE_1"
                 assert params.zscale == pytest.approx(float(zscale[row]))
                 assert params.zzero == pytest.approx(float(zzero[row]))
+                assert params.dither_method == exp_method
+                assert params.zdither0 == exp_zdither0
+                assert params.block_size == exp_block
+                if not has_zblank_col:
+                    if exp_zblank_hdr is None:
+                        assert math.isnan(params.zblank)
+                    else:
+                        assert params.zblank == float(exp_zblank_hdr)
                 checked_tiles += 1
     assert checked_tiles > 0
+    return saw_partial_edge
 
 
 def test_byte_ranges_match_astropy(pyramid, manifest):
@@ -303,14 +348,37 @@ def test_byte_ranges_match_astropy(pyramid, manifest):
     _assert_byte_ranges_match_astropy(pyramid["outdir"], manifest)
 
 
-def test_tile_dims_partial_edges(pyramid, manifest):
-    # z1 is 512x512 -> a single 2x2-tile supertile, all full tiles.
+def test_tile_dims_full_tiles(pyramid, manifest):
+    # z1 is 512x512 -> a single 2x2-tile supertile, all full tiles (no partial edge).
     z1 = next(lv for lv in manifest.levels if lv.z == 1)
     path = pyramid["outdir"] / z1.supertiles[0].filename
     idx = SupertileIndex.open_local(str(path))
     assert (idx.znaxis1, idx.znaxis2) == (512, 512)
     assert idx.tile_dims(0, 0) == (256, 256)
     assert idx.tile_dims(1, 1) == (256, 256)
+
+
+def test_tile_dims_partial_edges(odd_pyramid, odd_manifest):
+    """tile_dims shrinks on the high-index edge tiles of a level whose pixel
+    dimensions are not a multiple of the fpack tile size (the odd, ZTILE=128
+    pyramid). Full interior tiles stay square; every tile matches the spec
+    formula computed independently of tile_dims' own return."""
+    z0 = next(lv for lv in odd_manifest.levels if lv.z == 0)
+    saw_partial = False
+    saw_full = False
+    for st in z0.supertiles:
+        idx = SupertileIndex.open_local(str(odd_pyramid["outdir"] / st.filename))
+        for ly in range(idx.n_tiles_y):
+            for lx in range(idx.n_tiles_x):
+                w, h = idx.tile_dims(lx, ly)
+                assert w == min(idx.ztile1, idx.znaxis1 - lx * idx.ztile1)
+                assert h == min(idx.ztile2, idx.znaxis2 - ly * idx.ztile2)
+                if w < idx.ztile1 or h < idx.ztile2:
+                    saw_partial = True
+                if w == idx.ztile1 and h == idx.ztile2:
+                    saw_full = True
+    assert saw_partial, "odd pyramid must have at least one partial-edge tile"
+    assert saw_full, "odd pyramid must also have full-size interior tiles"
 
 
 def test_supertile_index_open_fetcher_matches_local(pyramid, manifest):
@@ -365,6 +433,42 @@ def test_byte_range_helpers():
     assert br.http_range() == "bytes=100-149"
 
 
+def test_gzip2_byte_ranges_match_astropy(tmp_path):
+    """The GZIP_2 code path — an advertised ZCMPTYPE the build pipeline never
+    emits — must address bytes correctly. Build a GZIP_2-compressed FITS with
+    astropy and check every tile's byte range byte-for-byte against astropy's own
+    COMPRESSED_DATA, plus the no-quantization (NaN ZSCALE/ZZERO) param branch.
+
+    Integer data keeps the compressed bytes in COMPRESSED_DATA (a float image
+    would land in the lossless GZIP_COMPRESSED_DATA column, which this
+    addressing-only module intentionally does not serve)."""
+    data = (np.arange(200 * 300, dtype=np.int32).reshape(200, 300) % 101).astype(np.int32)
+    hdu = fits.CompImageHDU(data=data, compression_type="GZIP_2", tile_shape=(64, 64))
+    path = tmp_path / "gzip2.fits.fz"
+    hdu.writeto(path, overwrite=True)
+    raw = path.read_bytes()
+
+    idx = SupertileIndex.open_local(str(path))
+    assert idx.compression_type == "GZIP_2"
+    with fits.open(path, disable_image_compression=True) as hdul:
+        comp = hdul[1].data["COMPRESSED_DATA"]
+    assert idx.n_tiles_x * idx.n_tiles_y == len(comp)
+    checked = 0
+    for ly in range(idx.n_tiles_y):
+        for lx in range(idx.n_tiles_x):
+            row = idx.tile_row(lx, ly)
+            br = idx.tile_byte_range(lx, ly)
+            want = np.asarray(comp[row], dtype=np.uint8).tobytes()
+            assert raw[br.start : br.stop] == want, f"GZIP_2 tile ({lx},{ly}) byte range"
+            params = idx.tile_params(lx, ly)
+            assert params.compression_type == "GZIP_2"
+            # GZIP_2 is not quantized -> no per-tile ZSCALE/ZZERO columns.
+            assert math.isnan(params.zscale)
+            assert math.isnan(params.zzero)
+            checked += 1
+    assert checked == idx.n_tiles_x * idx.n_tiles_y
+
+
 # --------------------------------------------------------------------------- #
 # cutout.py — plan_cutout against astropy projection
 # --------------------------------------------------------------------------- #
@@ -410,25 +514,35 @@ def test_plan_cutout_center_inside_covered_tiles(manifest):
 
 
 def test_plan_cutout_covers_full_sky_box(manifest):
-    """Every in-image corner of the requested box lands in a covered tile (rotated WCS)."""
+    """Every corner of the requested box lands in a covered tile (rotated WCS).
+
+    The FOV is chosen so the whole box lands comfortably inside the selected
+    level; each corner is asserted in-image (not merely skipped when off-image)
+    and a `checked` counter guards against the vacuity where all corners project
+    outside the level and the coverage assertion silently never runs.
+    """
     center = (150.0, 2.2)
-    fov = (40.0, 25.0)
-    plan = plan_cutout(manifest, center=center, fov=fov, output_size=(800, 500))
+    fov = (12.0, 8.0)
+    plan = plan_cutout(manifest, center=center, fov=fov, output_size=(200, 133))
     lvl = plan.level
     wcs = _level_wcs(lvl)
+    ts = manifest.fpack_tile_size
     h, w = lvl.shape
     covered = {(t.tile.tile_x, t.tile.tile_y) for t in plan.tiles}
     half_w = (fov[0] / 2) / 3600.0
     half_h = (fov[1] / 2) / 3600.0
     cosd = math.cos(math.radians(center[1]))
+    checked = 0
     for sx in (-1, 1):
         for sy in (-1, 1):
             ra = center[0] + sx * half_w / cosd
             dec = center[1] + sy * half_h
             px, py = wcs.world_to_pixel_values(ra, dec)
             col, row = int(math.floor(px + 0.5)), int(math.floor(py + 0.5))
-            if 0 <= col < w and 0 <= row < h:
-                assert (col // 256, row // 256) in covered
+            assert 0 <= col < w and 0 <= row < h  # box must land inside the level
+            assert (col // ts, row // ts) in covered
+            checked += 1
+    assert checked == 4
 
 
 def test_plan_cutout_out_of_field_is_empty(manifest):
@@ -438,11 +552,65 @@ def test_plan_cutout_out_of_field_is_empty(manifest):
     assert plan.tiles == []
 
 
+def test_plan_cutout_reports_missing_gap_tiles():
+    """A cutout covering a dropped-supertile gap routes those tiles into
+    plan.missing (not plan.tiles) and is not reported empty — the integration
+    path plan.missing exists for, previously covered only at the resolve_supertile
+    unit level."""
+    scale_deg = 0.03 / 3600.0
+    wcs = {
+        "WCSAXES": 2,
+        "CTYPE1": "RA---TAN",
+        "CTYPE2": "DEC--TAN",
+        "CRPIX1": 256.5,
+        "CRPIX2": 256.5,
+        "CRVAL1": 150.0,
+        "CRVAL2": 2.0,
+        "CD1_1": -scale_deg,
+        "CD1_2": 0.0,
+        "CD2_1": 0.0,
+        "CD2_2": scale_deg,
+        "CUNIT1": "deg",
+        "CUNIT2": "deg",
+        "RADESYS": "ICRS",
+    }
+    # 512x512 level, 2x2 tiles @256; only the LEFT column of supertiles exists,
+    # so every global tile with tile_x == 1 falls in a gap.
+    level = LevelInfo(
+        z=0,
+        filename="left.fits.fz",
+        compression="RICE_1",
+        lossless=False,
+        shape=[512, 512],
+        fpack_tile_count=[2, 2],
+        pixel_scale_arcsec=0.03,
+        wcs=wcs,
+        supertiles=[SupertileInfo(filename="left.fits.fz", tile_origin=[0, 0], tile_count=[1, 2])],
+    )
+    manifest = Manifest(
+        source_file="s", native_shape=[512, 512], n_levels=0, fpack_tile_size=256, levels=[level]
+    )
+    # A box larger than the level covers all four tiles after clamping to [0,512).
+    plan = plan_cutout(manifest, center=(150.0, 2.0), fov=18.0, output_size=600)
+    assert plan.level_index == 0
+    assert not plan.is_empty
+    covered = {(t.tile.tile_x, t.tile.tile_y) for t in plan.tiles}
+    missing = {(c.tile_x, c.tile_y) for c in plan.missing}
+    assert missing == {(1, 0), (1, 1)}  # the whole right column is the gap
+    assert covered == {(0, 0), (0, 1)}  # only the left column has data
+    assert covered.isdisjoint(missing)
+
+
 def test_plan_cutout_supertile_filenames(manifest):
     plan = plan_cutout(manifest, center=(150.0, 2.2), fov=60.0, output_size=2000)
     names = plan.supertile_filenames()
     assert names  # non-empty
-    assert len(names) == len(set(names))  # distinct
+    # Many covering tiles share each supertile file, so dedup must actually
+    # collapse duplicates: strictly fewer distinct files than covering tiles.
+    assert len(plan.tiles) > len(names)
+    assert len(names) == len(set(names))  # each file listed once
+    # the list is exactly the set of files the covering tiles reference
+    assert set(names) == {ref.filename for ref in plan.tiles}
     # every listed name is a real supertile of the chosen level
     level_files = {st.filename for st in plan.level.supertiles}
     assert set(names) <= level_files
@@ -477,8 +645,9 @@ def test_sky_box_perimeter_samples_full_edges():
     assert len(ra) > 4 and len(ra) == len(dec)
     half_w = (fov[0] / 2) / 3600.0
     half_h = (fov[1] / 2) / 3600.0
-    cosd = math.cos(math.radians(center[1]))
-    dra = (ra - center[0]) * cosd
+    # Recover each sample's on-sky RA offset with cos at that sample's own dec
+    # (the sampler now widens RA per-dec, not by a single centre cosine).
+    dra = (ra - center[0]) * np.cos(np.radians(dec))
     ddec = dec - center[1]
     # Every sample lies within the box, and on at least one edge (|offset| == half).
     assert np.all(np.abs(dra) <= half_w + 1e-12)
@@ -516,7 +685,8 @@ def test_odd_partial_edge_pixel_bounds(odd_manifest):
 
 def test_odd_byte_ranges_match_astropy(odd_pyramid, odd_manifest):
     """Byte addressing + tile_dims on partial edges and a non-square, ZTILE=128 grid."""
-    _assert_byte_ranges_match_astropy(odd_pyramid["outdir"], odd_manifest)
+    saw_partial = _assert_byte_ranges_match_astropy(odd_pyramid["outdir"], odd_manifest)
+    assert saw_partial  # the non-256, non-square pyramid must exercise partial-edge tiles
 
 
 def test_odd_resolve_supertile_disjoint(odd_manifest):
@@ -555,10 +725,15 @@ def test_plan_cutout_uses_manifest_tile_size(odd_manifest):
 
 
 def test_plan_cutout_covers_full_sky_box_odd(odd_manifest):
-    """Full-perimeter coverage on the rotated, non-256 odd pyramid."""
+    """Full-perimeter coverage on the rotated, non-256 odd pyramid.
+
+    FOV chosen so the whole box lands inside the level; every perimeter sample is
+    asserted in-image and covered (with a `checked` guard) so this can't silently
+    go vacuous the way an oversized box would.
+    """
     center = (150.0, 2.2)
-    fov = (30.0, 18.0)
-    plan = plan_cutout(odd_manifest, center=center, fov=fov, output_size=(600, 360))
+    fov = (9.0, 6.0)
+    plan = plan_cutout(odd_manifest, center=center, fov=fov, output_size=(300, 200))
     lvl = plan.level
     ts = odd_manifest.fpack_tile_size
     wcs = _level_wcs(lvl)
@@ -570,7 +745,10 @@ def test_plan_cutout_covers_full_sky_box_odd(odd_manifest):
 
     ra, dec = _sky_box_perimeter(center, fov, samples=25)
     px, py = wcs.world_to_pixel_values(ra, dec)
+    checked = 0
     for x, y in zip(np.atleast_1d(px), np.atleast_1d(py)):
         col, row = int(math.floor(x + 0.5)), int(math.floor(y + 0.5))
-        if 0 <= col < w and 0 <= row < h:
-            assert (col // ts, row // ts) in covered
+        assert 0 <= col < w and 0 <= row < h  # box must land inside the level
+        assert (col // ts, row // ts) in covered
+        checked += 1
+    assert checked >= 25

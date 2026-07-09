@@ -25,6 +25,7 @@ the integer), which is exactly the level's data-array indexing.
 
 from __future__ import annotations
 
+import numbers
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -93,11 +94,23 @@ class CutoutPlan:
 
 
 def _as_pair(value: SizeArg, what: str) -> tuple[float, float]:
-    if isinstance(value, (int, float)):
+    # `bool` is a `numbers.Real`, so reject it up front (a boolean size is a type
+    # error, not a 0/1 request). `numbers.Real` accepts Python int/float *and*
+    # numpy scalars (np.int64/np.float32/np.float64 all register), so a caller
+    # passing a numpy-derived scalar is treated as the scalar case rather than
+    # crashing on `x, y = value` in the tuple branch.
+    if isinstance(value, bool):
+        raise ValueError(f"{what} must be a positive number or an (x, y) pair (got {value!r})")
+    if isinstance(value, numbers.Real):
         v = float(value)
         pair = (v, v)
     else:
-        x, y = value
+        try:
+            x, y = value
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{what} must be a positive number or an (x, y) pair (got {value!r})"
+            ) from None
         pair = (float(x), float(y))
     if not (pair[0] > 0 and pair[1] > 0):
         raise ValueError(f"{what} must be positive (got {value!r})")
@@ -146,10 +159,6 @@ def _sky_box_perimeter(
     ra_c, dec_c = center
     half_w_deg = (fov_arcsec[0] / 2.0) / 3600.0
     half_h_deg = (fov_arcsec[1] / 2.0) / 3600.0
-    # RA offsets are along a small circle: divide by cos(dec) so the box spans the
-    # requested angular width on the sky. (Cutouts are far from the poles.)
-    cos_dec = np.cos(np.radians(dec_c))
-    cos_dec = cos_dec if abs(cos_dec) > 1e-9 else 1e-9
 
     n = max(2, samples)
     t = np.linspace(-1.0, 1.0, n)
@@ -163,8 +172,16 @@ def _sky_box_perimeter(
         dys.append(t * half_h_deg)
     dx = np.concatenate(dxs)
     dy = np.concatenate(dys)
-    ra = ra_c + dx / cos_dec
     dec = dec_c + dy
+    # RA offsets are along a small circle: divide by cos(dec) so the box spans the
+    # requested angular width on the sky. Evaluate cos at *each sample's own dec*
+    # (not just the box centre) so a tall / off-equator box still spans the
+    # requested angular width along its top and bottom edges — keeping the
+    # projected perimeter a true superset of the request. (Cutouts are far from
+    # the poles; clamp cos to avoid a blow-up near dec = ±90.)
+    cos_dec = np.cos(np.radians(dec))
+    cos_dec = np.where(np.abs(cos_dec) > 1e-9, cos_dec, 1e-9)
+    ra = ra_c + dx / cos_dec
     return ra, dec
 
 
@@ -191,8 +208,10 @@ def plan_cutout(
         (width along RA, height along Dec).
     output_size
         Intended output image size in **pixels**: a scalar or ``(width, height)``.
-        Together with ``fov`` it sets the output scale (``fov / output_size``) used
-        to pick the level. Omit to plan at the finest level (native resolution),
+        Together with ``fov`` it sets the output scale used to pick the level —
+        the **finer** of the two per-axis scales ``min(fov_x/out_x, fov_y/out_y)``,
+        so an anisotropic request is never served from a level coarser than its
+        finer axis needs. Omit to plan at the finest level (native resolution),
         unless ``target_scale_arcsec`` is given.
     target_scale_arcsec
         Output pixel scale (arcsec/pixel) to select the level by, overriding the
@@ -212,6 +231,9 @@ def plan_cutout(
         to supertile files. An out-of-field request yields a plan with empty
         ``tiles`` (``plan.is_empty``).
     """
+    if not manifest.levels:
+        raise ValueError("manifest has no levels")
+
     fov_pair = _as_pair(fov, "fov")
 
     if target_scale_arcsec is not None:
@@ -220,7 +242,13 @@ def plan_cutout(
         scale = float(target_scale_arcsec)
     elif output_size is not None:
         out = _as_pair(output_size, "output_size")
-        scale = 0.5 * (fov_pair[0] / out[0] + fov_pair[1] / out[1])
+        # Use the *finer* of the two per-axis scales, not their average: picking
+        # a level by the average would serve an anisotropic request (e.g. a wide,
+        # short output) from a level coarser than its finer axis needs, and the
+        # detail that axis asked for could not be recovered by resampling. The
+        # finer axis's scale never upsamples either axis at the chosen level; the
+        # consumer downsamples the coarser axis in numpy.
+        scale = min(fov_pair[0] / out[0], fov_pair[1] / out[1])
     else:
         # No scale hint: serve at the finest level (native resolution).
         scale = min(lvl.pixel_scale_arcsec for lvl in manifest.levels)

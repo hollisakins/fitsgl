@@ -20,9 +20,12 @@ into a FITS cutout or an RGB thumbnail.
 | `fitsgl.fpack_index` | no | Byte-range addressing *inside* a supertile: the exact `[start, length)` of each fpack tile's compressed bytes, parsed from the file's header with `struct`. |
 | `fitsgl.cutout` | yes | `plan_cutout(...)` — ties level selection + WCS projection + tile/supertile resolution into one `CutoutPlan`. |
 
-Because `tiles` and `fpack_index` avoid astropy, a consumer can do all the
-level/tile/byte bookkeeping without importing it; only the sky↔pixel projection
-in `cutout` uses a real WCS engine.
+`tiles` and `fpack_index` are written without astropy — their level/tile/byte
+math needs no WCS engine, so that code is self-contained and easy to port or
+vendor. Only the sky↔pixel projection in `cutout` calls a real WCS engine.
+(astropy is still a hard dependency of the `fitsgl` package as a whole — importing
+the package initialises it via the producer modules — so this is about which
+*computations* need a WCS engine, not about running with astropy uninstalled.)
 
 ## Planning a cutout
 

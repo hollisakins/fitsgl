@@ -38,11 +38,15 @@ from typing import Literal, Optional
 
 from .manifest import LevelInfo, Manifest, SupertileInfo
 
-#: Default fpack-internal tile edge in level pixels (the unit of HTTP byte
-#: ranges). Mirrors ``FPACK_TILE_SIZE`` in ``build_pyramid``. A dataset built
-#: with a non-default ``[build] tile_size`` records the true value in
-#: ``manifest.fpack_tile_size`` — the authoritative source for the tile geometry
-#: functions here; this constant is only the fallback default.
+#: The standard fpack-internal tile edge in level pixels (the unit of HTTP byte
+#: ranges). Mirrors ``FPACK_TILE_SIZE`` in ``build_pyramid``. This is only the
+#: conventional value: the authoritative tile size for a given dataset is
+#: ``manifest.fpack_tile_size`` (a build with a non-default ``[build] tile_size``
+#: records the true value there). The tile-geometry functions below take
+#: ``tile_size`` as a *required* argument precisely so a caller can never silently
+#: assume 256 on a dataset that was tiled differently — pass
+#: ``manifest.fpack_tile_size`` (or use :func:`fitsgl.cutout.plan_cutout`, which
+#: reads it for you).
 TILE_SIZE = 256
 
 #: How :func:`select_level_index` breaks a tie between two pyramid levels.
@@ -130,12 +134,18 @@ def resolve_supertile(level: LevelInfo, tile_x: int, tile_y: int) -> Optional[Su
     return None
 
 
-def tile_pixel_bounds(level: LevelInfo, tile_x: int, tile_y: int, tile_size: int = TILE_SIZE) -> PixelBBox:
+def tile_pixel_bounds(level: LevelInfo, tile_x: int, tile_y: int, *, tile_size: int) -> PixelBBox:
     """Level-pixel rectangle a tile covers, clamped to the level's dimensions.
 
     High-index edge tiles are smaller than ``tile_size`` because the level's
     pixel dimensions need not be a multiple of it (astropy stores them at their
     true size).
+
+    ``tile_size`` is required and MUST be the size the level was tiled at
+    (``manifest.fpack_tile_size``, conventionally 256). It is not defaulted:
+    ``LevelInfo`` does not carry the tile size, and silently assuming 256 on a
+    dataset tiled at, say, 128 would return bounds with the wrong stride (an
+    inverted / empty box for a high-index tile).
     """
     h, w = level.shape
     x0 = tile_x * tile_size
@@ -144,9 +154,13 @@ def tile_pixel_bounds(level: LevelInfo, tile_x: int, tile_y: int, tile_size: int
 
 
 def pixel_to_tile(
-    level: LevelInfo, px: int, py: int, tile_size: int = TILE_SIZE
+    level: LevelInfo, px: int, py: int, *, tile_size: int
 ) -> Optional[TileCoord]:
-    """The tile holding 0-based level pixel ``(px, py)``, or ``None`` if outside the grid."""
+    """The tile holding 0-based level pixel ``(px, py)``, or ``None`` if outside the grid.
+
+    ``tile_size`` is required (``manifest.fpack_tile_size``) — see
+    :func:`tile_pixel_bounds` for why it is not defaulted to 256.
+    """
     h, w = level.shape
     if px < 0 or py < 0 or px >= int(w) or py >= int(h):
         return None
@@ -154,7 +168,7 @@ def pixel_to_tile(
 
 
 def tiles_for_pixel_bbox(
-    level: LevelInfo, bbox: PixelBBox, tile_size: int = TILE_SIZE
+    level: LevelInfo, bbox: PixelBBox, *, tile_size: int
 ) -> list[TileCoord]:
     """Every tile of ``level`` overlapping the half-open pixel box ``bbox``.
 
@@ -164,12 +178,13 @@ def tiles_for_pixel_bbox(
     :func:`resolve_supertile` on each to find its file, and expect ``None`` for
     tiles that fall in a dropped-supertile gap.
 
-    ``tile_size`` MUST be the size the level was tiled at
-    (``manifest.fpack_tile_size``, default 256) — the unit ``fpack_tile_count``
-    and every supertile ``tile_origin``/``tile_count`` are expressed in. Passing a
+    ``tile_size`` is required and MUST be the size the level was tiled at
+    (``manifest.fpack_tile_size``, conventionally 256) — the unit
+    ``fpack_tile_count`` and every supertile ``tile_origin``/``tile_count`` are
+    expressed in. It is deliberately not defaulted: passing (or defaulting to) a
     different value yields tile indices that :func:`resolve_supertile` cannot
-    interpret, silently under-covering the box. Prefer :func:`fitsgl.cutout.plan_cutout`,
-    which reads the size from the manifest for you.
+    interpret, silently under-covering the box. Prefer
+    :func:`fitsgl.cutout.plan_cutout`, which reads the size from the manifest for you.
     """
     n_tx, n_ty = level_tile_grid(level)
     h, w = int(level.shape[0]), int(level.shape[1])
@@ -204,7 +219,10 @@ def _levels_by_z(manifest: Manifest) -> list[LevelInfo]:
     levels = sorted(manifest.levels, key=lambda lvl: lvl.z)
     for lvl in levels:
         s = lvl.pixel_scale_arcsec
-        if not (isinstance(s, (int, float)) and math.isfinite(s) and s > 0):
+        # `bool` is a subclass of `int`, so exclude it explicitly — a manifest
+        # whose scale deserialized to `true`/`false` is malformed, not a 1.0/0.0
+        # arcsec level.
+        if isinstance(s, bool) or not (isinstance(s, (int, float)) and math.isfinite(s) and s > 0):
             raise ValueError(
                 f"level z={lvl.z} has a non-positive / non-finite pixel_scale_arcsec ({s!r}); "
                 "cannot select a level by scale"
