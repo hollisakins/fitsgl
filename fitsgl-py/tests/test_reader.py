@@ -433,6 +433,23 @@ def test_byte_range_helpers():
     assert br.http_range() == "bytes=100-149"
 
 
+def test_lossless_rice_without_zscale_rejected(tmp_path):
+    """A lossless / integer RICE_1 file has no ZSCALE/ZZERO columns, so
+    tile_params() could only report NaN dequantization; opening it must raise an
+    actionable error (mirrors the TS FpackFile guard) rather than silently
+    exposing decode params that yield an all-NaN tile."""
+    data = (np.arange(200 * 300, dtype=np.int32).reshape(200, 300) % 101).astype(np.int32)
+    hdu = fits.CompImageHDU(data=data, compression_type="RICE_1", tile_shape=(64, 64))
+    path = tmp_path / "lossless_rice.fits.fz"
+    hdu.writeto(path, overwrite=True)
+    # Sanity: the file really is RICE_1 with no ZSCALE column.
+    with fits.open(path, disable_image_compression=True) as hdul:
+        assert hdul[1].header["ZCMPTYPE"] == "RICE_1"
+        assert "ZSCALE" not in hdul[1].data.columns.names
+    with pytest.raises(ValueError, match="ZSCALE"):
+        SupertileIndex.open_local(str(path))
+
+
 def test_gzip2_byte_ranges_match_astropy(tmp_path):
     """The GZIP_2 code path — an advertised ZCMPTYPE the build pipeline never
     emits — must address bytes correctly. Build a GZIP_2-compressed FITS with

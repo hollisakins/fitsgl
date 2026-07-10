@@ -324,6 +324,21 @@ class SupertileIndex:
             raise ValueError(
                 f"unsupported ZCMPTYPE {self.compression_type!r}; only RICE_1 and GZIP_2 are supported"
             )
+        # A float RICE pyramid quantizes to int32 and stores per-tile ZSCALE/ZZERO
+        # columns. A RICE_1 table without them is lossless/integer RICE: there is no
+        # linear mapping back to floats, so `tile_params()` would report zscale=NaN
+        # and a self-decoding consumer would get a silent all-NaN tile. Reject it
+        # loudly (mirrors the TS `FpackFile.open` guard). This is a structural check
+        # on column presence, not per-tile values, so a legitimately all-blank tile
+        # is unaffected. Byte-range addressing would still work, but this reader
+        # serves fitsgl's quantized display pyramids and must not hand back decode
+        # params it cannot honour.
+        if self.compression_type == "RICE_1" and "ZSCALE" not in layout.by_name:
+            raise ValueError(
+                "RICE_1 supertile has no per-tile ZSCALE/ZZERO quantization columns "
+                "(lossless or integer RICE), which this float pipeline cannot reconstruct "
+                "to floats"
+            )
         self._layout = layout
 
         self.znaxis1 = bintable.require_int("ZNAXIS1")  # columns (fast axis)
