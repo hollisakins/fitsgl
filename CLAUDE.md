@@ -9,7 +9,8 @@ WebGL2.
 **The code is the source of truth.** This file captures the load-bearing
 invariants and decisions that are *not* obvious from reading the code. End-user
 how-to lives in `docs/`: `docs/cli.md` (the producer CLI), `docs/core-integration.md`
-(consuming `@fitsgl/core`), and `docs/r2-setup.md` (Cloudflare R2 hosting).
+(consuming `@fitsgl/core`), `docs/server-reads.md` (the Python read-side/cutout
+API — `tiles`/`fpack_index`/`cutout`), and `docs/r2-setup.md` (Cloudflare R2 hosting).
 
 ## Layout
 
