@@ -139,6 +139,30 @@ export type {
   ColorTuple,
 } from './overlay/index.js';
 
+// Region overlays (issue #16) — world-sized, rotatable rectangle + polygon glyphs
+// (MSA shutters, pointing footprints, tile boundaries). Sky or world geometry,
+// per-region fill/stroke/dash, instanced rects + a per-polygon path, hit-tested
+// as world-space areas. The store + resolution is public; the GL renderer is
+// wired into `FitsViewer` (`addRegions`/`setRegions`/…/`setRegionHandlers`).
+export {
+  REGION_SHAPES,
+  isRegionShape,
+  DEFAULT_REGION_STROKE,
+  DEFAULT_REGION_FILL,
+  DEFAULT_REGION_STROKE_WIDTH,
+} from './overlay/index.js';
+export type {
+  RegionInput,
+  RegionPatch,
+  ResolvedRegion,
+  ResolvedRect,
+  ResolvedPolygon,
+  RegionShape,
+  RegionPoint,
+  RegionEvent,
+  RegionHandlers,
+} from './overlay/index.js';
+
 // M5 — ViewerConfig: the single high-level config every delivery tier (React,
 // vanilla embed, SSG) consumes. `loadViewerSource` does the URL->RenderSource
 // orchestration that used to live in the demo. The view/stretch fields reference

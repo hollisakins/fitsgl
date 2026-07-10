@@ -43,3 +43,32 @@ export { pickMarker, wasClick, broadPhaseWorldRadius, glyphHalfBuffer, glyphCont
 export { OverlayRenderer } from './overlay-renderer.js';
 export type { OverlayView } from './overlay-renderer.js';
 export { OverlayPopup } from './popup.js';
+
+// Region overlays (issue #16) — world-sized, rotatable rect + polygon glyphs.
+export {
+  RegionStore,
+  REGION_SHAPES,
+  isRegionShape,
+  inferRegionShape,
+  resolveRect,
+  resolvePolygon,
+  DEFAULT_REGION_STROKE,
+  DEFAULT_REGION_FILL,
+  DEFAULT_REGION_STROKE_WIDTH,
+} from './regions.js';
+export type {
+  RegionInput,
+  RegionPatch,
+  ResolvedRegion,
+  ResolvedRect,
+  ResolvedPolygon,
+  RegionShape,
+  RegionPoint,
+  RegionEvent,
+  RegionHandlers,
+  ResolvedStyle,
+} from './regions.js';
+export { packRects, packRectOne, REGION_INSTANCE_FLOATS, REGION_INSTANCE_STRIDE_BYTES } from './region-pack.js';
+export { triangulate, buildPolygonFill, buildPolygonStroke, signedArea2 } from './polygon.js';
+export { pointInRect, pointInPolygon, pointInRegion, pickRegion } from './region-hit-test.js';
+export { RegionRenderer } from './region-renderer.js';

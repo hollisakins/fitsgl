@@ -40,7 +40,12 @@ import type {
   MarkerInput,
   MarkerPatch,
   PointerTool,
+  RegionEvent,
+  RegionHandlers,
+  RegionInput,
+  RegionPatch,
   ResolvedMarker,
+  ResolvedRegion,
   TilePyramid,
   TilePyramidOptions,
   ViewerConfig,
@@ -78,6 +83,16 @@ export interface FitsViewerHandle {
   removeMarker(id: string): boolean;
   /** Remove all markers. */
   clearMarkers(): void;
+  /** Replace all region overlays (rects/polygons); returns the resolved ids. */
+  setRegions(regions: RegionInput[]): string[];
+  /** Append regions; returns the resolved ids. */
+  addRegions(regions: RegionInput[]): string[];
+  /** Patch one region by id; returns whether it existed. */
+  updateRegion(id: string, patch: RegionPatch): boolean;
+  /** Remove one region by id; returns whether it existed. */
+  removeRegion(id: string): boolean;
+  /** Remove all regions. */
+  clearRegions(): void;
   /** Auto-stretch to the data in view; resolves null before the first frame. */
   autoStretch(pLo?: number, pHi?: number): Promise<AutoStretchResult | null>;
   /** Centre + zoom so the whole mosaic is visible. */
@@ -121,6 +136,12 @@ export interface FitsViewerProps {
   onMarkerHover?: (e: MarkerEvent | null) => void;
   /** Built-in popup content for the hovered marker. Hot-swappable. */
   markerTooltip?: (m: ResolvedMarker) => string | HTMLElement | null;
+  /** Region click (non-drag, inside a footprint, no marker on top). Hot-swappable. */
+  onRegionClick?: (e: RegionEvent) => void;
+  /** Region hover change; null on leave. Hot-swappable. */
+  onRegionHover?: (e: RegionEvent | null) => void;
+  /** Built-in popup content for the hovered region (a marker tooltip wins). Hot-swappable. */
+  regionTooltip?: (r: ResolvedRegion) => string | HTMLElement | null;
   /** Fired once the viewer is constructed (and again after each band reload). */
   onReady?: (handle: FitsViewerHandle) => void;
   /** Fired if loading or viewer construction fails (e.g. no WebGL2, bad manifest). */
@@ -140,6 +161,9 @@ interface CallbackBag {
   onMarkerClick?: (e: MarkerEvent) => void;
   onMarkerHover?: (e: MarkerEvent | null) => void;
   markerTooltip?: (m: ResolvedMarker) => string | HTMLElement | null;
+  onRegionClick?: (e: RegionEvent) => void;
+  onRegionHover?: (e: RegionEvent | null) => void;
+  regionTooltip?: (r: ResolvedRegion) => string | HTMLElement | null;
   onReady?: (handle: FitsViewerHandle) => void;
   onError?: (err: unknown) => void;
 }
@@ -199,6 +223,18 @@ const FitsViewerComponent = forwardRef<FitsViewerHandle, FitsViewerProps>(functi
     if (cb.onMarkerHover !== undefined) handlers.onMarkerHover = (e) => latestRef.current.cb.onMarkerHover?.(e);
     if (cb.markerTooltip !== undefined) handlers.markerTooltip = (m) => latestRef.current.cb.markerTooltip?.(m) ?? null;
     viewer.setMarkerHandlers(handlers);
+  };
+
+  // Region handler trampolines — same pattern as markers (issue #16).
+  const installRegionHandlers = (): void => {
+    const viewer = viewerRef.current;
+    if (viewer === null) return;
+    const cb = latestRef.current.cb;
+    const handlers: RegionHandlers = {};
+    if (cb.onRegionClick !== undefined) handlers.onRegionClick = (e) => latestRef.current.cb.onRegionClick?.(e);
+    if (cb.onRegionHover !== undefined) handlers.onRegionHover = (e) => latestRef.current.cb.onRegionHover?.(e);
+    if (cb.regionTooltip !== undefined) handlers.regionTooltip = (r) => latestRef.current.cb.regionTooltip?.(r) ?? null;
+    viewer.setRegionHandlers(handlers);
   };
 
   // Run an auto-stretch action now if a frame has drawn (autoStretch is a no-op
@@ -276,6 +312,25 @@ const FitsViewerComponent = forwardRef<FitsViewerHandle, FitsViewerProps>(functi
       updateMarker: (id, patch) => viewerRef.current?.updateMarker(id, patch) ?? false,
       removeMarker: (id) => viewerRef.current?.removeMarker(id) ?? false,
       clearMarkers: () => viewerRef.current?.clearMarkers(),
+      setRegions: (r) => {
+        const v = viewerRef.current;
+        if (v === null) {
+          warnNoViewer('setRegions');
+          return [];
+        }
+        return v.setRegions(r);
+      },
+      addRegions: (r) => {
+        const v = viewerRef.current;
+        if (v === null) {
+          warnNoViewer('addRegions');
+          return [];
+        }
+        return v.addRegions(r);
+      },
+      updateRegion: (id, patch) => viewerRef.current?.updateRegion(id, patch) ?? false,
+      removeRegion: (id) => viewerRef.current?.removeRegion(id) ?? false,
+      clearRegions: () => viewerRef.current?.clearRegions(),
       autoStretch: (pLo, pHi) => viewerRef.current?.autoStretch(pLo, pHi) ?? Promise.resolve(null),
       fitToImage: () => viewerRef.current?.fitToImage(),
       setCenter: (x, y) => viewerRef.current?.setCenter(x, y),
@@ -374,6 +429,7 @@ const FitsViewerComponent = forwardRef<FitsViewerHandle, FitsViewerProps>(functi
         if (latest.stretch?.mode !== undefined) viewer.setStretchMode(latest.stretch.mode);
         applyControlledStretch(viewer, latest);
         installMarkerHandlers();
+        installRegionHandlers();
         applyInitialOverlay(viewer, latest);
 
         // From here the viewer reflects `latest`; the apply effect diffs against it.
@@ -446,6 +502,15 @@ const FitsViewerComponent = forwardRef<FitsViewerHandle, FitsViewerProps>(functi
     installMarkerHandlers();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasClick, hasHover, hasTooltip]);
+
+  // Same for the region handlers (issue #16).
+  const hasRegionClick = props.onRegionClick !== undefined;
+  const hasRegionHover = props.onRegionHover !== undefined;
+  const hasRegionTooltip = props.regionTooltip !== undefined;
+  useEffect(() => {
+    installRegionHandlers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasRegionClick, hasRegionHover, hasRegionTooltip]);
 
   const style = props.style === undefined ? CONTAINER_STYLE : { ...CONTAINER_STYLE, ...props.style };
   return (
