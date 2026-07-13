@@ -634,11 +634,26 @@ export class TileManager {
    * Upload up to `budget` queued tiles to the GPU (marking them resident this
    * frame) and return the number still queued. The viewer calls this once per
    * frame; when the return is > 0 it schedules another frame to drain the rest.
+   *
+   * `deadline` (a `performance.now()` timestamp) bounds the flush by wall-clock
+   * time as well as count: after each upload, if the deadline has passed, the
+   * rest of the queue waits for the next frame. The count cap alone assumes
+   * uploads are cheap, which they are not everywhere — Safari proxies every
+   * WebGL call to its GPU process and an R32F texImage2D lands 10–30× slower
+   * than Chrome's, so a burst of count-budgeted uploads (a zoom crossing a
+   * level re-uploads the whole viewport) blows the frame budget there and reads
+   * as stutter. At least one tile is always uploaded per call when the queue is
+   * non-empty — even past the deadline — so every band makes progress every
+   * frame regardless of how slow an individual upload is.
    */
-  flushUploads(budget: number, now = 0): number {
+  flushUploads(budget: number, now = 0, deadline = Number.POSITIVE_INFINITY): number {
     if (this.destroyed) return 0;
     let uploaded = 0;
-    while (uploaded < budget && this.pendingUploads.length > 0) {
+    while (
+      uploaded < budget &&
+      this.pendingUploads.length > 0 &&
+      (uploaded === 0 || performance.now() < deadline)
+    ) {
       const u = this.pendingUploads.shift()!;
       this.inflight.delete(u.key);
       const texture = createTileTexture(this.gl, u.width, u.height, u.data);

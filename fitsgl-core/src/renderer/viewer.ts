@@ -114,6 +114,19 @@ const DEFAULT_TEXTURE_BUDGET = 200;
  */
 const MAX_UPLOADS_PER_FRAME = 8;
 /**
+ * Wall-clock budget (ms) for GPU tile uploads per frame, shared across ALL
+ * bands (the count cap above is per band — 3× that in RGB mode). The count cap
+ * assumes uploads are cheap; on Safari, whose WebGL proxies every call to a GPU
+ * process, an R32F texImage2D is 10–30× slower than Chrome's, and the upload
+ * burst on a zoom-driven level switch was blowing whole frames there (zoom
+ * hitched while pan — which rarely changes level — stayed smooth). Bounding the
+ * flush by time keeps the frame rate intact on slow-upload browsers while fast
+ * ones still drain the full count. Each band always uploads at least one queued
+ * tile per frame, so bands advance together for RGB compositing no matter how
+ * slow uploads run.
+ */
+const MAX_UPLOAD_MS_PER_FRAME = 4;
+/**
  * Crossfade-in duration (ms) for a tile that appears OVER finer detail — the
  * zoom-OUT level switch, where the incoming coarse tile replaces sharper content
  * still resident underneath and a hard cut would pop. The tile ramps alpha 0→1
@@ -1829,10 +1842,13 @@ export class FitsViewer {
 
     // Drain a bounded number of pending GPU uploads per band before drawing, so a
     // burst of decoded tiles can't stall the frame; uploaded tiles draw this frame.
-    // The upload timestamp stamps each tile's crossfade-in start.
+    // Bounded by count per band AND wall-clock time across bands (see
+    // MAX_UPLOAD_MS_PER_FRAME). The upload timestamp stamps each tile's
+    // crossfade-in start.
     let queuedUploads = 0;
+    const uploadDeadline = this.frameNow + MAX_UPLOAD_MS_PER_FRAME;
     for (const m of this.bandManagers) {
-      queuedUploads += m.flushUploads(MAX_UPLOADS_PER_FRAME, this.frameNow);
+      queuedUploads += m.flushUploads(MAX_UPLOADS_PER_FRAME, this.frameNow, uploadDeadline);
     }
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
