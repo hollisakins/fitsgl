@@ -211,6 +211,22 @@ export interface CursorInfo {
   region: ResolvedRegion | null;
 }
 
+/**
+ * The slice of Safari's proprietary `GestureEvent` (trackpad pinch) the viewer
+ * reads. Safari is the one browser that does NOT synthesize ctrl+wheel for a
+ * pinch (Chrome/Firefox do, and the wheel handler catches those); it fires
+ * gesturestart/gesturechange/gestureend instead, and — unless they are
+ * preventDefault-ed — runs its own full-page zoom over the canvas. Not in
+ * TypeScript's DOM lib, so the shape is declared here and the events arrive
+ * through the string-typed `addEventListener` overload.
+ */
+interface SafariGestureEvent extends Event {
+  /** Cumulative pinch scale since gesturestart (1.0 at the start). */
+  readonly scale: number;
+  readonly clientX: number;
+  readonly clientY: number;
+}
+
 /** A point in world (native image-pixel) or drawing-buffer coordinates. */
 export interface ToolPoint {
   x: number;
@@ -575,6 +591,21 @@ export class FitsViewer {
   private lastDragX = 0;
   private lastDragY = 0;
 
+  // Zoom input is coalesced and applied once per drawn frame (applyPendingZoom):
+  // wheel deltas accumulate, a pinch stores its absolute target, and the anchor
+  // is the latest pointer position in client (CSS) coordinates. Safari dispatches
+  // wheel/gesture events on its own cadence, denser than and not aligned with
+  // rAF (Chrome aligns wheel dispatch with the frame), so per-event application
+  // there does redundant camera math and — worse — a forced synchronous layout
+  // per event (`clientToBuffer` reads getBoundingClientRect while the per-frame
+  // readout keeps layout dirty during a zoom), which reads as stutter.
+  private pendingWheelDelta = 0;
+  private pendingGestureZoom: number | null = null;
+  private zoomAnchorClientX = 0;
+  private zoomAnchorClientY = 0;
+  /** camera.zoom captured at gesturestart; the pinch scale is relative to it. */
+  private gestureBaseZoom = 0;
+
   /** The active pointer tool (ruler etc.), or null for default pan/marker-click. */
   private activeTool: PointerTool | null = null;
   /** True while `activeTool` is consuming a press→release gesture (suppresses pan + marker-click). */
@@ -587,6 +618,9 @@ export class FitsViewer {
   private readonly onMouseMove: (e: MouseEvent) => void;
   private readonly onMouseUp: (e: MouseEvent) => void;
   private readonly onWheel: (e: WheelEvent) => void;
+  private readonly onGestureStart: (e: Event) => void;
+  private readonly onGestureChange: (e: Event) => void;
+  private readonly onGestureEnd: (e: Event) => void;
   private readonly onCanvasMove: (e: MouseEvent) => void;
   private readonly onCanvasLeave: () => void;
   private readonly onKeyDown: (e: KeyboardEvent) => void;
@@ -804,16 +838,30 @@ export class FitsViewer {
     };
     this.onWheel = (e) => {
       e.preventDefault();
-      const p = this.toBufferCoords(e);
-      const target = this.camera.zoom * Math.pow(2, -e.deltaY * WHEEL_ZOOM_RATE);
-      // Anchor the zoom on the world point under the cursor *through the current
-      // orientation* — otherwise North-up zooms toward a vertically-flipped point.
-      const newZoom = this.camera.clampZoom(target);
-      const c = anchoredZoomCenter(this.camera, this.currentOrientation(), p.x, p.y, newZoom);
-      this.camera.setZoom(newZoom);
-      this.camera.setCenter(c.centerX, c.centerY);
-      this.markCameraMoved();
+      // Accumulate only; the anchored camera update happens once per drawn frame
+      // in applyPendingZoom (see the pendingWheelDelta field for why).
+      this.pendingWheelDelta += e.deltaY;
+      this.zoomAnchorClientX = e.clientX;
+      this.zoomAnchorClientY = e.clientY;
       this.requestRender();
+    };
+    this.onGestureStart = (e) => {
+      e.preventDefault(); // suppress Safari's own full-page pinch zoom
+      this.gestureBaseZoom = this.camera.zoom;
+      // The pinch owns the zoom gesture from here; drop any queued wheel input
+      // so a stray momentum-scroll residue can't fight it.
+      this.pendingWheelDelta = 0;
+    };
+    this.onGestureChange = (e) => {
+      e.preventDefault();
+      const g = e as SafariGestureEvent;
+      this.pendingGestureZoom = this.gestureBaseZoom * g.scale;
+      this.zoomAnchorClientX = g.clientX;
+      this.zoomAnchorClientY = g.clientY;
+      this.requestRender();
+    };
+    this.onGestureEnd = (e) => {
+      e.preventDefault();
     };
     this.onCanvasMove = (e) => {
       // Run when the host wants the cursor readout OR marker hover/tooltip — not
@@ -1665,6 +1713,11 @@ export class FitsViewer {
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mouseup', this.onMouseUp);
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
+    // Safari-only trackpad pinch (see SafariGestureEvent). No-ops elsewhere:
+    // other browsers never fire these event types.
+    this.canvas.addEventListener('gesturestart', this.onGestureStart, { passive: false });
+    this.canvas.addEventListener('gesturechange', this.onGestureChange, { passive: false });
+    this.canvas.addEventListener('gestureend', this.onGestureEnd, { passive: false });
     this.canvas.addEventListener('mousemove', this.onCanvasMove);
     this.canvas.addEventListener('mouseleave', this.onCanvasLeave);
     this.canvas.addEventListener('keydown', this.onKeyDown);
@@ -1682,6 +1735,9 @@ export class FitsViewer {
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('mouseup', this.onMouseUp);
     this.canvas.removeEventListener('wheel', this.onWheel);
+    this.canvas.removeEventListener('gesturestart', this.onGestureStart);
+    this.canvas.removeEventListener('gesturechange', this.onGestureChange);
+    this.canvas.removeEventListener('gestureend', this.onGestureEnd);
     this.canvas.removeEventListener('mousemove', this.onCanvasMove);
     this.canvas.removeEventListener('mouseleave', this.onCanvasLeave);
     this.canvas.removeEventListener('keydown', this.onKeyDown);
@@ -1730,7 +1786,37 @@ export class FitsViewer {
     }, PREFETCH_IDLE_MS);
   }
 
+  /**
+   * Apply the zoom input coalesced since the last frame — accumulated wheel
+   * deltas and/or the pinch target — as ONE anchored camera update, at the top
+   * of the frame. Rendering already happens at most once per rAF, so applying
+   * per event never showed intermediate states anyway; doing it here costs one
+   * getBoundingClientRect and one camera update per frame instead of one per
+   * event, which is what keeps Safari (whose wheel/gesture cadence is denser
+   * than and decoupled from rAF) from stuttering through a zoom. The zoom is
+   * anchored on the world point under the latest pointer position, through the
+   * current orientation — otherwise North-up zooms toward a flipped point.
+   */
+  private applyPendingZoom(): void {
+    const gestureZoom = this.pendingGestureZoom;
+    if (this.pendingWheelDelta === 0 && gestureZoom === null) return;
+    // A pinch update is an absolute target (base zoom × cumulative scale); wheel
+    // deltas are relative. If both landed in one frame the pinch wins — it
+    // already encodes the gesture's whole intent — and the wheel residue drops.
+    const target =
+      gestureZoom ?? this.camera.zoom * Math.pow(2, -this.pendingWheelDelta * WHEEL_ZOOM_RATE);
+    this.pendingWheelDelta = 0;
+    this.pendingGestureZoom = null;
+    const p = this.clientToBuffer(this.zoomAnchorClientX, this.zoomAnchorClientY);
+    const newZoom = this.camera.clampZoom(target);
+    const c = anchoredZoomCenter(this.camera, this.currentOrientation(), p.x, p.y, newZoom);
+    this.camera.setZoom(newZoom);
+    this.camera.setCenter(c.centerX, c.centerY);
+    this.markCameraMoved();
+  }
+
   private draw(): void {
+    this.applyPendingZoom();
     const gl = this.gl;
     this.frameCounter++;
     this.frameNow = performance.now();
