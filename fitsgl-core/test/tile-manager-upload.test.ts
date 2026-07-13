@@ -96,6 +96,26 @@ describe('TileManager upload queue (P4 throttling)', () => {
     mgr.destroy();
   });
 
+  it('stops at the wall-clock deadline but always uploads at least one tile', async () => {
+    const { gl } = fakeGl();
+    const mgr = new TileManager(gl, fakePyramid(), GEOMS, 200, () => {});
+    mgr.frame = 1;
+
+    for (let x = 0; x < 4; x++) mgr.request(0, x, 0);
+    await settle();
+
+    // A deadline already in the past: exactly one upload per flush — the
+    // guaranteed-progress floor for slow-upload browsers (Safari).
+    expect(mgr.flushUploads(8, 0, 0)).toBe(3);
+    expect(mgr.residentCount).toBe(1);
+    expect(mgr.flushUploads(8, 0, 0)).toBe(2);
+    expect(mgr.residentCount).toBe(2);
+    // No deadline (the default): the count cap governs and the queue drains.
+    expect(mgr.flushUploads(8, 0)).toBe(0);
+    expect(mgr.residentCount).toBe(4);
+    mgr.destroy();
+  });
+
   it('does not re-request a tile that is queued for upload', async () => {
     let calls = 0;
     const pyramid = {
