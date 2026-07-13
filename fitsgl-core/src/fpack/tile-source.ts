@@ -294,6 +294,26 @@ export interface TilePyramidOptions extends TileEngineOptions {
 }
 
 /**
+ * Build the decode worker pool `TilePyramid.load` would use for `options`, or
+ * `null` when pooling does not apply (no Worker support, or fetchers were
+ * injected without an explicit `useWorker: true` — the byte-observable test
+ * path). Extracted so `loadViewerSource` can apply the exact same policy ONCE
+ * and share a single pool across every band's engine, instead of each band
+ * paying its own pool of workers (an RGB view used to spawn 3 × poolSize).
+ */
+export function createPoolDecoder(options: TilePyramidOptions): WorkerPoolDecoder | null {
+  const canPool = options.workerFactory !== undefined || typeof Worker !== 'undefined';
+  const injectedFetchers = options.rangeFetch !== undefined || options.fetchImpl !== undefined;
+  const usePool = (options.useWorker ?? (canPool && !injectedFetchers)) && canPool;
+  if (!usePool) return null;
+  const factory =
+    options.workerFactory ??
+    ((): WorkerLike =>
+      new Worker(new URL('../worker.js', import.meta.url), { type: 'module' }) as WorkerLike);
+  return new WorkerPoolDecoder(options.poolSize ?? defaultPoolSize(), factory);
+}
+
+/**
  * Public façade over a `TileEngine` (plan P4, "Shape B"). The engine — manifest,
  * file metadata, fetch, RAM + disk caches, de-dup — always runs on the main
  * thread; the only difference between modes is the engine's decode executor:
@@ -310,20 +330,20 @@ export class TilePyramid {
   }
 
   static async load(manifestUrl: string, options: TilePyramidOptions = {}): Promise<TilePyramid> {
-    const canPool = options.workerFactory !== undefined || typeof Worker !== 'undefined';
-    const injectedFetchers = options.rangeFetch !== undefined || options.fetchImpl !== undefined;
-    const usePool = (options.useWorker ?? (canPool && !injectedFetchers)) && canPool;
-
-    if (!usePool) {
+    // An explicitly injected decode executor wins — no pool is created here.
+    // The engine closes the injected executor on destroy (single-owner
+    // semantics, same as it always has); a caller sharing one executor across
+    // pyramids hands each a release facade instead (see `loadViewerSource`).
+    if (options.decoder !== undefined) {
       const engine = await TileEngine.load(manifestUrl, options);
       return new TilePyramid(engine);
     }
 
-    const factory =
-      options.workerFactory ??
-      ((): WorkerLike =>
-        new Worker(new URL('../worker.js', import.meta.url), { type: 'module' }) as WorkerLike);
-    const pool = new WorkerPoolDecoder(options.poolSize ?? defaultPoolSize(), factory);
+    const pool = createPoolDecoder(options);
+    if (pool === null) {
+      const engine = await TileEngine.load(manifestUrl, options);
+      return new TilePyramid(engine);
+    }
     try {
       const engine = await TileEngine.load(manifestUrl, { ...options, decoder: pool });
       return new TilePyramid(engine);

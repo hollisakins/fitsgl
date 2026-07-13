@@ -13,7 +13,10 @@
  * M6 mosaic will need no config change.
  */
 
-import { TilePyramid, type TilePyramidOptions } from './fpack/tile-source.js';
+import { TilePyramid, createPoolDecoder, type TilePyramidOptions } from './fpack/tile-source.js';
+import type { DecodeExecutor } from './fpack/decode-executor.js';
+import type { BlobStore } from './fpack/blob-store.js';
+import { openDefaultBlobStore } from './fpack/idb-blob-store.js';
 import { isColormapName, isStretchMode, MAX_BANDS } from './renderer/index.js';
 import type {
   ColormapLUT,
@@ -233,27 +236,114 @@ export interface LoadedViewerSource {
 }
 
 /**
+ * A `close()` that forwards to `close` only on its `count`-th call — the release
+ * side of sharing one resource across N per-band owners (each band's engine
+ * closes its own facade on destroy; the underlying resource closes when the
+ * last one does).
+ */
+function releaseAfter(count: number, close: () => void): () => void {
+  let remaining = count;
+  return () => {
+    remaining--;
+    if (remaining === 0) close();
+  };
+}
+
+/**
+ * Per-band `TilePyramidOptions` that share ONE decode worker pool and ONE disk
+ * cache across all `n` bands, plus a `closeShared` for the load-failure path.
+ *
+ * Without this, every band's `TilePyramid.load` built its own worker pool (an
+ * RGB view spawned 3 × poolSize workers) and opened its own IndexedDB
+ * connection — each re-scanning the entire cache index at startup. The workers
+ * are stateless decode units and blob keys are namespaced by each band's
+ * manifest fingerprint, so both resources share safely. Each band gets a
+ * facade whose `close()` releases a refcount share; the engine's existing
+ * "close what you were given on destroy" behavior then frees the shared
+ * resource exactly when the LAST pyramid is destroyed — callers keep the
+ * documented contract (destroy every pyramid) with no new teardown API.
+ *
+ * Host-injected `opts.decoder`/`opts.blobStore` pass through untouched (the
+ * host owns their lifecycle). The shared pool's size still defaults to
+ * `min(4, hardwareConcurrency − 1)` — now the TOTAL across bands rather than
+ * per band; pass `poolSize` to raise decode parallelism.
+ */
+async function sharedBandOptions(
+  opts: TilePyramidOptions,
+  n: number,
+): Promise<{ perBand: TilePyramidOptions[]; closeShared: () => void }> {
+  const pool = opts.decoder === undefined ? createPoolDecoder(opts) : null;
+  // undefined = build the default store once here (null when unavailable, which
+  // is injected as an explicit null so the engines don't each retry the open).
+  const store = opts.blobStore === undefined ? await openDefaultBlobStore() : undefined;
+
+  const releasePool = pool !== null ? releaseAfter(n, () => pool.close()) : null;
+  const storeClose = store?.close;
+  const releaseStore =
+    store !== undefined && store !== null && storeClose !== undefined
+      ? releaseAfter(n, () => storeClose.call(store))
+      : null;
+
+  const perBand: TilePyramidOptions[] = [];
+  for (let i = 0; i < n; i++) {
+    const o: TilePyramidOptions = { ...opts };
+    if (pool !== null && releasePool !== null) {
+      const facade: DecodeExecutor = {
+        decode: (bytes, params) => pool.decode(bytes, params),
+        close: releasePool,
+      };
+      o.decoder = facade;
+    }
+    if (store !== undefined) {
+      const facade: BlobStore | null =
+        store === null
+          ? null
+          : {
+              get: (key) => store.get(key),
+              put: (key, bytes) => store.put(key, bytes),
+              close: releaseStore ?? undefined,
+            };
+      o.blobStore = facade;
+    }
+    perBand.push(o);
+  }
+  // Both closes are idempotent, so force-closing here and a straggler facade
+  // releasing later cannot double-free.
+  const closeShared = (): void => {
+    pool?.close();
+    if (store !== undefined && store !== null) store.close?.();
+  };
+  return { perBand, closeShared };
+}
+
+/**
  * Fetch the manifests for every band in `config` and build the initial render
  * source from `config.view`. All bands are loaded (not just the view's) so a host
- * can switch bands without a round-trip. Validates first (throws on a bad config,
- * including an M6 multi-tile band). The caller owns the returned pyramids and must
- * `destroy()` them on teardown.
+ * can switch bands without a round-trip, and they share one decode worker pool +
+ * one disk-cache connection (see `sharedBandOptions`). Validates first (throws on
+ * a bad config, including an M6 multi-tile band). The caller owns the returned
+ * pyramids and must `destroy()` them on teardown; destroying the last one
+ * releases the shared resources.
  */
 export async function loadViewerSource(
   config: ViewerConfig,
   opts: TilePyramidOptions = {},
 ): Promise<LoadedViewerSource> {
   validateViewerConfig(config);
+  const { perBand, closeShared } = await sharedBandOptions(opts, config.bands.length);
   // Load all bands concurrently; if any fails, destroy the ones that succeeded so
   // a partial load never leaks GPU/heap resources before rethrowing.
   const settled = await Promise.allSettled(
-    config.bands.map((band) => TilePyramid.load(band.tiles[0], opts)),
+    config.bands.map((band, i) => TilePyramid.load(band.tiles[0], perBand[i])),
   );
   const failure = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected');
   if (failure !== undefined) {
     for (const s of settled) {
       if (s.status === 'fulfilled') s.value.destroy();
     }
+    // A failed band never adopted its facade, so its refcount share would leak
+    // the shared pool/store — force-close them (idempotent) instead.
+    closeShared();
     throw failure.reason instanceof Error ? failure.reason : new Error(String(failure.reason));
   }
   const pyramids = new Map<string, TilePyramid>(
