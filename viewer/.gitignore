@@ -1,3 +1,4 @@
 node_modules/
-# The build output goes to ../fitsgl-py/src/fitsgl/_viewer (vendored,
-# committed) — there is no local dist/ to ignore here.
+# The vendor build goes to ../fitsgl-py/src/fitsgl/_viewer (vendored, committed).
+# dist/ appears only for dev/preview builds (FITSGL_VIEWER_OUTDIR=dist, see
+# docs/dev-preview.md) and is ignored by the root .gitignore dist/ rule.
