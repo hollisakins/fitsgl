@@ -142,3 +142,25 @@ def test_warns_when_rgb_default_spans_grids(tmp_path):
         build_fitsgl_config(bands, out, name="set", default_view=dv)
     # It still emits (the viewer falls back); the warning is advisory.
     assert out.is_file()
+
+
+def test_default_view_dict_weights_and_trilogy():
+    dv = default_view_dict(
+        mode="rgb",
+        r="c",
+        g="b",
+        b="a",
+        stretch="trilogy",
+        weights={"a": (0.0, 0.0, 1.0), "b": (0.0, 1.0, 0.0), "c": (1.0, 0.0, 0.0)},
+        trilogy={"noiselum": 0.12, "satpercent": 0.01},
+    )
+    assert dv["weights"] == [
+        {"band": "a", "weight": [0.0, 0.0, 1.0]},
+        {"band": "b", "weight": [0.0, 1.0, 0.0]},
+        {"band": "c", "weight": [1.0, 0.0, 0.0]},
+    ]
+    assert dv["trilogy"] == {"noiselum": 0.12, "satpercent": 0.01}
+    assert dv["stretch"] == {"mode": "trilogy"}
+    # weights are rgb-mode-only; single mode never emits them
+    single = default_view_dict(mode="single", band="a", weights={"a": (1.0, 0.0, 0.0)})
+    assert "weights" not in single

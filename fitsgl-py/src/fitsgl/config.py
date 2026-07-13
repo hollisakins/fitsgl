@@ -102,9 +102,15 @@ class ViewerSpec:
     r: str | None = None  # rgb
     g: str | None = None
     b: str | None = None
-    stretch: str | None = None  # linear | log | asinh
+    stretch: str | None = None  # linear | log | asinh | trilogy
     colormap: str | None = None  # single only
     north_up: bool | None = None
+    # ``[viewer.weights]`` — weighted-trilogy seed: band -> (wR, wG, wB), rgb mode
+    # only. Keys resolve through the band alias map (name or label), order kept.
+    weights: dict[str, tuple[float, float, float]] | None = None
+    # ``[viewer.trilogy]`` — producer-tuned trilogy knobs (noiselum / satpercent /
+    # noisesig / noisesig0); unset knobs keep the viewer's defaults.
+    trilogy: dict[str, float] | None = None
 
 
 @dataclass
@@ -404,4 +410,49 @@ def _parse_viewer(raw: object, band_alias: dict[str, str]) -> ViewerSpec:
     if north_up is not None:
         _require(isinstance(north_up, bool), "[viewer].north_up must be a boolean")
         out.north_up = north_up
+
+    weights = raw.get("weights")
+    if weights is not None:
+        _require(mode == "rgb", '[viewer.weights] requires default = "rgb"')
+        _require(isinstance(weights, dict), "[viewer.weights] must be a table of band -> [r, g, b]")
+        assert isinstance(weights, dict)
+        parsed: dict[str, tuple[float, float, float]] = {}
+        for key, value in weights.items():
+            _require(key in band_alias, f"[viewer.weights] references unknown band {key!r}")
+            _require(
+                isinstance(value, (list, tuple))
+                and len(value) == 3
+                and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value),
+                f"[viewer.weights].{key} must be a 3-element [r, g, b] number list",
+            )
+            assert isinstance(value, (list, tuple))
+            parsed[band_alias[key]] = (float(value[0]), float(value[1]), float(value[2]))
+        out.weights = parsed
+
+    trilogy = raw.get("trilogy")
+    if trilogy is not None:
+        _require(isinstance(trilogy, dict), "[viewer.trilogy] must be a table")
+        assert isinstance(trilogy, dict)
+        knobs: dict[str, float] = {}
+        for key, value in trilogy.items():
+            _require(
+                key in ("noiselum", "satpercent", "noisesig", "noisesig0"),
+                f"[viewer.trilogy] unknown knob {key!r} "
+                "(expected noiselum / satpercent / noisesig / noisesig0)",
+            )
+            _require(
+                isinstance(value, (int, float)) and not isinstance(value, bool),
+                f"[viewer.trilogy].{key} must be a number",
+            )
+            assert isinstance(value, (int, float))
+            v = float(value)
+            if key == "noiselum":
+                _require(0 < v < 1, "[viewer.trilogy].noiselum must be in (0, 1)")
+            elif key == "satpercent":
+                _require(0 < v < 100, "[viewer.trilogy].satpercent must be in (0, 100)")
+            else:
+                _require(v >= 0, f"[viewer.trilogy].{key} must be >= 0")
+            knobs[key] = v
+        if knobs:
+            out.trilogy = knobs
     return out

@@ -71,11 +71,23 @@ def default_view_dict(
     stretch: str | None = None,
     colormap: str | None = None,
     north_up: bool | None = None,
+    weights: dict[str, tuple[float, float, float]] | None = None,
+    trilogy: dict[str, float] | None = None,
 ) -> dict:
-    """Build the camelCase ``defaultView`` dict the contract expects."""
+    """Build the camelCase ``defaultView`` dict the contract expects.
+
+    ``weights`` (band -> (wR, wG, wB), rgb mode only) becomes the contract's
+    ``weights: [{band, weight}]`` list, seeding the weighted-trilogy composite;
+    ``trilogy`` carries the producer-tuned knobs (noiselum / satpercent /
+    noisesig / noisesig0) verbatim.
+    """
     dv: dict = {"mode": mode}
     if mode == "rgb":
         dv["r"], dv["g"], dv["b"] = r, g, b
+        if weights:
+            dv["weights"] = [
+                {"band": name, "weight": [w[0], w[1], w[2]]} for name, w in weights.items()
+            ]
     else:
         if band is not None:
             dv["band"] = band
@@ -83,6 +95,8 @@ def default_view_dict(
             dv["colormap"] = colormap
     if stretch is not None:
         dv["stretch"] = {"mode": stretch}
+    if trilogy:
+        dv["trilogy"] = dict(trilogy)
     if north_up is not None:
         dv["northUp"] = north_up
     return dv

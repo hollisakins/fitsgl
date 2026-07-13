@@ -341,6 +341,8 @@ def build_dataset(
         stretch=view.stretch,
         colormap=view.colormap,
         north_up=view.north_up,
+        weights=view.weights,
+        trilogy=view.trilogy,
     )
     log("writing fitsgl.json")
     bands = [(b.name, b.label, dataset_dir / b.name / "manifest.json") for b in config.bands]

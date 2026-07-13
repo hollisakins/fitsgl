@@ -492,3 +492,93 @@ def test_colormap_rejected_in_rgb_mode(tmp_path):
     )
     with pytest.raises(ValueError, match="colormap applies to single-band"):
         load_config(p)
+
+
+def test_viewer_weights_and_trilogy_knobs(tmp_path):
+    for n in ("a", "b", "c"):
+        touch(tmp_path, f"{n}.fits")
+    p = write_toml(
+        tmp_path,
+        """
+        [dataset]
+        name = "cosmos"
+        [[dataset.bands]]
+        name = "a"
+        input = "a.fits"
+        [[dataset.bands]]
+        name = "b"
+        input = "b.fits"
+        [[dataset.bands]]
+        name = "c"
+        input = "c.fits"
+        [viewer]
+        default = "rgb"
+        r = "c"
+        g = "b"
+        b = "a"
+        stretch = "trilogy"
+        [viewer.weights]
+        a = [0.0, 0.0, 1.0]
+        b = [0.0, 1.0, 0.0]
+        c = [1.0, 0.5, 0.0]
+        [viewer.trilogy]
+        noiselum = 0.12
+        satpercent = 0.01
+        """,
+    )
+    cfg = load_config(p)
+    assert cfg.viewer.weights == {
+        "a": (0.0, 0.0, 1.0),
+        "b": (0.0, 1.0, 0.0),
+        "c": (1.0, 0.5, 0.0),
+    }
+    assert list(cfg.viewer.weights) == ["a", "b", "c"]  # declaration order kept
+    assert cfg.viewer.trilogy == {"noiselum": 0.12, "satpercent": 0.01}
+
+
+def _viewer_toml(tmp_path, viewer_body):
+    for n in ("a", "b", "c"):
+        touch(tmp_path, f"{n}.fits")
+    return write_toml(
+        tmp_path,
+        f"""
+        [dataset]
+        name = "cosmos"
+        [[dataset.bands]]
+        name = "a"
+        input = "a.fits"
+        [[dataset.bands]]
+        name = "b"
+        input = "b.fits"
+        [[dataset.bands]]
+        name = "c"
+        input = "c.fits"
+        [viewer]
+        {viewer_body}
+        """,
+    )
+
+
+def test_viewer_weights_reject_unknown_band_and_single_mode(tmp_path):
+    import pytest
+
+    p = _viewer_toml(
+        tmp_path,
+        'default = "rgb"\nr = "a"\ng = "b"\nb = "c"\n[viewer.weights]\nzz = [1.0, 0.0, 0.0]',
+    )
+    with pytest.raises(Exception, match="unknown band 'zz'"):
+        load_config(p)
+    p = _viewer_toml(tmp_path, 'default = "single"\n[viewer.weights]\na = [1.0, 0.0, 0.0]')
+    with pytest.raises(Exception, match=r'requires default = "rgb"'):
+        load_config(p)
+
+
+def test_viewer_trilogy_rejects_bad_knobs(tmp_path):
+    import pytest
+
+    p = _viewer_toml(tmp_path, 'default = "single"\n[viewer.trilogy]\nnoiselum = 1.5')
+    with pytest.raises(Exception, match=r"noiselum must be in \(0, 1\)"):
+        load_config(p)
+    p = _viewer_toml(tmp_path, 'default = "single"\n[viewer.trilogy]\nnope = 1.0')
+    with pytest.raises(Exception, match="unknown knob 'nope'"):
+        load_config(p)
