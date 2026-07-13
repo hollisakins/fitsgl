@@ -1,0 +1,7 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "npm --prefix fitsgl-core install && npm --prefix viewer install",
+  "buildCommand": "FITSGL_VIEWER_OUTDIR=dist npm --prefix viewer run build",
+  "outputDirectory": "viewer/dist"
+}

@@ -11,6 +11,14 @@ const repoRoot = resolve(here, '..');
 // regenerates the committed artifact in place.
 const vendorDir = resolve(repoRoot, 'fitsgl-py', 'src', 'fitsgl', '_viewer');
 
+// Dev/preview builds (the Vercel app, docs/dev-preview.md) redirect the output
+// away from the committed vendor artifact: FITSGL_VIEWER_OUTDIR is resolved
+// against the viewer directory (e.g. `dist` → viewer/dist). Unset → vendor flow.
+const outDir =
+  process.env.FITSGL_VIEWER_OUTDIR !== undefined && process.env.FITSGL_VIEWER_OUTDIR !== ''
+    ? resolve(here, process.env.FITSGL_VIEWER_OUTDIR)
+    : vendorDir;
+
 export default defineConfig({
   // RELATIVE asset URLs (`./assets/...`) so the built site deploys under an
   // arbitrary subpath on a university web server (e.g. /~user/cosmos/), not just
@@ -18,7 +26,7 @@ export default defineConfig({
   base: './',
   plugins: [react()],
   build: {
-    outDir: vendorDir,
+    outDir,
     emptyOutDir: true, // outDir is outside this project root; opt in explicitly.
   },
   resolve: {

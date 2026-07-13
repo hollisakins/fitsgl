@@ -10,7 +10,9 @@ WebGL2.
 invariants and decisions that are *not* obvious from reading the code. End-user
 how-to lives in `docs/`: `docs/cli.md` (the producer CLI), `docs/core-integration.md`
 (consuming `@fitsgl/core`), `docs/server-reads.md` (the Python read-side/cutout
-API — `tiles`/`fpack_index`/`cutout`), and `docs/r2-setup.md` (Cloudflare R2 hosting).
+API — `tiles`/`fpack_index`/`cutout`), `docs/r2-setup.md` (Cloudflare R2 hosting),
+and `docs/dev-preview.md` (the Vercel preview app + `?dataset=` override for
+testing core changes against live R2 tiles without a deploy).
 
 ## Layout
 
