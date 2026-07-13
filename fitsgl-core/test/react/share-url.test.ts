@@ -21,6 +21,20 @@ describe('share-url encode/decode', () => {
     expect(decodeShareHash(hash)).toEqual(sample);
   });
 
+  it('round-trips trilogy knobs and weighted-composite entries', () => {
+    const s: ShareState = {
+      m: 'rgb',
+      s: 'trilogy',
+      tp: [0.12, 0.01, 1, 2],
+      w: [
+        ['F115W', 0, 0, 1],
+        ['F277W', 0, 1, 0],
+        ['F444W', 1, 0, 0],
+      ],
+    };
+    expect(decodeShareHash(`#v=${encodeShareState(s)}`)).toEqual(s);
+  });
+
   it('finds the v= param among other hash params', () => {
     const hash = `#a=1&v=${encodeShareState({ m: 'single', b: 'F200W' })}&z=9`;
     expect(decodeShareHash(hash)).toEqual({ m: 'single', b: 'F200W' });

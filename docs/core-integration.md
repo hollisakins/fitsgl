@@ -310,9 +310,19 @@ A non-exhaustive tour of `@fitsgl/core`:
   `validateCollection`, `COLLECTION_SCHEMA_VERSION`; `validateViewerConfig`,
   `renderSourceForView`, `loadViewerSource`.
 - **Stretch math:** `percentileRange`, `histogram`, `PERCENTILE_SAMPLE_CAP`,
-  `STRETCH_MODES`, `isStretchMode`; the trilogy helpers (`trilogyLevels`,
-  `solveTrilogyK`, `combineTrilogyLuminance`, `rainbowWeights`,
-  `DEFAULT_TRILOGY_PARAMS`, `MAX_BANDS`, …).
+  `STRETCH_MODES`, `isStretchMode`, `applySaturation` (the CPU reference of the
+  composite color-saturation the viewer's `setSaturation` drives); the trilogy
+  helpers (`trilogyLevels`, `solveTrilogyK`, `combineTrilogyLuminance`,
+  `rainbowWeights`, `DEFAULT_TRILOGY_PARAMS`, `MAX_BANDS`, …).
+- **Standalone display controls** (`@fitsgl/core/react`): `Knob`,
+  `TrilogyControls`, `TrilogyWeightMatrix`, `ensureExplorerStyles` — the
+  explorer's rotary weight knob, trilogy noise/saturation sliders, and per-band
+  weight matrix, exported for hosts composing their own chrome around
+  `<FitsViewer>`. Each injects the explorer stylesheet on mount; wrap them in an
+  element with the `fgl-embed` class to receive (or override) the design tokens.
+  The pure view-model helpers ride along: `bandRailModel`, `canComposite`,
+  `rainbowAction`, `trilogyComposite`, `isTrilogyComposite`,
+  `isBandSelectableForRgb`, `rgbActiveGroup`, `groupBands`, `hasZscalePreset`.
 - **Colormaps:** `COLORMAP_NAMES`, `COLORMAP_SIZE`, `isColormapName`,
   `colormapRGB`.
 - **WCS:** `parseWcs`, `pixToSky`, `skyToPix`, `formatRA`, `formatDec` (types

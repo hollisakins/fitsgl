@@ -37,6 +37,31 @@ describe('validateFitsglConfig', () => {
     expect(c.defaultView).toEqual({ mode: 'rgb', r: 'a', g: 'b', b: 'c', stretch: { mode: 'asinh' }, northUp: true });
   });
 
+  it('accepts producer trilogy knobs and rejects out-of-range values', () => {
+    const ok = validateFitsglConfig({
+      ...raw(),
+      defaultView: {
+        mode: 'rgb', r: 'a', g: 'b', b: 'c',
+        stretch: { mode: 'trilogy' },
+        trilogy: { noiselum: 0.12, satpercent: 0.01 },
+      },
+    });
+    // partial knobs pass through; unset knobs stay unset (viewer fills defaults)
+    expect(ok.defaultView.trilogy).toEqual({ noiselum: 0.12, satpercent: 0.01 });
+
+    const withKnob = (trilogy: unknown): Record<string, unknown> => ({
+      ...raw(),
+      defaultView: { mode: 'single', band: 'a', trilogy },
+    });
+    expect(() => validateFitsglConfig(withKnob({ noiselum: 1.5 }))).toThrow(/noiselum must be in \(0, 1\)/);
+    expect(() => validateFitsglConfig(withKnob({ satpercent: 0 }))).toThrow(/satpercent must be in \(0, 100\)/);
+    expect(() => validateFitsglConfig(withKnob({ noisesig: -1 }))).toThrow(/noisesig must be >= 0/);
+    expect(() => validateFitsglConfig(withKnob({ noiselum: 'x' }))).toThrow(/must be a finite number/);
+    expect(() => validateFitsglConfig(withKnob('x'))).toThrow(/trilogy" must be an object/);
+    // an empty knob object normalizes away entirely
+    expect(validateFitsglConfig(withKnob({})).defaultView.trilogy).toBeUndefined();
+  });
+
   it('carries a band pivotUm through validation', () => {
     const r = raw();
     (r.dataset as { bands: Array<Record<string, unknown>> }).bands[0].pivotUm = 1.501;

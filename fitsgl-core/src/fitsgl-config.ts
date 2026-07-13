@@ -101,6 +101,11 @@ export interface FitsglDefaultView {
   weights?: Array<{ band: string; weight: [number, number, number] }>;
   colormap?: ColormapName;
   stretch?: { mode?: StretchMode };
+  /** Producer-tuned trilogy knobs seeding the viewer's `TrilogyParams` (all
+   *  optional; unset knobs keep `DEFAULT_TRILOGY_PARAMS`). Levels still derive
+   *  live from the per-band `stats.trilogy` + these knobs — the producer ships
+   *  tuning, never baked levels. */
+  trilogy?: { noiselum?: number; satpercent?: number; noisesig?: number; noisesig0?: number };
   northUp?: boolean;
 }
 
@@ -310,6 +315,30 @@ export function validateFitsglConfig(raw: unknown): FitsglConfig {
     } else {
       defaultView.stretch = {};
     }
+  }
+  if (dvRaw.trilogy !== undefined && dvRaw.trilogy !== null) {
+    if (!isObj(dvRaw.trilogy)) throw new Error('fitsgl-config: "defaultView.trilogy" must be an object');
+    const tri: NonNullable<FitsglDefaultView['trilogy']> = {};
+    const knob = (key: 'noiselum' | 'satpercent' | 'noisesig' | 'noisesig0'): void => {
+      const v = dvRaw.trilogy as Record<string, unknown>;
+      if (v[key] === undefined || v[key] === null) return;
+      const n = asFiniteNum(v[key], `defaultView.trilogy.${key}`);
+      if (key === 'noiselum' && !(n > 0 && n < 1)) {
+        throw new Error('fitsgl-config: defaultView.trilogy.noiselum must be in (0, 1)');
+      }
+      if (key === 'satpercent' && !(n > 0 && n < 100)) {
+        throw new Error('fitsgl-config: defaultView.trilogy.satpercent must be in (0, 100)');
+      }
+      if ((key === 'noisesig' || key === 'noisesig0') && !(n >= 0)) {
+        throw new Error(`fitsgl-config: defaultView.trilogy.${key} must be >= 0`);
+      }
+      tri[key] = n;
+    };
+    knob('noiselum');
+    knob('satpercent');
+    knob('noisesig');
+    knob('noisesig0');
+    if (Object.keys(tri).length > 0) defaultView.trilogy = tri;
   }
   if (dvRaw.northUp !== undefined) {
     if (typeof dvRaw.northUp !== 'boolean') throw new Error('fitsgl-config: defaultView.northUp must be a boolean');

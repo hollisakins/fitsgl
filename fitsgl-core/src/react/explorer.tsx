@@ -113,6 +113,31 @@ function applyShareToState(
   if (u.s !== undefined && (STRETCH_MODES as readonly string[]).includes(u.s)) {
     next.stretch = u.s as StretchMode;
   }
+  const fin = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
+  if (
+    Array.isArray(u.tp) &&
+    u.tp.length === 4 &&
+    u.tp.every(fin) &&
+    u.tp[0] > 0 && u.tp[0] < 1 &&      // noiselum
+    u.tp[1] > 0 && u.tp[1] < 100 &&    // satpercent
+    u.tp[2] >= 0 && u.tp[3] >= 0       // noisesig / noisesig0
+  ) {
+    next.trilogyParams = {
+      noiselum: u.tp[0], satpercent: u.tp[1], noisesig: u.tp[2], noisesig0: u.tp[3],
+    };
+  }
+  if (Array.isArray(u.w)) {
+    const entries = u.w.filter(
+      (e): e is [string, number, number, number] =>
+        Array.isArray(e) && e.length === 4 && hasBand(e[0]) && fin(e[1]) && fin(e[2]) && fin(e[3]),
+    );
+    if (entries.length > 0 && entries.length === u.w.length) {
+      const weights: ExplorerState['weights'] = {};
+      for (const [name, r, g, b] of entries) weights[name] = [r, g, b];
+      next.weights = weights;
+      next.weightBands = entries.map((e) => e[0]);
+    }
+  }
   if (u.cm !== undefined && (COLORMAP_NAMES as readonly string[]).includes(u.cm)) {
     next.colormap = u.cm as ColormapName;
   }
@@ -415,7 +440,7 @@ function TriSlider({
  * the softening are derived from these + the band's precomputed global stats, so
  * there are no manual limit sliders here — moving a knob re-derives instantly.
  */
-function TrilogyControls({
+export function TrilogyControls({
   params,
   missing,
   onChange,
@@ -424,6 +449,7 @@ function TrilogyControls({
   missing: boolean;
   onChange: (patch: Partial<TrilogyParams>) => void;
 }): JSX.Element {
+  useEffect(ensureStyles, []);
   return (
     <div className="fgl-tri">
       {missing && (
@@ -496,7 +522,7 @@ const snap01 = (v: number): number => Math.round(clamp01(v) * 100) / 100;
  * and fill the arc proportionally. Fully controlled — no internal value state —
  * so an external write (Rainbow) is reflected immediately and exactly.
  */
-function Knob({
+export function Knob({
   value,
   color,
   label,
@@ -507,6 +533,7 @@ function Knob({
   label: string;
   onChange: (next: number) => void;
 }): JSX.Element {
+  useEffect(ensureStyles, []);
   const SIZE = 30;
   const STROKE = 3.5;
   const RADIUS = (SIZE - STROKE) / 2;
@@ -661,7 +688,7 @@ function Knob({
  * still apply globally below it. Edits are materialized into `weights`/`weightBands`
  * via `onApply` (the pure composite the parent derives the multiband view from).
  */
-function TrilogyWeightMatrix({
+export function TrilogyWeightMatrix({
   bands,
   state,
   onApply,
@@ -672,6 +699,7 @@ function TrilogyWeightMatrix({
   onApply: (entries: Array<{ band: string; weight: BandWeight }>) => void;
   onRainbow: () => void;
 }): JSX.Element {
+  useEffect(ensureStyles, []);
   const activeGroup = rgbActiveGroup(bands, state.rgb);
   const rows = groupBands(bands, activeGroup);
   const comp = new Map(trilogyComposite(state).map((e) => [e.band, e.weight] as const));
@@ -1659,6 +1687,16 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
       n: state.northUp ? 1 : 0,
       g: state.graticule ? 1 : 0,
     };
+    if (state.stretch === 'trilogy') {
+      const p = state.trilogyParams;
+      s.tp = [r(p.noiselum, 6), r(p.satpercent, 6), r(p.noisesig, 4), r(p.noisesig0, 4)];
+      if (state.weightBands.length > 0) {
+        s.w = state.weightBands.map((name) => {
+          const w = state.weights[name] ?? [0, 0, 0];
+          return [name, r(w[0], 4), r(w[1], 4), r(w[2], 4)];
+        });
+      }
+    }
     const v = handle.current?.getViewer() ?? null;
     const wcs = v?.getWcs() ?? null;
     const cam = v?.getCameraState() ?? null;
@@ -2373,13 +2411,23 @@ function ensureStyles(): void {
   document.head.appendChild(el);
 }
 
+/**
+ * Inject the explorer stylesheet once (idempotent; SSR-safe no-op). The exported
+ * standalone controls (`Knob`/`TrilogyControls`/`TrilogyWeightMatrix`) call this
+ * on mount themselves; a host composing custom chrome from `fgl-*` classes can
+ * call it directly. Standalone embeds get the explorer's design tokens by
+ * wrapping the controls in an element with the `fgl-embed` class (a host can
+ * override the CSS custom properties on that element to restyle).
+ */
+export const ensureExplorerStyles = ensureStyles;
+
 const STYLE_CSS = `
 /* ---- tokens (unchanged visual language) -------------------------------- */
-.fgl-explorer{--win:#0e1320;--inset:#080b12;--line:rgba(150,170,210,.11);--line2:rgba(150,170,210,.2);
+.fgl-explorer,.fgl-embed{--win:#0e1320;--inset:#080b12;--line:rgba(150,170,210,.11);--line2:rgba(150,170,210,.2);
   --text:#cdd5e3;--dim:#828ca3;--faint:#566073;--gold:#e0ad4d;--gold-d:#7d6630;
   --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
   color:var(--text);font-family:var(--mono);font-size:12.5px;}
-.fgl-explorer *{box-sizing:border-box;}
+.fgl-explorer *,.fgl-embed *{box-sizing:border-box;}
 .fgl-chev{color:var(--gold);font-size:10px;transition:transform .2s;}
 .fgl-win-ttl{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);}
 .fgl-cap{display:block;font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);margin-bottom:9px;}

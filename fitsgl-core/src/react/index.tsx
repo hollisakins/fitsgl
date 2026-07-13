@@ -538,6 +538,12 @@ export default FitsViewerComponent;
 // imports it) is evaluated by this re-export.
 export { FitsExplorer } from './explorer.js';
 export type { FitsExplorerProps } from './explorer.js';
+// Standalone display controls for hosts building their own chrome around
+// `<FitsViewer>` (e.g. CAMPFIRE's map display panel): the rotary weight knob,
+// the trilogy noise/saturation sliders, and the per-band weight matrix. Each
+// injects the explorer stylesheet on mount; wrap them in an element with the
+// `fgl-embed` class to pick up (or override) the design tokens.
+export { Knob, TrilogyControls, TrilogyWeightMatrix, ensureExplorerStyles } from './explorer.js';
 // The decorative boot/placeholder overlay (a `children` of `<FitsViewer>`); the
 // batteries-included `<FitsExplorer>` wires it up itself, but a bare-`<FitsViewer>`
 // host can drop it in too.
@@ -550,8 +556,26 @@ export {
   defaultViewFromConfig,
   explorerBandsFromDataset,
   defaultViewFromDataset,
+  // Pure view-model helpers for custom chrome (band rails, composite pickers,
+  // weight matrices) — no React, no GL; unit-testable in the host.
+  bandRailModel,
+  canComposite,
+  groupBands,
+  hasZscalePreset,
+  isBandSelectableForRgb,
+  isTrilogyComposite,
+  rainbowAction,
+  rgbActiveGroup,
+  trilogyComposite,
 } from './explorer-state.js';
-export type { ExplorerBand, ExplorerDefaultView, ExplorerState } from './explorer-state.js';
+export type {
+  BandChip,
+  BandRailChannel,
+  BandRailModel,
+  ExplorerBand,
+  ExplorerDefaultView,
+  ExplorerState,
+} from './explorer-state.js';
 // Convenience re-exports so a host using only the `/react` subpath can load and
 // type the producer contract without also importing the core barrel.
 export { loadFitsglConfig, fitsglConfigFromDataset } from '../index.js';

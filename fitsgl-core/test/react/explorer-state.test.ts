@@ -7,6 +7,7 @@ import {
   clampInspectorWidth,
   defaultExplorerState,
   defaultLayoutState,
+  defaultViewFromConfig,
   defaultViewFromDataset,
   deriveViewerConfig,
   explorerBandsFromConfig,
@@ -100,6 +101,18 @@ describe('defaultExplorerState', () => {
     expect(s.rgb).toEqual({ r: 'f444w', g: 'f277w', b: 'f150w' });
     expect(s.stretch).toBe('log');
     expect(s.northUp).toBe(false);
+  });
+  it('seeds trilogy knobs from the producer default, keeping unset defaults', () => {
+    const s = defaultExplorerState(BANDS, {
+      mode: 'rgb',
+      stretch: 'trilogy',
+      trilogy: { noiselum: 0.12, satpercent: 0.01 },
+    });
+    expect(s.trilogyParams).toEqual({ noiselum: 0.12, satpercent: 0.01, noisesig: 1, noisesig0: 2 });
+    // no producer knobs ⇒ library defaults
+    expect(defaultExplorerState(BANDS).trilogyParams).toEqual({
+      noiselum: 0.15, satpercent: 0.001, noisesig: 1, noisesig0: 2,
+    });
   });
   it('pads a triple when the largest group has fewer than three bands', () => {
     const s = defaultExplorerState([band('only', 0)]);
@@ -297,6 +310,42 @@ describe('defaultViewFromDataset', () => {
   });
   it('falls back to single when there is no default_rgb', () => {
     expect(defaultViewFromDataset({ ...DATASET, default_rgb: null })).toEqual({ mode: 'single' });
+  });
+});
+
+describe('defaultViewFromConfig', () => {
+  it('maps weights and trilogy knobs through from the wire config', () => {
+    const config: FitsglConfig = {
+      schemaVersion: 1,
+      dataset: {
+        name: 'set',
+        bands: [
+          { name: 'a', tiles: ['a/manifest.json'], grid: { group: 0 } },
+          { name: 'b', tiles: ['b/manifest.json'], grid: { group: 0 } },
+          { name: 'c', tiles: ['c/manifest.json'], grid: { group: 0 } },
+        ],
+      },
+      defaultView: {
+        mode: 'rgb',
+        r: 'c', g: 'b', b: 'a',
+        weights: [
+          { band: 'a', weight: [0, 0, 1] },
+          { band: 'b', weight: [0, 1, 0] },
+          { band: 'c', weight: [1, 0, 0] },
+        ],
+        stretch: { mode: 'trilogy' },
+        trilogy: { noiselum: 0.12 },
+      },
+    };
+    const dv = defaultViewFromConfig(config);
+    expect(dv.stretch).toBe('trilogy');
+    expect(dv.trilogy).toEqual({ noiselum: 0.12 });
+    expect(dv.weights).toHaveLength(3);
+    // and the seeded state drives the weighted composite on first paint
+    const s = defaultExplorerState(explorerBandsFromConfig(config), dv);
+    expect(isTrilogyComposite(s)).toBe(true);
+    expect(s.weightBands).toEqual(['a', 'b', 'c']);
+    expect(s.trilogyParams.noiselum).toBe(0.12);
   });
 });
 

@@ -23,6 +23,10 @@ export interface ShareState {
   rgb?: [string, string, string];
   /** Stretch mode name. */
   s?: string;
+  /** Trilogy knobs [noiselum, satpercent, noisesig, noisesig0] (trilogy stretch only). */
+  tp?: [number, number, number, number];
+  /** Weighted-trilogy composite: per-band [name, wR, wG, wB] entries (order = weightBands). */
+  w?: Array<[string, number, number, number]>;
   /** Colormap name. */
   cm?: string;
   /** North-up: 1 on, 0 off. */
