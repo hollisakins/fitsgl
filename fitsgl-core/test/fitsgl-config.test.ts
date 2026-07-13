@@ -37,6 +37,34 @@ describe('validateFitsglConfig', () => {
     expect(c.defaultView).toEqual({ mode: 'rgb', r: 'a', g: 'b', b: 'c', stretch: { mode: 'asinh' }, northUp: true });
   });
 
+  it('accepts producer trilogy knobs and rejects out-of-range values', () => {
+    const ok = validateFitsglConfig({
+      ...raw(),
+      defaultView: {
+        mode: 'rgb', r: 'a', g: 'b', b: 'c',
+        stretch: { mode: 'trilogy' },
+        trilogy: { noiselum: 0.12, satpercent: 0.01 },
+      },
+    });
+    // partial knobs pass through; unset knobs stay unset (viewer fills defaults)
+    expect(ok.defaultView.trilogy).toEqual({ noiselum: 0.12, satpercent: 0.01 });
+
+    const withKnob = (trilogy: unknown): Record<string, unknown> => ({
+      ...raw(),
+      defaultView: { mode: 'single', band: 'a', trilogy },
+    });
+    expect(() => validateFitsglConfig(withKnob({ noiselum: 1.5 }))).toThrow(/noiselum must be in \(0, 1\)/);
+    expect(() => validateFitsglConfig(withKnob({ satpercent: 0 }))).toThrow(/satpercent must be in \(0, 1\]/);
+    // 1 < satpercent would be silently clamped to 1 by saturationValue — reject it here
+    expect(() => validateFitsglConfig(withKnob({ satpercent: 10 }))).toThrow(/satpercent must be in \(0, 1\]/);
+    expect(validateFitsglConfig(withKnob({ satpercent: 1 })).defaultView.trilogy).toEqual({ satpercent: 1 });
+    expect(() => validateFitsglConfig(withKnob({ noisesig: -1 }))).toThrow(/noisesig must be >= 0/);
+    expect(() => validateFitsglConfig(withKnob({ noiselum: 'x' }))).toThrow(/must be a finite number/);
+    expect(() => validateFitsglConfig(withKnob('x'))).toThrow(/trilogy" must be an object/);
+    // an empty knob object normalizes away entirely
+    expect(validateFitsglConfig(withKnob({})).defaultView.trilogy).toBeUndefined();
+  });
+
   it('carries a band pivotUm through validation', () => {
     const r = raw();
     (r.dataset as { bands: Array<Record<string, unknown>> }).bands[0].pivotUm = 1.501;
@@ -82,6 +110,14 @@ describe('validateFitsglConfig', () => {
         defaultView: { mode: 'rgb', r: 'a', g: 'b', b: 'c', weights: [{ band: 'zz', weight: [1, 0, 0] }] },
       }),
     ).toThrow(/references unknown band "zz"/);
+    // a default longer than the renderer's composite cap fails HERE, not at setSource
+    const tooMany = Array.from({ length: 13 }, () => ({ band: 'a', weight: [1, 0, 0] }));
+    expect(() =>
+      validateFitsglConfig({
+        ...raw(),
+        defaultView: { mode: 'rgb', r: 'a', g: 'b', b: 'c', weights: tooMany },
+      }),
+    ).toThrow(/capped at 12 bands/);
   });
 
   it('accepts a minimal single-band config (no band/colormap/catalog/title)', () => {

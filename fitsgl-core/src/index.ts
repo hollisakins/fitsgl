@@ -64,7 +64,7 @@ export type {
 } from './renderer/index.js';
 
 // M1 — display modes: stretch curves + bundled colormaps (single-band).
-export { STRETCH_MODES, isStretchMode, applyStretch } from './renderer/index.js';
+export { STRETCH_MODES, isStretchMode, applyStretch, applySaturation } from './renderer/index.js';
 export type { StretchMode } from './renderer/index.js';
 // Trilogy stretch: pure level-determination math + precomputed-stats types, plus
 // the weighted multi-band helpers (faithful trilogy: per-band stretch + rainbow).

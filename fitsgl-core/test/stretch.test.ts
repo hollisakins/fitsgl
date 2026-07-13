@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
+  applySaturation,
   applyStretch,
   scaleValue,
   isStretchMode,
@@ -200,7 +201,7 @@ describe('TILE_FRAG shader — structure + constant injection', () => {
     // The composited (not-all-NaN) path writes RGB at the crossfade-in alpha
     // (u_opacity, == 1 once settled) — distinct from the no-data branch's full
     // alpha, so the occluding-no-data contract is preserved.
-    const composite = TILE_FRAG.indexOf('vec4(rs, gs, bs, u_opacity)');
+    const composite = TILE_FRAG.indexOf('vec4(saturateRGB(vec3(rs, gs, bs)), u_opacity)');
     expect(composite).toBeGreaterThan(bgOut);
     // Single-band no-data takes the same opaque-background path (a second u_bg out).
     expect(TILE_FRAG.indexOf('vec4(u_bg, 1.0)', composite)).toBeGreaterThan(composite);
@@ -479,5 +480,36 @@ describe('tile shaders — the single-UV constraint behind common-level-hold (M4
     expect(TILE_FRAG).toContain('u_minRGB.b');
     // A single shared transfer curve — no per-channel mode uniform.
     expect(TILE_FRAG).not.toContain('u_stretchModeRGB');
+  });
+});
+
+describe('applySaturation — composite color saturation (CPU reference of saturateRGB)', () => {
+  it('is the exact identity at 1 and grayscale (channel mean) at 0', () => {
+    const px: [number, number, number] = [0.8, 0.5, 0.2];
+    expect(applySaturation(px, 1)).toEqual(px);
+    const gray = applySaturation(px, 0);
+    expect(gray[0]).toBeCloseTo(0.5, 12);
+    expect(gray[1]).toBeCloseTo(0.5, 12);
+    expect(gray[2]).toBeCloseTo(0.5, 12);
+  });
+
+  it('boosts separation above 1 and clamps to [0,1]', () => {
+    const boosted = applySaturation([0.8, 0.5, 0.2], 2);
+    expect(boosted[0]).toBeCloseTo(1, 12); // 0.5 + 0.3*2 = 1.1 -> clamp
+    expect(boosted[1]).toBeCloseTo(0.5, 12);
+    expect(boosted[2]).toBeCloseTo(0, 12); // 0.5 - 0.3*2 = -0.1 -> clamp
+  });
+
+  it('preserves luminance for unclamped values', () => {
+    const [r, g, b] = applySaturation([0.6, 0.5, 0.4], 1.5);
+    expect((r + g + b) / 3).toBeCloseTo(0.5, 12);
+  });
+
+  it('the GLSL saturateRGB transcribes this reference (no drift)', () => {
+    // Same channel-mean luminance + mix; applied in RGB trilogy, plain RGB, and
+    // weighted paths, never in the single-band path.
+    expect(TILE_FRAG).toContain('float lum = (c.r + c.g + c.b) / 3.0;');
+    expect(TILE_FRAG).toContain('mix(vec3(lum), c, u_saturation)');
+    expect(TILE_FRAG.match(/saturateRGB\(/g)?.length).toBe(4); // 1 def + 3 call sites
   });
 });
