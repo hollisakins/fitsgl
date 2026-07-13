@@ -54,7 +54,10 @@ describe('validateFitsglConfig', () => {
       defaultView: { mode: 'single', band: 'a', trilogy },
     });
     expect(() => validateFitsglConfig(withKnob({ noiselum: 1.5 }))).toThrow(/noiselum must be in \(0, 1\)/);
-    expect(() => validateFitsglConfig(withKnob({ satpercent: 0 }))).toThrow(/satpercent must be in \(0, 100\)/);
+    expect(() => validateFitsglConfig(withKnob({ satpercent: 0 }))).toThrow(/satpercent must be in \(0, 1\]/);
+    // 1 < satpercent would be silently clamped to 1 by saturationValue — reject it here
+    expect(() => validateFitsglConfig(withKnob({ satpercent: 10 }))).toThrow(/satpercent must be in \(0, 1\]/);
+    expect(validateFitsglConfig(withKnob({ satpercent: 1 })).defaultView.trilogy).toEqual({ satpercent: 1 });
     expect(() => validateFitsglConfig(withKnob({ noisesig: -1 }))).toThrow(/noisesig must be >= 0/);
     expect(() => validateFitsglConfig(withKnob({ noiselum: 'x' }))).toThrow(/must be a finite number/);
     expect(() => validateFitsglConfig(withKnob('x'))).toThrow(/trilogy" must be an object/);
@@ -107,6 +110,14 @@ describe('validateFitsglConfig', () => {
         defaultView: { mode: 'rgb', r: 'a', g: 'b', b: 'c', weights: [{ band: 'zz', weight: [1, 0, 0] }] },
       }),
     ).toThrow(/references unknown band "zz"/);
+    // a default longer than the renderer's composite cap fails HERE, not at setSource
+    const tooMany = Array.from({ length: 13 }, () => ({ band: 'a', weight: [1, 0, 0] }));
+    expect(() =>
+      validateFitsglConfig({
+        ...raw(),
+        defaultView: { mode: 'rgb', r: 'a', g: 'b', b: 'c', weights: tooMany },
+      }),
+    ).toThrow(/capped at 12 bands/);
   });
 
   it('accepts a minimal single-band config (no band/colormap/catalog/title)', () => {

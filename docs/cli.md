@@ -284,7 +284,8 @@ stretch = "asinh"                # linear | log | asinh | trilogy
 
 # Optional weighted-trilogy seed (rgb mode only): each participating band's
 # (R, G, B) contribution weight; the viewer opens on the faithful weighted
-# composite instead of the strict r/g/b triple. Keys are band names (or labels).
+# composite instead of the strict r/g/b triple. Keys are band names (or labels);
+# at most 12 entries (the viewer's composite cap).
 # [viewer.weights]
 # f150w = [0.0, 0.0, 1.0]
 # f277w = [0.0, 1.0, 0.0]
@@ -295,7 +296,8 @@ stretch = "asinh"                # linear | log | asinh | trilogy
 # derive live from per-band stats + these knobs — never baked in.
 # [viewer.trilogy]
 # noiselum = 0.12                # (0, 1)
-# satpercent = 0.01              # (0, 100)
+# satpercent = 0.01              # (0, 1] — % of pixels clipped; the stats tail
+#                                #   spans p99..p99.999, so <0.001 clamps to 0.001
 # noisesig = 1.0                 # >= 0
 # noisesig0 = 2.0                # >= 0
 ```
@@ -306,9 +308,10 @@ Key notes, verified against the parser:
   is optional for `single` (defaults to the first band). View keys reference a
   band's `name` (or its original toml name) and must resolve to a known band.
 - `[viewer].stretch` must be one of `linear | log | asinh | trilogy`. `colormap`
-  applies to single-band mode only. `[viewer.weights]` requires `default = "rgb"`
-  and known band keys; `[viewer.trilogy]` accepts only the four knobs, with
-  range checks matching the TS validator.
+  applies to single-band mode only. `[viewer.weights]` requires `default = "rgb"`,
+  known band keys, and at most 12 entries (the viewer's composite cap);
+  `[viewer.trilogy]` accepts only the four knobs, with range checks matching
+  the TS validator.
 - `[build]` numeric keys are integers; `quantize_level` and `tile_size` must be
   positive, `supertile_blocks ≥ 1`. Changing any of these requires `fitsgl build
   --overwrite`.

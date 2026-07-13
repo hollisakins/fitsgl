@@ -582,3 +582,45 @@ def test_viewer_trilogy_rejects_bad_knobs(tmp_path):
     p = _viewer_toml(tmp_path, 'default = "single"\n[viewer.trilogy]\nnope = 1.0')
     with pytest.raises(Exception, match="unknown knob 'nope'"):
         load_config(p)
+
+
+def test_viewer_weights_capped_at_composite_max(tmp_path):
+    import pytest
+
+    from fitsgl.config import MAX_COMPOSITE_BANDS
+
+    n = MAX_COMPOSITE_BANDS + 1
+    for i in range(n):
+        touch(tmp_path, f"b{i}.fits")
+    bands = "\n".join(
+        f'[[dataset.bands]]\nname = "b{i}"\ninput = "b{i}.fits"' for i in range(n)
+    )
+    weights = "\n".join(f"b{i} = [1.0, 0.0, 0.0]" for i in range(n))
+    p = write_toml(
+        tmp_path,
+        f"""
+        [dataset]
+        name = "cosmos"
+        {bands}
+        [viewer]
+        default = "rgb"
+        r = "b0"
+        g = "b1"
+        b = "b2"
+        [viewer.weights]
+        {weights}
+        """,
+    )
+    with pytest.raises(Exception, match=r"caps a\s+composite at 12 bands"):
+        load_config(p)
+
+
+def test_viewer_trilogy_satpercent_rejects_above_one(tmp_path):
+    import pytest
+
+    p = _viewer_toml(tmp_path, 'default = "single"\n[viewer.trilogy]\nsatpercent = 10.0')
+    with pytest.raises(Exception, match=r"satpercent must be in \(0, 1\]"):
+        load_config(p)
+    # exactly 1 (one percent of pixels clipped) is the top of the honored range
+    p = _viewer_toml(tmp_path, 'default = "single"\n[viewer.trilogy]\nsatpercent = 1.0')
+    assert load_config(p).viewer.trilogy == {"satpercent": 1.0}

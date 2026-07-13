@@ -119,7 +119,7 @@ function applyShareToState(
     u.tp.length === 4 &&
     u.tp.every(fin) &&
     u.tp[0] > 0 && u.tp[0] < 1 &&      // noiselum
-    u.tp[1] > 0 && u.tp[1] < 100 &&    // satpercent
+    u.tp[1] > 0 && u.tp[1] <= 1 &&     // satpercent (stats tail spans 0.001..1)
     u.tp[2] >= 0 && u.tp[3] >= 0       // noisesig / noisesig0
   ) {
     next.trilogyParams = {
@@ -131,7 +131,7 @@ function applyShareToState(
       (e): e is [string, number, number, number] =>
         Array.isArray(e) && e.length === 4 && hasBand(e[0]) && fin(e[1]) && fin(e[2]) && fin(e[3]),
     );
-    if (entries.length > 0 && entries.length === u.w.length) {
+    if (entries.length > 0 && entries.length === u.w.length && entries.length <= MAX_BANDS) {
       const weights: ExplorerState['weights'] = {};
       for (const [name, r, g, b] of entries) weights[name] = [r, g, b];
       next.weights = weights;

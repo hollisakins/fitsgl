@@ -24,7 +24,7 @@
 
 import { compatibleBands, resolveDatasetBandUrl, type DatasetBand, type DatasetManifest } from './dataset.js';
 import { isColormapName, type ColormapName } from './renderer/colormaps.js';
-import { isStretchMode, type StretchMode } from './renderer/stretch.js';
+import { isStretchMode, MAX_BANDS, type StretchMode } from './renderer/stretch.js';
 
 /** The FitsglConfig schema major version this client accepts. */
 export const FITSGL_SCHEMA_VERSION = 1;
@@ -290,6 +290,13 @@ export function validateFitsglConfig(raw: unknown): FitsglConfig {
       if (!Array.isArray(dvRaw.weights)) {
         throw new Error('fitsgl-config: defaultView.weights must be an array');
       }
+      if (dvRaw.weights.length > MAX_BANDS) {
+        // The renderer caps a composite at MAX_BANDS; a longer default would
+        // fail at setSource with an opaque load error instead of here.
+        throw new Error(
+          `fitsgl-config: defaultView.weights has ${dvRaw.weights.length} entries — a composite is capped at ${MAX_BANDS} bands`,
+        );
+      }
       defaultView.weights = dvRaw.weights.map((w, i) => {
         if (!isObj(w)) throw new Error(`fitsgl-config: defaultView.weights[${i}] must be an object`);
         const wband = asStr(w.band, `defaultView.weights[${i}].band`);
@@ -326,8 +333,12 @@ export function validateFitsglConfig(raw: unknown): FitsglConfig {
       if (key === 'noiselum' && !(n > 0 && n < 1)) {
         throw new Error('fitsgl-config: defaultView.trilogy.noiselum must be in (0, 1)');
       }
-      if (key === 'satpercent' && !(n > 0 && n < 100)) {
-        throw new Error('fitsgl-config: defaultView.trilogy.satpercent must be in (0, 100)');
+      // The saturation solve interpolates the precomputed p99..p99.999 tail, so
+      // satpercent is meaningful only in [0.001, 1] — saturationValue clamps to
+      // that range. Reject values above 1 outright (they'd silently render as 1);
+      // below 0.001 the clamp is a documented soft floor.
+      if (key === 'satpercent' && !(n > 0 && n <= 1)) {
+        throw new Error('fitsgl-config: defaultView.trilogy.satpercent must be in (0, 1]');
       }
       if ((key === 'noisesig' || key === 'noisesig0') && !(n >= 0)) {
         throw new Error(`fitsgl-config: defaultView.trilogy.${key} must be >= 0`);
