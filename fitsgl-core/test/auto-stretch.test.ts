@@ -43,6 +43,29 @@ describe('percentileRange', () => {
       expect(r[1]).toBeGreaterThan(900);
     }
   });
+
+  it('estimates percentiles accurately on input far larger than the default cap', () => {
+    // A 1M ramp (≈16 tiles' worth of pixels): stride sampling of a ramp is
+    // uniform, so the estimate should land within one stride of the true value.
+    const arr = Float32Array.from({ length: 1_000_000 }, (_, i) => i);
+    const r = percentileRange([arr], 0.01, 0.99);
+    expect(r).not.toBeNull();
+    if (r !== null) {
+      expect(Math.abs(r[0] - 10_000)).toBeLessThan(20);
+      expect(Math.abs(r[1] - 990_000)).toBeLessThan(20);
+    }
+  });
+
+  it('preserves exact float32 values (no precision loss in the sample buffer)', () => {
+    // 0.1 is inexact in binary; the sampled copy must return the float32-rounded
+    // value bit-exactly, not a re-rounded approximation.
+    const v = Math.fround(0.1);
+    const arr = new Float32Array([v, v, v, v]);
+    expect(percentileRange([arr], 0, 1, CAP)).toBeNull(); // constant -> collapsed
+    const arr2 = new Float32Array([v, 2 * v]);
+    const r = percentileRange([arr2], 0, 1, CAP);
+    expect(r).toEqual([v, 2 * v]);
+  });
 });
 
 describe('histogram', () => {

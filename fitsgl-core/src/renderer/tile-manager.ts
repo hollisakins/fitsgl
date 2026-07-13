@@ -602,15 +602,31 @@ export class TileManager {
   }
 
   /**
-   * Abort in-flight FETCHES at `level` whose key is not in `retain` — tiles that
-   * scrolled out of the viewport + prefetch ring before they finished loading.
-   * Only fetch-phase tiles at the current level are cancelled; already-decoded
-   * tiles and tiles at other levels (coarse fallbacks, the coarsest prime) are
-   * left untouched. The aborted requests clean themselves up in their `.catch`.
+   * Abort in-flight FETCHES the current frame no longer wants (P6a + P6b):
+   *
+   *  - At `level` (the displayed level): any fetch whose key is not in `retain`
+   *    (the visible + prefetch-ring tiles) — a tile that scrolled out of the
+   *    retention region before it finished loading.
+   *  - At any level NOT in `keepLevels`: every fetch. The manager only ever
+   *    issues fetches at the displayed level, its prefetched parent, and the
+   *    pinned floor, so a fetch at any other level is a leftover from a level
+   *    the camera has since moved past — a fast multi-level zoom requests
+   *    visible tiles at every level it crosses, and those uncancelled fetches
+   *    otherwise keep competing with the target level for bandwidth and decode
+   *    slots (the "stuck at low resolution after a fast zoom" stall). The
+   *    caller lists the levels still wanted; fetches there are kept unfiltered
+   *    (their retention isn't tracked per-key).
+   *
+   * Decoded tiles are untouched (decode can't be unspent); aborted requests
+   * clean themselves up in their `.catch`.
    */
-  cancelExcept(level: number, retain: Set<string>): void {
+  cancelExcept(level: number, retain: Set<string>, keepLevels: readonly number[]): void {
     for (const [key, f] of this.fetches) {
-      if (f.level === level && !retain.has(key)) f.controller.abort();
+      if (f.level === level) {
+        if (!retain.has(key)) f.controller.abort();
+      } else if (!keepLevels.includes(f.level)) {
+        f.controller.abort();
+      }
     }
   }
 

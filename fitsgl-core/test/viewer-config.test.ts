@@ -1,11 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import type { TilePyramid } from '../src/fpack/tile-source.js';
+import type { TilePyramid, TilePyramidOptions } from '../src/fpack/tile-source.js';
+import type { DecodeExecutor } from '../src/fpack/decode-executor.js';
+import { FpackFile } from '../src/fpack/fpack-file.js';
 import {
   validateViewerConfig,
   renderSourceForView,
+  loadViewerSource,
   type BandConfig,
   type ViewerConfig,
 } from '../src/viewer-config.js';
+import { manifestFetch, fixtureRangeFetcher, createInProcessWorker } from './helpers.js';
 
 const band = (name: string, tiles: string[] = [`${name}.json`]): BandConfig => ({ name, tiles });
 
@@ -223,5 +227,101 @@ describe('renderSourceForView', () => {
     expect(() => renderSourceForView({ mode: 'single', band: 'a' }, pyrs)).toThrow(
       /no loaded pyramid for band "a"/,
     );
+  });
+});
+
+describe('loadViewerSource — shared decode pool + disk store (F5)', () => {
+  // All bands resolve to the same committed fixture manifest (manifestFetch
+  // serves it for any URL), so a 3-band config loads three real engines. URLs
+  // are absolute because level filenames resolve against the manifest URL.
+  const aband = (name: string): BandConfig => ({
+    name,
+    tiles: [`http://fixtures.test/${name}/manifest.json`],
+  });
+  const cfg3: ViewerConfig = {
+    bands: [aband('r'), aband('g'), aband('b')],
+    view: { mode: 'rgb', r: 'r', g: 'g', b: 'b' },
+  };
+
+  function sharedOpts(workers: Array<ReturnType<typeof createInProcessWorker>>): TilePyramidOptions {
+    return {
+      useWorker: true,
+      poolSize: 2,
+      workerFactory: () => {
+        const w = createInProcessWorker();
+        workers.push(w);
+        return w;
+      },
+      fetchImpl: manifestFetch(),
+      rangeFetch: fixtureRangeFetcher().fetch,
+      blobStore: null,
+    };
+  }
+
+  it('spawns poolSize workers TOTAL (not per band) and decodes every band through them', async () => {
+    const workers: Array<ReturnType<typeof createInProcessWorker>> = [];
+    const { pyramids } = await loadViewerSource(cfg3, sharedOpts(workers));
+    expect(pyramids.size).toBe(3);
+    expect(workers.length).toBe(2); // one shared pool — was 3 × 2 before sharing
+
+    const tiles = await Promise.all([...pyramids.values()].map((p) => p.getTile(0, 0, 0)));
+    for (const t of tiles) expect(t.length).toBe(256 * 256);
+    for (const p of pyramids.values()) p.destroy();
+  });
+
+  it('keeps the shared pool alive until the LAST pyramid is destroyed', async () => {
+    const workers: Array<ReturnType<typeof createInProcessWorker>> = [];
+    const { pyramids } = await loadViewerSource(cfg3, sharedOpts(workers));
+    const ps = [...pyramids.values()];
+
+    ps[0].destroy();
+    ps[1].destroy();
+    expect(workers.some((w) => w.terminated)).toBe(false); // band 3 still decoding
+    ps[2].destroy();
+    expect(workers.every((w) => w.terminated)).toBe(true); // last owner released it
+  });
+
+  it('force-closes the shared pool when any band fails to load', async () => {
+    const workers: Array<ReturnType<typeof createInProcessWorker>> = [];
+    const good = manifestFetch();
+    const fetchImpl = (async (url: unknown) =>
+      String(url).includes('bad')
+        ? new Response('missing', { status: 404 })
+        : good(url as never)) as typeof fetch;
+    const cfg: ViewerConfig = {
+      bands: [aband('a'), aband('bad')],
+      view: { mode: 'single', band: 'a' },
+    };
+    await expect(
+      loadViewerSource(cfg, { ...sharedOpts(workers), fetchImpl }),
+    ).rejects.toThrow(/manifest fetch failed|404/i);
+    expect(workers.length).toBe(2); // the pool was built before the loads
+    expect(workers.every((w) => w.terminated)).toBe(true); // and torn down on failure
+  });
+
+  it('an explicitly injected decoder passes through to every band untouched', async () => {
+    let decodes = 0;
+    let closes = 0;
+    const inline: DecodeExecutor = {
+      decode: (bytes, params) => {
+        decodes++;
+        return FpackFile.decodeTile(bytes, params);
+      },
+      close: () => {
+        closes++;
+      },
+    };
+    const { pyramids } = await loadViewerSource(cfg3, {
+      decoder: inline,
+      fetchImpl: manifestFetch(),
+      rangeFetch: fixtureRangeFetcher().fetch,
+      blobStore: null,
+    });
+    await Promise.all([...pyramids.values()].map((p) => p.getTile(0, 0, 0)));
+    expect(decodes).toBe(3);
+    for (const p of pyramids.values()) p.destroy();
+    // Host-owned executor: each engine closes what it was handed (pre-existing
+    // single-owner semantics) — the host's no-op close absorbs it.
+    expect(closes).toBe(3);
   });
 });

@@ -9,8 +9,16 @@
  * because only it knows the frame's level + bounds.
  */
 
-/** Default cap on the sampled value count so a wide viewport's sort stays cheap. */
-export const PERCENTILE_SAMPLE_CAP = 1_000_000;
+/**
+ * Default cap on the sampled value count so a wide viewport's percentile sort
+ * stays cheap. This runs on the MAIN thread (autoStretch / visibleHistogram fire
+ * on the explorer's first frame and on every stretch change), so the cap bounds
+ * a user-visible stall: 2^17 samples sort in single-digit milliseconds, where
+ * the previous 1M cap made first paint jank for hundreds of ms. Statistically
+ * it is still generous — even the 0.1th-percentile domain edge rests on ~130
+ * samples, and stride sampling keeps the estimate unbiased.
+ */
+export const PERCENTILE_SAMPLE_CAP = 131_072;
 
 /**
  * The `[pLo, pHi]`-percentile pair over the finite values across `arrays`
@@ -29,20 +37,25 @@ export function percentileRange(
   if (total === 0) return null;
   const stride = total > cap ? Math.ceil(total / cap) : 1;
 
-  const vals: number[] = [];
+  // Collect into a preallocated typed array: TypedArray.prototype.sort is
+  // numeric by default and skips both the per-comparison callback and boxed
+  // doubles of a number[] sort — the sort dominates this function, and it runs
+  // on the main thread. Float64 holds every float32 value exactly. Sampled
+  // indices are 0, stride, 2·stride, …, so ceil(total / stride) bounds the count.
+  const vals = new Float64Array(Math.ceil(total / stride));
+  let n = 0;
   let idx = 0;
   for (const a of arrays) {
     for (let i = 0; i < a.length; i++, idx++) {
       if (stride > 1 && idx % stride !== 0) continue;
       const v = a[i];
-      if (Number.isFinite(v)) vals.push(v);
+      if (Number.isFinite(v)) vals[n++] = v;
     }
   }
-  if (vals.length === 0) return null;
-  vals.sort((x, y) => x - y);
+  if (n === 0) return null;
+  const sorted = vals.subarray(0, n).sort();
 
-  const at = (p: number): number =>
-    vals[Math.min(vals.length - 1, Math.max(0, Math.round(p * (vals.length - 1))))];
+  const at = (p: number): number => sorted[Math.min(n - 1, Math.max(0, Math.round(p * (n - 1))))];
   const lo = at(pLo);
   const hi = at(pHi);
   if (!(hi > lo)) return null;
