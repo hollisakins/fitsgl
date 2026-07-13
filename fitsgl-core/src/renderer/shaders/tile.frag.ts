@@ -72,6 +72,7 @@ uniform vec3 u_maxRGB;
 uniform float u_opacity;    // crossfade-in ramp (1 = fully settled); scales alpha
 uniform float u_trilogyK;   // trilogy softening (mode 3); solved on the host from noiselum
 uniform float u_trilogyLsat;// trilogy RGB: bias-subtracted luminance mapping to 1
+uniform float u_saturation; // composite color saturation (1 = identity, 0 = grayscale)
 uniform vec3 u_bg;          // opaque background colour; NaN/no-data pixels emit this
 
 // Declared before the uniform block below: GLSL ES requires the array-size
@@ -115,6 +116,16 @@ float scaleChannel(float v, float lo, float hi, float k) {
   return applyStretch(norm, k);
 }
 
+// Composite color saturation about the channel-mean luminance (the same simple
+// average the trilogy shared-luminance path uses, not a perceptual weighting —
+// channels are fluxes, not display primaries). 1 = identity, 0 = grayscale,
+// >1 boosts separation. Mirrors stretch.ts applySaturation.
+vec3 saturateRGB(vec3 c) {
+  if (u_saturation == 1.0) return c;
+  float lum = (c.r + c.g + c.b) / 3.0;
+  return clamp(mix(vec3(lum), c, u_saturation), 0.0, 1.0);
+}
+
 // Sample band texture \`idx\` from the sampler array via literal-constant indices
 // (see bandSamplerDispatch / GLSL ES 3.00 §4.1.7): a sampler-array subscript must
 // be a constant integral expression, which a loop variable is not.
@@ -149,17 +160,17 @@ void main() {
       float norm = clamp(L / u_trilogyLsat, 0.0, 1.0);
       float z = applyStretch(norm, u_trilogyK);
       float scale = L > 0.0 ? z / L : 0.0;
-      outColor = vec4(
+      vec3 tri = vec3(
         clamp(rb * scale, 0.0, 1.0),
         clamp(gb * scale, 0.0, 1.0),
-        clamp(bb * scale, 0.0, 1.0),
-        u_opacity);
+        clamp(bb * scale, 0.0, 1.0));
+      outColor = vec4(saturateRGB(tri), u_opacity);
       return;
     }
     float rs = rn ? 0.0 : scaleChannel(r, u_minRGB.r, u_maxRGB.r, u_trilogyK);
     float gs = gn ? 0.0 : scaleChannel(g, u_minRGB.g, u_maxRGB.g, u_trilogyK);
     float bs = bn ? 0.0 : scaleChannel(b, u_minRGB.b, u_maxRGB.b, u_trilogyK);
-    outColor = vec4(rs, gs, bs, u_opacity);
+    outColor = vec4(saturateRGB(vec3(rs, gs, bs)), u_opacity);
     return;
   }
 
@@ -191,7 +202,7 @@ void main() {
       u_weightSum.r > 0.0 ? num.r / u_weightSum.r : 0.0,
       u_weightSum.g > 0.0 ? num.g / u_weightSum.g : 0.0,
       u_weightSum.b > 0.0 ? num.b / u_weightSum.b : 0.0);
-    outColor = vec4(clamp(rgb, 0.0, 1.0), u_opacity);
+    outColor = vec4(saturateRGB(clamp(rgb, 0.0, 1.0)), u_opacity);
     return;
   }
 

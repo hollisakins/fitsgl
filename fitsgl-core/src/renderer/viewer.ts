@@ -482,6 +482,7 @@ export class FitsViewer {
   private readonly uOpacity: WebGLUniformLocation | null;
   private readonly uTrilogyK: WebGLUniformLocation | null;
   private readonly uTrilogyLsat: WebGLUniformLocation | null;
+  private readonly uSaturation: WebGLUniformLocation | null;
   private readonly uBg: WebGLUniformLocation | null;
   // Weighted multi-band trilogy (u_mode == 2) uniform-array bases.
   private readonly uBand: WebGLUniformLocation | null;
@@ -503,6 +504,8 @@ export class FitsViewer {
   /** Trilogy softening (mode 3); single-band uses its own, RGB uses the shared
    *  luminance one. `DEFAULT_TRILOGY_K` until levels are solved. */
   private trilogyK = DEFAULT_TRILOGY_K;
+  /** Composite color saturation (1 = identity); applied post-stretch in RGB/weighted modes. */
+  private saturation = 1;
   /** Trilogy RGB: bias-subtracted luminance that maps to output 1. */
   private trilogyLsat = 1;
   /** Single-band colormap LUT (texture unit 1), or null for grayscale. */
@@ -659,6 +662,7 @@ export class FitsViewer {
     this.uOpacity = gl.getUniformLocation(this.program, 'u_opacity');
     this.uTrilogyK = gl.getUniformLocation(this.program, 'u_trilogyK');
     this.uTrilogyLsat = gl.getUniformLocation(this.program, 'u_trilogyLsat');
+    this.uSaturation = gl.getUniformLocation(this.program, 'u_saturation');
     this.uBg = gl.getUniformLocation(this.program, 'u_bg');
     this.uBand = gl.getUniformLocation(this.program, 'u_band');
     this.uWeight = gl.getUniformLocation(this.program, 'u_weight');
@@ -892,6 +896,25 @@ export class FitsViewer {
   setStretchMode(mode: StretchMode): void {
     this.stretchMode = mode;
     this.requestRender();
+  }
+
+  /**
+   * Composite color saturation, applied post-stretch about the channel-mean
+   * luminance (RGB + weighted modes; the single-band path ignores it). `1` is
+   * the exact identity, `0` grayscale, `>1` boosts color separation. Clamped to
+   * [0, 4]; non-finite input resets to 1. Mirrors `applySaturation` in
+   * `stretch.ts` (the shader transcribes that reference).
+   */
+  setSaturation(saturation: number): void {
+    this.saturation = Number.isFinite(saturation)
+      ? Math.min(4, Math.max(0, saturation))
+      : 1;
+    this.requestRender();
+  }
+
+  /** The current composite color saturation (see `setSaturation`). */
+  get colorSaturation(): number {
+    return this.saturation;
   }
 
   /**
@@ -1735,6 +1758,8 @@ export class FitsViewer {
     // Trilogy softening + luminance saturation (mode 3); inert for other modes.
     gl.uniform1f(this.uTrilogyK, this.trilogyK);
     gl.uniform1f(this.uTrilogyLsat, this.trilogyLsat);
+    // Composite color saturation (identity at 1; single-band path ignores it).
+    gl.uniform1f(this.uSaturation, this.saturation);
     // No-data colour: NaN pixels emit this so they occlude the fallback beneath.
     gl.uniform3f(this.uBg, BG_COLOR[0], BG_COLOR[1], BG_COLOR[2]);
 

@@ -24,7 +24,7 @@
 
 import { compatibleBands, resolveDatasetBandUrl, type DatasetBand, type DatasetManifest } from './dataset.js';
 import { isColormapName, type ColormapName } from './renderer/colormaps.js';
-import { isStretchMode, type StretchMode } from './renderer/stretch.js';
+import { isStretchMode, MAX_BANDS, type StretchMode } from './renderer/stretch.js';
 
 /** The FitsglConfig schema major version this client accepts. */
 export const FITSGL_SCHEMA_VERSION = 1;
@@ -101,6 +101,11 @@ export interface FitsglDefaultView {
   weights?: Array<{ band: string; weight: [number, number, number] }>;
   colormap?: ColormapName;
   stretch?: { mode?: StretchMode };
+  /** Producer-tuned trilogy knobs seeding the viewer's `TrilogyParams` (all
+   *  optional; unset knobs keep `DEFAULT_TRILOGY_PARAMS`). Levels still derive
+   *  live from the per-band `stats.trilogy` + these knobs — the producer ships
+   *  tuning, never baked levels. */
+  trilogy?: { noiselum?: number; satpercent?: number; noisesig?: number; noisesig0?: number };
   northUp?: boolean;
 }
 
@@ -285,6 +290,13 @@ export function validateFitsglConfig(raw: unknown): FitsglConfig {
       if (!Array.isArray(dvRaw.weights)) {
         throw new Error('fitsgl-config: defaultView.weights must be an array');
       }
+      if (dvRaw.weights.length > MAX_BANDS) {
+        // The renderer caps a composite at MAX_BANDS; a longer default would
+        // fail at setSource with an opaque load error instead of here.
+        throw new Error(
+          `fitsgl-config: defaultView.weights has ${dvRaw.weights.length} entries — a composite is capped at ${MAX_BANDS} bands`,
+        );
+      }
       defaultView.weights = dvRaw.weights.map((w, i) => {
         if (!isObj(w)) throw new Error(`fitsgl-config: defaultView.weights[${i}] must be an object`);
         const wband = asStr(w.band, `defaultView.weights[${i}].band`);
@@ -310,6 +322,34 @@ export function validateFitsglConfig(raw: unknown): FitsglConfig {
     } else {
       defaultView.stretch = {};
     }
+  }
+  if (dvRaw.trilogy !== undefined && dvRaw.trilogy !== null) {
+    if (!isObj(dvRaw.trilogy)) throw new Error('fitsgl-config: "defaultView.trilogy" must be an object');
+    const tri: NonNullable<FitsglDefaultView['trilogy']> = {};
+    const knob = (key: 'noiselum' | 'satpercent' | 'noisesig' | 'noisesig0'): void => {
+      const v = dvRaw.trilogy as Record<string, unknown>;
+      if (v[key] === undefined || v[key] === null) return;
+      const n = asFiniteNum(v[key], `defaultView.trilogy.${key}`);
+      if (key === 'noiselum' && !(n > 0 && n < 1)) {
+        throw new Error('fitsgl-config: defaultView.trilogy.noiselum must be in (0, 1)');
+      }
+      // The saturation solve interpolates the precomputed p99..p99.999 tail, so
+      // satpercent is meaningful only in [0.001, 1] — saturationValue clamps to
+      // that range. Reject values above 1 outright (they'd silently render as 1);
+      // below 0.001 the clamp is a documented soft floor.
+      if (key === 'satpercent' && !(n > 0 && n <= 1)) {
+        throw new Error('fitsgl-config: defaultView.trilogy.satpercent must be in (0, 1]');
+      }
+      if ((key === 'noisesig' || key === 'noisesig0') && !(n >= 0)) {
+        throw new Error(`fitsgl-config: defaultView.trilogy.${key} must be >= 0`);
+      }
+      tri[key] = n;
+    };
+    knob('noiselum');
+    knob('satpercent');
+    knob('noisesig');
+    knob('noisesig0');
+    if (Object.keys(tri).length > 0) defaultView.trilogy = tri;
   }
   if (dvRaw.northUp !== undefined) {
     if (typeof dvRaw.northUp !== 'boolean') throw new Error('fitsgl-config: defaultView.northUp must be a boolean');

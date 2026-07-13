@@ -369,3 +369,21 @@ export function weightedTrilogyPixel(
     den > 0 ? Math.min(1, Math.max(0, num / den)) : 0;
   return [ch(rNum, rDen), ch(gNum, gDen), ch(bNum, bDen)];
 }
+
+/**
+ * CPU reference of the shader's composite color saturation (`saturateRGB` in
+ * `tile.frag.ts` — the non-drift rule): scale each channel's distance from the
+ * channel-mean luminance (the same simple average the trilogy shared-luminance
+ * path uses; channels are fluxes, not display primaries), then clamp to [0,1].
+ * `1` is the exact identity, `0` collapses to grayscale, `>1` boosts color
+ * separation. Applied post-stretch to composite (RGB / weighted) pixels only.
+ */
+export function applySaturation(
+  rgb: readonly [number, number, number],
+  saturation: number,
+): [number, number, number] {
+  if (saturation === 1) return [rgb[0], rgb[1], rgb[2]];
+  const lum = (rgb[0] + rgb[1] + rgb[2]) / 3;
+  const mix = (c: number): number => Math.min(1, Math.max(0, lum + (c - lum) * saturation));
+  return [mix(rgb[0]), mix(rgb[1]), mix(rgb[2])];
+}

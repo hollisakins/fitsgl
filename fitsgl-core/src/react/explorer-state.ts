@@ -70,6 +70,8 @@ export interface ExplorerDefaultView {
   /** Optional weighted-trilogy seed: participating bands + per-band (R,G,B) weights. */
   weights?: Array<{ band: string; weight: BandWeight }>;
   stretch?: StretchMode;
+  /** Producer-tuned trilogy knobs; unset knobs keep `DEFAULT_TRILOGY_PARAMS`. */
+  trilogy?: Partial<TrilogyParams>;
   colormap?: ColormapName;
   northUp?: boolean;
 }
@@ -209,7 +211,7 @@ export function defaultExplorerState(
     band,
     rgb: defaultTriple(bands, dv),
     stretch: dv?.stretch ?? 'asinh',
-    trilogyParams: { ...DEFAULT_TRILOGY_PARAMS },
+    trilogyParams: { ...DEFAULT_TRILOGY_PARAMS, ...dv?.trilogy },
     weights,
     weightBands: seed.map((w) => w.band),
     colormap: dv?.colormap ?? 'gray',
@@ -369,6 +371,7 @@ export function defaultViewFromConfig(config: FitsglConfig): ExplorerDefaultView
     out.weights = dv.weights.map((w) => ({ band: w.band, weight: w.weight }));
   }
   if (dv.stretch?.mode !== undefined) out.stretch = dv.stretch.mode;
+  if (dv.trilogy !== undefined) out.trilogy = { ...dv.trilogy };
   if (dv.colormap !== undefined) out.colormap = dv.colormap;
   if (dv.northUp !== undefined) out.northUp = dv.northUp;
   return out;

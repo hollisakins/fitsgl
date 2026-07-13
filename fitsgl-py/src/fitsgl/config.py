@@ -32,6 +32,11 @@ from .deploy_plan import (  # CDN cache-window + upload defaults (lightweight, n
 #: Known transfer curves (kept in lockstep with the TS ``StretchMode``).
 STRETCH_MODES = ("linear", "log", "asinh", "trilogy")
 
+# The viewer's composite cap (mirrors fitsgl-core's MAX_BANDS in stretch.ts) —
+# a [viewer.weights] table longer than this would build a dataset whose default
+# view fails to load, so the parser rejects it up front.
+MAX_COMPOSITE_BANDS = 12
+
 #: Band names that would collide with a top-level output file/dir in the dataset
 #: directory, so they are refused (a band becomes a subdirectory named for it).
 #: ``index``/``assets`` are the bundled SSG viewer's files; ``fitsgl`` is ``fitsgl.json``.
@@ -102,9 +107,15 @@ class ViewerSpec:
     r: str | None = None  # rgb
     g: str | None = None
     b: str | None = None
-    stretch: str | None = None  # linear | log | asinh
+    stretch: str | None = None  # linear | log | asinh | trilogy
     colormap: str | None = None  # single only
     north_up: bool | None = None
+    # ``[viewer.weights]`` — weighted-trilogy seed: band -> (wR, wG, wB), rgb mode
+    # only. Keys resolve through the band alias map (name or label), order kept.
+    weights: dict[str, tuple[float, float, float]] | None = None
+    # ``[viewer.trilogy]`` — producer-tuned trilogy knobs (noiselum / satpercent /
+    # noisesig / noisesig0); unset knobs keep the viewer's defaults.
+    trilogy: dict[str, float] | None = None
 
 
 @dataclass
@@ -404,4 +415,57 @@ def _parse_viewer(raw: object, band_alias: dict[str, str]) -> ViewerSpec:
     if north_up is not None:
         _require(isinstance(north_up, bool), "[viewer].north_up must be a boolean")
         out.north_up = north_up
+
+    weights = raw.get("weights")
+    if weights is not None:
+        _require(mode == "rgb", '[viewer.weights] requires default = "rgb"')
+        _require(isinstance(weights, dict), "[viewer.weights] must be a table of band -> [r, g, b]")
+        assert isinstance(weights, dict)
+        _require(
+            len(weights) <= MAX_COMPOSITE_BANDS,
+            f"[viewer.weights] has {len(weights)} entries — the viewer caps a "
+            f"composite at {MAX_COMPOSITE_BANDS} bands",
+        )
+        parsed: dict[str, tuple[float, float, float]] = {}
+        for key, value in weights.items():
+            _require(key in band_alias, f"[viewer.weights] references unknown band {key!r}")
+            _require(
+                isinstance(value, (list, tuple))
+                and len(value) == 3
+                and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value),
+                f"[viewer.weights].{key} must be a 3-element [r, g, b] number list",
+            )
+            assert isinstance(value, (list, tuple))
+            parsed[band_alias[key]] = (float(value[0]), float(value[1]), float(value[2]))
+        out.weights = parsed
+
+    trilogy = raw.get("trilogy")
+    if trilogy is not None:
+        _require(isinstance(trilogy, dict), "[viewer.trilogy] must be a table")
+        assert isinstance(trilogy, dict)
+        knobs: dict[str, float] = {}
+        for key, value in trilogy.items():
+            _require(
+                key in ("noiselum", "satpercent", "noisesig", "noisesig0"),
+                f"[viewer.trilogy] unknown knob {key!r} "
+                "(expected noiselum / satpercent / noisesig / noisesig0)",
+            )
+            _require(
+                isinstance(value, (int, float)) and not isinstance(value, bool),
+                f"[viewer.trilogy].{key} must be a number",
+            )
+            assert isinstance(value, (int, float))
+            v = float(value)
+            if key == "noiselum":
+                _require(0 < v < 1, "[viewer.trilogy].noiselum must be in (0, 1)")
+            elif key == "satpercent":
+                # The viewer's saturation solve interpolates the precomputed
+                # p99..p99.999 tail, clamping satpercent to [0.001, 1] — values
+                # above 1 would silently render as 1, so reject them here.
+                _require(0 < v <= 1, "[viewer.trilogy].satpercent must be in (0, 1]")
+            else:
+                _require(v >= 0, f"[viewer.trilogy].{key} must be >= 0")
+            knobs[key] = v
+        if knobs:
+            out.trilogy = knobs
     return out
