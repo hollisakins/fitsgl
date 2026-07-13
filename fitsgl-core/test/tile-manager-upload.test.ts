@@ -211,6 +211,15 @@ describe('TileManager request cancellation (P6a)', () => {
     return { pyramid, calls: () => calls };
   }
 
+  // A 6-level pyramid (z=0 native … z=5 coarsest) for cross-level cancellation.
+  const MULTI_GEOMS = new Map<number, LevelGeom>(
+    Array.from({ length: 6 }, (_, z) => {
+      const size = 8192 >> z;
+      const n = Math.max(1, Math.ceil(size / 256));
+      return [z, { z, levelW: size, levelH: size, nTilesX: n, nTilesY: n }] as const;
+    }),
+  );
+
   it('cancelExcept aborts an in-flight fetch outside the retain set; nothing uploads and it can be re-requested', async () => {
     const { pyramid, calls } = hangingPyramid();
     const { gl, created } = fakeGl();
@@ -218,7 +227,7 @@ describe('TileManager request cancellation (P6a)', () => {
     mgr.frame = 1;
 
     mgr.request(0, 2, 2);
-    mgr.cancelExcept(0, new Set<string>()); // (2,2) not retained -> abort
+    mgr.cancelExcept(0, new Set<string>(), [0]); // (2,2) not retained -> abort
     await settle();
 
     expect(mgr.residentCount).toBe(0);
@@ -233,19 +242,49 @@ describe('TileManager request cancellation (P6a)', () => {
     mgr.destroy();
   });
 
-  it('cancelExcept keeps a retained tile and tiles at other levels', async () => {
+  it('cancelExcept keeps a retained tile and every fetch at a kept level', async () => {
     const { pyramid, calls } = hangingPyramid();
     const { gl } = fakeGl();
-    const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
+    const mgr = new TileManager(gl, pyramid, MULTI_GEOMS, 200, () => {});
     mgr.frame = 1;
 
-    mgr.request(0, 2, 2);
-    mgr.cancelExcept(0, new Set(['0/2/2'])); // retained -> not aborted
+    mgr.request(0, 2, 2); // displayed level, retained
+    mgr.request(1, 1, 1); // parent prefetch — kept unfiltered
+    mgr.request(5, 0, 0); // pinned floor — kept unfiltered
+    mgr.cancelExcept(0, new Set(['0/2/2']), [0, 1, 5]);
     await settle();
-    // Still in flight: a re-request is a no-op (no second fetch).
+    // All three still in flight: re-requests are no-ops (no extra fetches).
     mgr.request(0, 2, 2);
+    mgr.request(1, 1, 1);
+    mgr.request(5, 0, 0);
     await settle();
-    expect(calls()).toBe(1);
+    expect(calls()).toBe(3);
+    mgr.destroy();
+  });
+
+  it('cancelExcept aborts leftover fetches at levels a multi-level zoom crossed (P6b)', async () => {
+    const { pyramid, calls } = hangingPyramid();
+    const { gl } = fakeGl();
+    const mgr = new TileManager(gl, pyramid, MULTI_GEOMS, 200, () => {});
+    mgr.frame = 1;
+
+    // A fast zoom-in 4 -> 0 issued visible-tile fetches at every level crossed.
+    for (let z = 4; z >= 0; z--) mgr.request(z, 0, 0);
+    expect(calls()).toBe(5);
+
+    // Arrived at level 0: keep the displayed level, its parent, and the floor.
+    mgr.cancelExcept(0, new Set(['0/0/0']), [0, 1, 5]);
+    await settle();
+
+    // Levels 2-4 were aborted (re-requests fetch anew); 0 and 1 survived
+    // (re-requests are deduped no-ops).
+    mgr.request(0, 0, 0);
+    mgr.request(1, 0, 0);
+    expect(calls()).toBe(5);
+    mgr.request(2, 0, 0);
+    mgr.request(3, 0, 0);
+    mgr.request(4, 0, 0);
+    expect(calls()).toBe(8);
     mgr.destroy();
   });
 });

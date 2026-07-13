@@ -1812,7 +1812,7 @@ export class FitsViewer {
       else if (this.mode === 'multiband') this.drawMultiBandTiles(orient, geom, level, tiles);
       else this.drawSingleBandTiles(orient, geom, level, tiles);
 
-      // Prefetch ring (P5) + cancel abandoned in-flight fetches (P6a). The
+      // Prefetch ring (P5) + cancel abandoned in-flight fetches (P6a/P6b). The
       // retention region is the visible tiles plus a one-tile margin. The ring is
       // requested on a leading-edge throttle DURING motion (and again once idle), so
       // a pan/zoom keeps a warm edge ahead of the viewport instead of starting cold;
@@ -1830,7 +1830,16 @@ export class FitsViewer {
           for (const m of this.bandManagers) m.request(level, t.tileX, t.tileY);
         }
       }
-      for (const m of this.bandManagers) m.cancelExcept(level, retain);
+      // Levels whose in-flight fetches this frame still wants: the displayed
+      // level (filtered per-key by `retain`), its parent (the Option A prefetch
+      // below), the child just left on a one-step zoom-out (its landing tiles
+      // still draw as the finer-fallback overlay, and keeping it absorbs level
+      // flapping at a zoom threshold), and the pinned floor. Fetches at ANY
+      // other level are leftovers from levels a fast multi-level zoom crossed —
+      // aborted here (P6b) so they stop competing with the target level for
+      // bandwidth and decode-pool slots.
+      const keepLevels = [Math.max(0, level - 1), level, level + 1, this.displayMaxLevel];
+      for (const m of this.bandManagers) m.cancelExcept(level, retain, keepLevels);
 
       // Option A: keep the next-coarser PARENT level warm so a zoom-out lands on
       // already-resident tiles — and so any still-missing target tile falls back
@@ -1838,9 +1847,10 @@ export class FitsViewer {
       // fit-level floor (a coarser-than-needed "blocky flash"). Prefetch the parent
       // tiles over the viewport on the same throttle as the ring and re-acquire any
       // resident ones every frame so they survive idle/budget eviction while the
-      // user lingers here. `cancelExcept` only aborts fetches at the target level,
-      // so these parent fetches are never cancelled. Skipped at the floor level
-      // (its tiles are already pinned, and nothing coarser is ever displayed).
+      // user lingers here. The parent level rides in `keepLevels` above, so these
+      // prefetches are never cancelled while the camera stays at this level.
+      // Skipped at the floor level (its tiles are already pinned, and nothing
+      // coarser is ever displayed).
       if (level < this.displayMaxLevel) {
         const parentLevel = level + 1;
         const parentGeom = this.geoms.get(parentLevel);
