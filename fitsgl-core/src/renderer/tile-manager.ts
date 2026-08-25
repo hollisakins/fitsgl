@@ -315,9 +315,11 @@ export function coarserFallback(
  * time (each step halves the tile index). Pass `fromLevel = level + 1` to start
  * strictly coarser (used when the target level is already handled, e.g. as a
  * crossfade base that must differ from the target). `hasAll(level, tileX, tileY)`
- * must report whether *every* band has that tile resident. Returns the common
- * level and its ancestor tile index, or null if no level up to `maxLevel` is
- * common to all.
+ * must report whether the composite is drawable from that tile — classically
+ * "every band resident"; with per-band coverage gaps, "every band resident or
+ * permanently absent, at least one resident" (`compositeResidency`). Returns the
+ * common level and its ancestor tile index, or null if no level up to `maxLevel`
+ * satisfies it.
  */
 export function commonResidentLevel(
   level: number,
@@ -334,6 +336,43 @@ export function commonResidentLevel(
     if (hasAll(cl, ctx, cty)) return { level: cl, tileX: ctx, tileY: cty };
   }
   return null;
+}
+
+/**
+ * One band's relationship to a composite tile:
+ *  - `'resident'` — the band has the tile decoded + GPU-resident.
+ *  - `'absent'`   — the band's pyramid ships NO supertile covering the tile (a
+ *    coverage gap: the builder drops all-NaN supertiles, so a band paving only
+ *    part of a shared grid simply has none there). The tile will NEVER load.
+ *  - `'loading'`  — neither: requested (or requestable) but not resident yet.
+ */
+export type BandTileState = 'resident' | 'absent' | 'loading';
+
+/**
+ * Classify a composite tile from its per-band states (pure; the compositing
+ * counterpart of D8's per-pixel NaN rule, lifted to tile residency):
+ *
+ *  - `'pending'` — some band is still loading: hold (draw a fallback), exactly
+ *    as before.
+ *  - `'ready'`   — every band is resident or permanently absent, and at least
+ *    one is resident: drawable NOW. An absent band can never load, so waiting on
+ *    it would pin the whole composite at the coarsest level where every band
+ *    happens to have coverage (the "blocky low-res over partial filter
+ *    coverage" bug); instead the caller binds an all-NaN stand-in texture for
+ *    each absent band and the shader's NaN→zero-contribution rule (D8) does the
+ *    rest.
+ *  - `'empty'`   — every band is permanently absent: genuine no-data, nothing
+ *    to draw (the background shows through, matching what the shader would emit).
+ */
+export function compositeResidency(
+  states: readonly BandTileState[],
+): 'ready' | 'pending' | 'empty' {
+  let resident = 0;
+  for (const s of states) {
+    if (s === 'loading') return 'pending';
+    if (s === 'resident') resident++;
+  }
+  return resident > 0 ? 'ready' : 'empty';
 }
 
 /** A finer level plus the descendant tiles of a target that are resident there. */
@@ -476,6 +515,8 @@ interface TileTexture {
 export class TileManager {
   private readonly textures = new Map<string, TileTexture>();
   private readonly inflight = new Set<string>();
+  /** Memoized `absent` verdicts (immutable per manifest); see `absent()`. */
+  private readonly absentCache = new Map<string, boolean>();
   /** Tile keys whose level file+index has been speculatively warmed (`warmLevel`),
    *  so the warm fires once per supertile rather than every idle frame. */
   private readonly warmed = new Set<string>();
@@ -522,6 +563,26 @@ export class TileManager {
 
   has(level: number, tileX: number, tileY: number): boolean {
     return this.textures.has(tileKey(level, tileX, tileY));
+  }
+
+  /**
+   * Whether the tile is PERMANENTLY absent for this band: the level is not in
+   * the manifest, or no supertile of the band's pyramid covers (tileX, tileY) —
+   * a coverage gap in a band that only partly paves its shared grid (the builder
+   * drops all-NaN supertiles). Distinct from "not yet resident" (`has`): an
+   * absent tile will never load — `request` skips it — so composite draw paths
+   * treat it as an all-NaN stand-in instead of waiting for it forever
+   * (`compositeResidency`). Memoized per tile key: the manifest is immutable and
+   * the probe runs every frame for every consulted tile.
+   */
+  absent(level: number, tileX: number, tileY: number): boolean {
+    const key = tileKey(level, tileX, tileY);
+    let a = this.absentCache.get(key);
+    if (a === undefined) {
+      a = this.geoms.get(level) === undefined || !this.pyramid.hasTile(level, tileX, tileY);
+      this.absentCache.set(key, a);
+    }
+    return a;
   }
 
   /** Texture for a tile, marking it visible this frame, or undefined if absent. */
@@ -684,6 +745,7 @@ export class TileManager {
     this.textures.clear();
     this.inflight.clear();
     this.warmed.clear();
+    this.absentCache.clear();
     this.pendingUploads.length = 0;
   }
 }

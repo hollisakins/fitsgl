@@ -288,3 +288,56 @@ describe('TileManager request cancellation (P6a)', () => {
     mgr.destroy();
   });
 });
+
+describe('TileManager.absent (permanent per-band coverage gaps)', () => {
+  it('reports absent exactly where the pyramid ships no supertile, and memoizes the probe', () => {
+    const { gl } = fakeGl();
+    let probes = 0;
+    const pyramid = {
+      getTile: () => Promise.resolve(new Float32Array(TILE_LEN)),
+      hasTile: (_l: number, x: number, y: number) => {
+        probes++;
+        return !(x === 0 && y === 1); // gap at (0,1) only
+      },
+    } as unknown as TilePyramid;
+    const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
+
+    expect(mgr.absent(0, 0, 0)).toBe(false);
+    expect(mgr.absent(0, 0, 1)).toBe(true);
+    // Re-probing the same tiles hits the memo, not the pyramid: the composite
+    // draw path consults absent() every frame for every visible tile.
+    const before = probes;
+    expect(mgr.absent(0, 0, 0)).toBe(false);
+    expect(mgr.absent(0, 0, 1)).toBe(true);
+    expect(probes).toBe(before);
+    mgr.destroy();
+  });
+
+  it('treats a level missing from the geoms as absent (never consults the pyramid)', () => {
+    const { gl } = fakeGl();
+    let probes = 0;
+    const pyramid = {
+      getTile: () => Promise.resolve(new Float32Array(TILE_LEN)),
+      hasTile: () => {
+        probes++;
+        return true;
+      },
+    } as unknown as TilePyramid;
+    const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
+    expect(mgr.absent(7, 0, 0)).toBe(true);
+    expect(probes).toBe(0);
+    mgr.destroy();
+  });
+
+  it('absent and has are disjoint views: a loaded tile is neither absent nor missing', async () => {
+    const { gl } = fakeGl();
+    const mgr = new TileManager(gl, fakePyramid(), GEOMS, 200, () => {});
+    mgr.frame = 1;
+    mgr.request(0, 0, 0);
+    await settle();
+    mgr.flushUploads(8);
+    expect(mgr.has(0, 0, 0)).toBe(true);
+    expect(mgr.absent(0, 0, 0)).toBe(false);
+    mgr.destroy();
+  });
+});

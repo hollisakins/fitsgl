@@ -8,6 +8,7 @@ import {
   allLevelTiles,
   coarserFallback,
   commonResidentLevel,
+  compositeResidency,
   finerFallback,
   resolveDisplayLevel,
   selectEvictions,
@@ -604,5 +605,32 @@ describe('buildLevelGeoms', () => {
     const geoms = buildLevelGeoms(manifest);
     expect(geoms.get(0)).toEqual({ z: 0, levelW: 512, levelH: 512, nTilesX: 2, nTilesY: 2 });
     expect(geoms.get(1)).toEqual({ z: 1, levelW: 256, levelH: 256, nTilesX: 1, nTilesY: 1 });
+  });
+});
+
+describe('compositeResidency (composite over partial per-band coverage)', () => {
+  it('is ready when every band is resident (the classic steady state)', () => {
+    expect(compositeResidency(['resident', 'resident', 'resident'])).toBe('ready');
+  });
+
+  it('is ready when the missing bands are permanently absent — the trilogy fix: a filter with no coverage must not hold the composite at a coarser level', () => {
+    expect(compositeResidency(['resident', 'absent', 'resident'])).toBe('ready');
+    expect(compositeResidency(['absent', 'absent', 'resident'])).toBe('ready');
+    expect(compositeResidency(['resident', 'absent'])).toBe('ready');
+  });
+
+  it('is pending while any band is still loading, even if others are absent', () => {
+    expect(compositeResidency(['resident', 'loading', 'resident'])).toBe('pending');
+    expect(compositeResidency(['absent', 'loading', 'absent'])).toBe('pending');
+    expect(compositeResidency(['loading'])).toBe('pending');
+  });
+
+  it('is empty when every band is permanently absent (genuine no-data)', () => {
+    expect(compositeResidency(['absent', 'absent', 'absent'])).toBe('empty');
+    expect(compositeResidency(['absent'])).toBe('empty');
+  });
+
+  it('handles the degenerate empty band list as empty', () => {
+    expect(compositeResidency([])).toBe('empty');
   });
 });
