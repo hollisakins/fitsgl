@@ -16,7 +16,12 @@ import type { TilePyramid } from '../fpack/tile-source.js';
 import type { Manifest } from '../manifest.js';
 import { Camera } from './camera.js';
 import type { WorldBounds } from './camera.js';
-import { createColormapTexture, createProgram, createUnitQuadVAO } from './gl-util.js';
+import {
+  createColormapTexture,
+  createProgram,
+  createTileTexture,
+  createUnitQuadVAO,
+} from './gl-util.js';
 import { TILE_VERT } from './shaders/tile.vert.js';
 import { TILE_FRAG } from './shaders/tile.frag.js';
 import {
@@ -85,6 +90,7 @@ import {
   centerOutOrder,
   coarserFallback,
   commonResidentLevel,
+  compositeResidency,
   fallbackUV,
   finerFallback,
   resolveDisplayLevel,
@@ -95,6 +101,7 @@ import {
   visibleTiles,
   worldPixelToTileIndex,
   TILE_SIZE,
+  type BandTileState,
   type LevelGeom,
   type TileCoord,
   type WorldRect,
@@ -412,6 +419,14 @@ export class FitsViewer {
   private readonly program: WebGLProgram;
   private readonly vao: WebGLVertexArrayObject;
   private readonly quadBuffer: WebGLBuffer;
+  /**
+   * 1×1 R32F NaN texture bound in place of a band with no coverage of a
+   * composite tile (`TileManager.absent`). NEAREST sampling makes the whole quad
+   * read NaN for that band, and the shader's NaN→zero-contribution rule (D8)
+   * composites the remaining bands — so partial filter coverage no longer pins
+   * the composite to the coarsest level common to every band.
+   */
+  private readonly nanTexture: WebGLTexture;
   private readonly camera: Camera;
   /**
    * Tile managers, one per band: length 1 for single-band, length 3 (R, G, B)
@@ -643,6 +658,7 @@ export class FitsViewer {
     const quad = createUnitQuadVAO(gl);
     this.vao = quad.vao;
     this.quadBuffer = quad.buffer;
+    this.nanTexture = createTileTexture(gl, 1, 1, new Float32Array([NaN]));
     this.uP00 = gl.getUniformLocation(this.program, 'u_p00');
     this.uP10 = gl.getUniformLocation(this.program, 'u_p10');
     this.uP01 = gl.getUniformLocation(this.program, 'u_p01');
@@ -1018,9 +1034,12 @@ export class FitsViewer {
     if (gathered === null) return null;
     const { level, tiles } = gathered;
     const bandHist = async (pyramid: TilePyramid): Promise<BandHistogram | null> => {
+      // A band may lack coverage of some visible tiles (dropped all-NaN
+      // supertiles); fetching those rejects, so histogram only what it has.
+      const covered = tiles.filter((t) => pyramid.hasTile(level, t.tileX, t.tileY));
       let arrays: Float32Array[];
       try {
-        arrays = await Promise.all(tiles.map((t) => pyramid.getTile(level, t.tileX, t.tileY)));
+        arrays = await Promise.all(covered.map((t) => pyramid.getTile(level, t.tileX, t.tileY)));
       } catch (err) {
         console.warn('FitsViewer.visibleHistogram: tile fetch failed; skipping this band:', err);
         return null;
@@ -1052,7 +1071,10 @@ export class FitsViewer {
     pHi: number,
   ): Promise<[number, number] | null> {
     try {
-      const arrays = await Promise.all(tiles.map((t) => pyramid.getTile(level, t.tileX, t.tileY)));
+      // Skip tiles this band has no coverage of (dropped all-NaN supertiles):
+      // fetching one rejects, which would needlessly skip the whole band.
+      const covered = tiles.filter((t) => pyramid.hasTile(level, t.tileX, t.tileY));
+      const arrays = await Promise.all(covered.map((t) => pyramid.getTile(level, t.tileX, t.tileY)));
       return percentileRange(arrays, pLo, pHi, PERCENTILE_SAMPLE_CAP);
     } catch (err) {
       // A tile fetch can fail (network/decoder); auto-stretch is best-effort, so
@@ -1568,6 +1590,7 @@ export class FitsViewer {
     this.gl.deleteProgram(this.program);
     this.gl.deleteVertexArray(this.vao);
     this.gl.deleteBuffer(this.quadBuffer); // deleteVertexArray does not free it
+    this.gl.deleteTexture(this.nanTexture);
     // The pyramid is caller-owned and intentionally not destroyed here.
   }
 
@@ -2072,11 +2095,16 @@ export class FitsViewer {
   /**
    * RGB composite tile pass (decisions D7/D8). Tile selection is grid-only, so
    * the visible tiles are shared by all three bands. For each tile, draw from
-   * the finest level common to R, G, AND B (the vertex shader's single shared UV
-   * forces one source level + sub-rect across channels); request the target tile
-   * from every band; draw nothing for the tile if no common level is resident
-   * yet (common-level-hold). The all-three-NaN→transparent rule (D8) lives in
-   * the fragment shader.
+   * the finest level at which the composite is READY across R, G, AND B (the
+   * vertex shader's single shared UV forces one source level + sub-rect across
+   * channels); request the target tile from every band; draw nothing for the
+   * tile if no level is ready yet (common-level-hold). "Ready" is
+   * `compositeResidency`: every band resident OR permanently absent (a coverage
+   * gap — its slot binds the 1×1 NaN stand-in, which the shader's D8 rule turns
+   * into zero contribution), with at least one band resident — so a filter that
+   * simply has no data over a region cannot pin the whole composite at the
+   * coarsest level where all three overlap. The all-three-NaN→background rule
+   * (D8) lives in the fragment shader.
    */
   private drawRgbTiles(
     orient: Mat2,
@@ -2095,43 +2123,42 @@ export class FitsViewer {
     gl.uniform1i(this.uTileG, 2);
     gl.uniform1i(this.uTileB, 3);
 
-    const mr = this.bandManagers[0];
-    const mg = this.bandManagers[1];
-    const mb = this.bandManagers[2];
     for (const t of tiles) {
       const rect = tileWorldRect(geom, t.tileX, t.tileY);
-      // Drive every band toward the target tile.
-      mr.request(level, t.tileX, t.tileY);
-      mg.request(level, t.tileX, t.tileY);
-      mb.request(level, t.tileX, t.tileY);
-      // Target tile resident in ALL three bands? acquire() (not has()) marks each
-      // band's consulted tile visible this frame, so a band that is ahead cannot
-      // evict a tile its laggard siblings still need (cross-band eviction
-      // oscillation). Call all three unconditionally (no && short-circuit).
-      const er = mr.acquire(level, t.tileX, t.tileY);
-      const eg = mg.acquire(level, t.tileX, t.tileY);
-      const eb = mb.acquire(level, t.tileX, t.tileY);
-      if (er !== undefined && eg !== undefined && eb !== undefined) {
-        // Fade from the newest of the three uploads (when it became drawable), and
-        // only when finer detail common to all bands is resident underneath.
+      // Drive every band toward the target tile (a no-op for an absent band).
+      for (const m of this.bandManagers) m.request(level, t.tileX, t.tileY);
+      const ct = this.compositeTile(level, t.tileX, t.tileY);
+      // No band ever has data here: genuine no-data, background shows through.
+      if (ct === 'empty') continue;
+      if (ct !== 'pending') {
+        // Fade from the newest resident upload (when the composite became
+        // drawable), and only when finer composite-ready detail is underneath.
         const op = this.appearOpacity(
-          Math.max(er.uploadedAt, eg.uploadedAt, eb.uploadedAt),
+          ct.newest,
           () =>
-            finerFallback(
-              level,
-              t.tileX,
-              t.tileY,
-              (l, x, y) => mr.has(l, x, y) && mg.has(l, x, y) && mb.has(l, x, y),
+            finerFallback(level, t.tileX, t.tileY, (l, x, y) =>
+              this.compositeCovered(l, x, y),
             ) !== null,
         );
-        if (op < 1) this.drawRgbFallback(orient, level, t.tileX, t.tileY, rect, mr, mg, mb);
-        this.drawTileRGB(orient, rect, er.texture, eg.texture, eb.texture, 0, 0, 1, 1, op);
+        if (op < 1) this.drawRgbFallback(orient, level, t.tileX, t.tileY, rect);
+        this.drawTileRGB(
+          orient,
+          rect,
+          ct.textures[0],
+          ct.textures[1],
+          ct.textures[2],
+          0,
+          0,
+          1,
+          1,
+          op,
+        );
         continue;
       }
-      // Target not common to all three yet: best resident neighbour (a finer
-      // level common to every band, else a coarse common ancestor). Draws nothing
-      // if no common level is resident (common-level-hold).
-      this.drawRgbFallback(orient, level, t.tileX, t.tileY, rect, mr, mg, mb);
+      // Some band is still loading: best ready neighbour (a finer ready level,
+      // else a coarse ready ancestor). Draws nothing if no level is ready
+      // (common-level-hold).
+      this.drawRgbFallback(orient, level, t.tileX, t.tileY, rect);
     }
   }
 
@@ -2140,11 +2167,13 @@ export class FitsViewer {
    * target level (or crossfading in), as two layers (coarse base + finer overlay)
    * exactly like `drawSingleBandFallback`. The shader exposes a single shared UV,
    * so all three channels must sample one COMMON source level + sub-rect per draw:
-   * the base is the finest COARSE level common to all three, the overlay is the
-   * resident descendants common to all three at the nearest finer level. The
-   * target level is excluded from the base (fromLevel `level + 1`) — its
-   * all-resident case is the caller's, and a fade base must differ from the
-   * target. `acquire` marks consulted tiles visible (cross-band eviction guard).
+   * the base is the finest COARSE level at which the composite is ready
+   * (`compositeTile` — resident or permanently absent per band, ≥1 resident;
+   * absent bands bind the NaN stand-in), the overlay is the composite-ready
+   * descendants at the nearest finer level. The target level is excluded from the
+   * base (fromLevel `level + 1`) — its ready case is the caller's, and a fade
+   * base must differ from the target. `acquire` (inside `compositeTile`) marks
+   * consulted tiles visible (cross-band eviction guard).
    */
   private drawRgbFallback(
     orient: Mat2,
@@ -2152,52 +2181,59 @@ export class FitsViewer {
     tileX: number,
     tileY: number,
     rect: WorldRect,
-    mr: TileManager,
-    mg: TileManager,
-    mb: TileManager,
   ): void {
-    // Coarse base: finest level strictly above the target common to all bands.
+    // Coarse base: finest level strictly above the target ready across bands.
     const common = commonResidentLevel(
       level,
       tileX,
       tileY,
       this.displayMaxLevel,
-      (l, x, y) => {
-        const hr = mr.acquire(l, x, y) !== undefined;
-        const hg = mg.acquire(l, x, y) !== undefined;
-        const hb = mb.acquire(l, x, y) !== undefined;
-        return hr && hg && hb;
-      },
+      (l, x, y) => this.compositeReady(l, x, y),
       level + 1,
     );
     if (common !== null) {
-      const er = mr.acquire(common.level, common.tileX, common.tileY);
-      const eg = mg.acquire(common.level, common.tileX, common.tileY);
-      const eb = mb.acquire(common.level, common.tileX, common.tileY);
+      const ct = this.compositeTile(common.level, common.tileX, common.tileY);
       const fbGeom = this.geoms.get(common.level);
-      if (er !== undefined && eg !== undefined && eb !== undefined && fbGeom !== undefined) {
+      if (ct !== 'empty' && ct !== 'pending' && fbGeom !== undefined) {
         const ancestor = tileWorldRect(fbGeom, common.tileX, common.tileY);
         const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
-        this.drawTileRGB(orient, rect, er.texture, eg.texture, eb.texture, u0, v0, u1, v1, 1);
+        this.drawTileRGB(
+          orient,
+          rect,
+          ct.textures[0],
+          ct.textures[1],
+          ct.textures[2],
+          u0,
+          v0,
+          u1,
+          v1,
+          1,
+        );
       }
     }
-    // Finer overlay: resident descendants common to all three bands (partial OK).
-    const finer = finerFallback(
-      level,
-      tileX,
-      tileY,
-      (l, x, y) => mr.has(l, x, y) && mg.has(l, x, y) && mb.has(l, x, y),
+    // Finer overlay: composite-ready descendants (partial coverage OK).
+    const finer = finerFallback(level, tileX, tileY, (l, x, y) =>
+      this.compositeCovered(l, x, y),
     );
     if (finer !== null) {
       const fGeom = this.geoms.get(finer.level);
       if (fGeom !== undefined) {
         for (const ft of finer.tiles) {
-          const tr = mr.acquire(ft.level, ft.tileX, ft.tileY);
-          const tg = mg.acquire(ft.level, ft.tileX, ft.tileY);
-          const tb = mb.acquire(ft.level, ft.tileX, ft.tileY);
-          if (tr === undefined || tg === undefined || tb === undefined) continue;
+          const ct = this.compositeTile(ft.level, ft.tileX, ft.tileY);
+          if (ct === 'empty' || ct === 'pending') continue; // raced an eviction; skip
           const fRect = tileWorldRect(fGeom, ft.tileX, ft.tileY);
-          this.drawTileRGB(orient, fRect, tr.texture, tg.texture, tb.texture, 0, 0, 1, 1, 1);
+          this.drawTileRGB(
+            orient,
+            fRect,
+            ct.textures[0],
+            ct.textures[1],
+            ct.textures[2],
+            0,
+            0,
+            1,
+            1,
+            1,
+          );
         }
       }
     }
@@ -2296,9 +2332,13 @@ export class FitsViewer {
    * `drawRgbTiles` generalized to N bands: tile selection is grid-only (shared by
    * all bands), each band is driven toward the target tile and acquired
    * unconditionally (so a band that is ahead cannot evict a tile its laggards
-   * still need), and the tile draws only when every band is resident at a common
-   * level. Per-band weights + trilogy levels + the host-precomputed Σ weights ride
-   * in uniform arrays; the all-bands-NaN→background rule (D8) lives in the shader.
+   * still need), and the tile draws when the composite is READY at a common level
+   * (`compositeTile`: every band resident or permanently absent — an absent
+   * band's slot binds the 1×1 NaN stand-in — with at least one resident, so
+   * partial filter coverage cannot pin the composite at the coarsest level every
+   * band happens to share). Per-band weights + trilogy levels + the
+   * host-precomputed Σ weights ride in uniform arrays; the
+   * all-bands-NaN→background rule (D8) lives in the shader.
    */
   private drawMultiBandTiles(
     orient: Mat2,
@@ -2342,31 +2382,21 @@ export class FitsViewer {
 
     for (const t of tiles) {
       const rect = tileWorldRect(geom, t.tileX, t.tileY);
+      // Drive every band toward the target tile (a no-op for an absent band).
       for (const m of this.bandManagers) m.request(level, t.tileX, t.tileY);
-      // Acquire EVERY band unconditionally (no short-circuit) so the cross-band
-      // eviction guard marks each consulted tile visible this frame.
-      const textures: WebGLTexture[] = [];
-      let allResident = true;
-      let newest = 0;
-      for (const m of this.bandManagers) {
-        const e = m.acquire(level, t.tileX, t.tileY);
-        if (e === undefined) {
-          allResident = false;
-          continue;
-        }
-        textures.push(e.texture);
-        newest = Math.max(newest, e.uploadedAt);
-      }
-      if (allResident) {
+      const ct = this.compositeTile(level, t.tileX, t.tileY);
+      // No band ever has data here: genuine no-data, background shows through.
+      if (ct === 'empty') continue;
+      if (ct !== 'pending') {
         const op = this.appearOpacity(
-          newest,
+          ct.newest,
           () =>
             finerFallback(level, t.tileX, t.tileY, (l, x, y) =>
-              this.bandManagers.every((m) => m.has(l, x, y)),
+              this.compositeCovered(l, x, y),
             ) !== null,
         );
         if (op < 1) this.drawMultiBandFallback(orient, level, t.tileX, t.tileY, rect);
-        this.drawTileMultiBand(orient, rect, textures, 0, 0, 1, 1, op);
+        this.drawTileMultiBand(orient, rect, ct.textures, 0, 0, 1, 1, op);
         continue;
       }
       this.drawMultiBandFallback(orient, level, t.tileX, t.tileY, rect);
@@ -2375,11 +2405,11 @@ export class FitsViewer {
 
   /**
    * Best resident stand-in for a multiband tile missing at the target level (or
-   * crossfading in): a coarse base from the finest level common to ALL bands plus
-   * a finer overlay of resident descendants common to all bands — the N-band
-   * generalization of `drawRgbFallback`. The shader's single shared UV forces one
-   * common source level + sub-rect across bands. Draws nothing if no common level
-   * is resident (common-level-hold).
+   * crossfading in): a coarse base from the finest composite-ready level plus a
+   * finer overlay of composite-ready descendants — the N-band generalization of
+   * `drawRgbFallback`. The shader's single shared UV forces one common source
+   * level + sub-rect across bands. Draws nothing if no level is ready
+   * (common-level-hold).
    */
   private drawMultiBandFallback(
     orient: Mat2,
@@ -2393,59 +2423,94 @@ export class FitsViewer {
       tileX,
       tileY,
       this.displayMaxLevel,
-      (l, x, y) => this.acquireAllBands(l, x, y),
+      (l, x, y) => this.compositeReady(l, x, y),
       level + 1,
     );
     if (common !== null) {
       const fbGeom = this.geoms.get(common.level);
-      const texs = this.texturesIfAllResident(common.level, common.tileX, common.tileY);
-      if (texs !== null && fbGeom !== undefined) {
+      const ct = this.compositeTile(common.level, common.tileX, common.tileY);
+      if (ct !== 'empty' && ct !== 'pending' && fbGeom !== undefined) {
         const ancestor = tileWorldRect(fbGeom, common.tileX, common.tileY);
         const [u0, v0, u1, v1] = fallbackUV(rect, ancestor);
-        this.drawTileMultiBand(orient, rect, texs, u0, v0, u1, v1, 1);
+        this.drawTileMultiBand(orient, rect, ct.textures, u0, v0, u1, v1, 1);
       }
     }
     const finer = finerFallback(level, tileX, tileY, (l, x, y) =>
-      this.bandManagers.every((m) => m.has(l, x, y)),
+      this.compositeCovered(l, x, y),
     );
     if (finer !== null) {
       const fGeom = this.geoms.get(finer.level);
       if (fGeom !== undefined) {
         for (const ft of finer.tiles) {
-          const texs = this.texturesIfAllResident(ft.level, ft.tileX, ft.tileY);
-          if (texs === null) continue; // raced an eviction; skip this sub-tile
+          const ct = this.compositeTile(ft.level, ft.tileX, ft.tileY);
+          if (ct === 'empty' || ct === 'pending') continue; // raced an eviction; skip
           const fRect = tileWorldRect(fGeom, ft.tileX, ft.tileY);
-          this.drawTileMultiBand(orient, fRect, texs, 0, 0, 1, 1, 1);
+          this.drawTileMultiBand(orient, fRect, ct.textures, 0, 0, 1, 1, 1);
         }
       }
     }
   }
 
-  /** Acquire the tile in EVERY band (no short-circuit, so each is marked visible)
-   *  and report whether all are resident — the cross-band eviction guard. */
-  private acquireAllBands(level: number, tileX: number, tileY: number): boolean {
-    let all = true;
-    for (const m of this.bandManagers) {
-      if (m.acquire(level, tileX, tileY) === undefined) all = false;
-    }
-    return all;
-  }
-
-  /** The N band textures at a tile if ALL are resident, else null. Acquires every
-   *  band unconditionally first (eviction guard), then collects the textures. */
-  private texturesIfAllResident(
+  /**
+   * The composite state of one tile across every band, acquiring each band
+   * unconditionally (no short-circuit) so the cross-band eviction guard marks
+   * every consulted tile visible this frame. Returns, per `compositeResidency`:
+   *
+   *  - `'pending'` — some band is still loading (hold; draw a fallback instead);
+   *  - `'empty'`   — every band is permanently absent (genuine no-data);
+   *  - otherwise READY: the N band textures in band order — the 1×1 NaN
+   *    stand-in (`nanTexture`) filling each permanently-absent band's slot, so
+   *    the slot count always matches the sampler unit map — plus the newest
+   *    resident upload time (the crossfade-in start).
+   */
+  private compositeTile(
     level: number,
     tileX: number,
     tileY: number,
-  ): WebGLTexture[] | null {
+  ): { textures: WebGLTexture[]; newest: number } | 'pending' | 'empty' {
+    const states: BandTileState[] = [];
     const textures: WebGLTexture[] = [];
-    let all = true;
+    let newest = 0;
     for (const m of this.bandManagers) {
       const e = m.acquire(level, tileX, tileY);
-      if (e === undefined) all = false;
-      else textures.push(e.texture);
+      if (e !== undefined) {
+        states.push('resident');
+        textures.push(e.texture);
+        newest = Math.max(newest, e.uploadedAt);
+      } else if (m.absent(level, tileX, tileY)) {
+        states.push('absent');
+        textures.push(this.nanTexture);
+      } else {
+        states.push('loading');
+        textures.push(this.nanTexture); // placeholder; discarded on 'pending'
+      }
     }
-    return all ? textures : null;
+    const status = compositeResidency(states);
+    if (status === 'ready') return { textures, newest };
+    return status === 'empty' ? 'empty' : 'pending';
+  }
+
+  /**
+   * Non-acquiring composite-readiness probe (`has`/`absent` only) for the
+   * `finerFallback` / `appearOpacity` walks, which may test many descendant
+   * tiles per frame: whether every band has the tile resident or permanently
+   * absent, with at least one resident. The draw path re-checks via
+   * `compositeTile` (which acquires) before actually drawing.
+   */
+  private compositeCovered(level: number, tileX: number, tileY: number): boolean {
+    let resident = 0;
+    for (const m of this.bandManagers) {
+      if (m.has(level, tileX, tileY)) resident++;
+      else if (!m.absent(level, tileX, tileY)) return false;
+    }
+    return resident > 0;
+  }
+
+  /** `compositeTile` as a boolean (the `commonResidentLevel` callback): ready to
+   *  draw at this tile, acquiring every band (cross-band eviction guard). */
+  private compositeReady(level: number, tileX: number, tileY: number): boolean {
+    const ct = this.compositeTile(level, tileX, tileY);
+    return ct !== 'empty' && ct !== 'pending';
   }
 
   /**
