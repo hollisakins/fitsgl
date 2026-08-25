@@ -515,8 +515,15 @@ interface TileTexture {
 export class TileManager {
   private readonly textures = new Map<string, TileTexture>();
   private readonly inflight = new Set<string>();
-  /** Memoized `absent` verdicts (immutable per manifest); see `absent()`. */
-  private readonly absentCache = new Map<string, boolean>();
+  /**
+   * Per-level tile-coverage bitmaps (one bit per tile of the level's FULL grid;
+   * set = some supertile covers the tile), built once per consulted level from
+   * the manifest's supertile rectangles; see `absent()`. Memory is bounded by
+   * the pyramid's own grid size (bits), independent of how many tiles a
+   * long-lived viewer ever visits — a per-consulted-tile memo would grow
+   * without bound across a session of panning a large mosaic.
+   */
+  private readonly coverage = new Map<number, Uint8Array>();
   /** Tile keys whose level file+index has been speculatively warmed (`warmLevel`),
    *  so the warm fires once per supertile rather than every idle frame. */
   private readonly warmed = new Set<string>();
@@ -567,22 +574,52 @@ export class TileManager {
 
   /**
    * Whether the tile is PERMANENTLY absent for this band: the level is not in
-   * the manifest, or no supertile of the band's pyramid covers (tileX, tileY) —
-   * a coverage gap in a band that only partly paves its shared grid (the builder
-   * drops all-NaN supertiles). Distinct from "not yet resident" (`has`): an
-   * absent tile will never load — `request` skips it — so composite draw paths
-   * treat it as an all-NaN stand-in instead of waiting for it forever
-   * (`compositeResidency`). Memoized per tile key: the manifest is immutable and
-   * the probe runs every frame for every consulted tile.
+   * the manifest, the tile is outside the level grid, or no supertile of the
+   * band's pyramid covers (tileX, tileY) — a coverage gap in a band that only
+   * partly paves its shared grid (the builder drops all-NaN supertiles).
+   * Distinct from "not yet resident" (`has`): an absent tile will never load —
+   * `request` skips it — so composite draw paths treat it as an all-NaN
+   * stand-in instead of waiting for it forever (`compositeResidency`). O(1) per
+   * probe (it runs every frame for every consulted tile) against a per-level
+   * coverage bitmap built once from the manifest — the manifest is immutable,
+   * and the bitmap's size is fixed by the level grid, not by how many tiles
+   * were ever probed.
    */
   absent(level: number, tileX: number, tileY: number): boolean {
-    const key = tileKey(level, tileX, tileY);
-    let a = this.absentCache.get(key);
-    if (a === undefined) {
-      a = this.geoms.get(level) === undefined || !this.pyramid.hasTile(level, tileX, tileY);
-      this.absentCache.set(key, a);
+    const geom = this.geoms.get(level);
+    if (geom === undefined) return true;
+    // Out-of-grid probes are absent by definition — and must not index the
+    // bitmap, where (tileY * nTilesX + tileX) would alias another tile's bit.
+    if (tileX < 0 || tileY < 0 || tileX >= geom.nTilesX || tileY >= geom.nTilesY) return true;
+    const bits = this.coverageBitmap(level, geom);
+    const idx = tileY * geom.nTilesX + tileX;
+    return ((bits[idx >> 3] ?? 0) & (1 << (idx & 7))) === 0;
+  }
+
+  /** The level's coverage bitmap, built on first consult by rasterizing the
+   *  manifest's (disjoint) supertile rectangles — O(covered tiles), once. */
+  private coverageBitmap(level: number, geom: LevelGeom): Uint8Array {
+    let bits = this.coverage.get(level);
+    if (bits === undefined) {
+      bits = new Uint8Array(Math.ceil((geom.nTilesX * geom.nTilesY) / 8));
+      const lvl = this.pyramid.getManifest().levels.find((l) => l.z === level);
+      if (lvl !== undefined) {
+        for (const st of lvl.supertiles) {
+          const x0 = Math.max(0, st.tile_origin[0]);
+          const y0 = Math.max(0, st.tile_origin[1]);
+          const x1 = Math.min(geom.nTilesX, st.tile_origin[0] + st.tile_count[0]);
+          const y1 = Math.min(geom.nTilesY, st.tile_origin[1] + st.tile_count[1]);
+          for (let y = y0; y < y1; y++) {
+            for (let x = x0; x < x1; x++) {
+              const i = y * geom.nTilesX + x;
+              bits[i >> 3]! |= 1 << (i & 7);
+            }
+          }
+        }
+      }
+      this.coverage.set(level, bits);
     }
-    return a;
+    return bits;
   }
 
   /** Texture for a tile, marking it visible this frame, or undefined if absent. */
@@ -745,7 +782,7 @@ export class TileManager {
     this.textures.clear();
     this.inflight.clear();
     this.warmed.clear();
-    this.absentCache.clear();
+    this.coverage.clear();
     this.pendingUploads.length = 0;
   }
 }

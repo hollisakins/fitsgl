@@ -290,48 +290,64 @@ describe('TileManager request cancellation (P6a)', () => {
 });
 
 describe('TileManager.absent (permanent per-band coverage gaps)', () => {
-  it('reports absent exactly where the pyramid ships no supertile, and memoizes the probe', () => {
-    const { gl } = fakeGl();
-    let probes = 0;
+  /** Fake pyramid whose z=0 manifest level carries the given supertile rects
+   *  (over the 8×8 GEOM grid); `manifests()` counts coverage-bitmap builds. */
+  function gapPyramid(
+    supertiles: Array<{ tile_origin: [number, number]; tile_count: [number, number] }>,
+  ): { pyramid: TilePyramid; manifests: () => number } {
+    let manifests = 0;
     const pyramid = {
       getTile: () => Promise.resolve(new Float32Array(TILE_LEN)),
-      hasTile: (_l: number, x: number, y: number) => {
-        probes++;
-        return !(x === 0 && y === 1); // gap at (0,1) only
+      hasTile: () => true,
+      getManifest: () => {
+        manifests++;
+        return {
+          levels: [
+            { z: 0, supertiles: supertiles.map((st) => ({ filename: 'z0.fits.fz', ...st })) },
+          ],
+        };
       },
     } as unknown as TilePyramid;
+    return { pyramid, manifests: () => manifests };
+  }
+
+  it('reports absent exactly in the supertile gaps, from a bitmap built once per level', () => {
+    const { gl } = fakeGl();
+    // Full top row + the (1,1)..(7,7) block: the gap is column x=0, rows y>=1.
+    const { pyramid, manifests } = gapPyramid([
+      { tile_origin: [0, 0], tile_count: [8, 1] },
+      { tile_origin: [1, 1], tile_count: [7, 7] },
+    ]);
     const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
 
-    expect(mgr.absent(0, 0, 0)).toBe(false);
-    expect(mgr.absent(0, 0, 1)).toBe(true);
-    // Re-probing the same tiles hits the memo, not the pyramid: the composite
-    // draw path consults absent() every frame for every visible tile.
-    const before = probes;
-    expect(mgr.absent(0, 0, 0)).toBe(false);
-    expect(mgr.absent(0, 0, 1)).toBe(true);
-    expect(probes).toBe(before);
+    expect(mgr.absent(0, 0, 0)).toBe(false); // covered by the top row
+    expect(mgr.absent(0, 5, 3)).toBe(false); // covered by the block
+    expect(mgr.absent(0, 0, 1)).toBe(true); // the gap
+    expect(mgr.absent(0, 0, 7)).toBe(true); // the gap
+    // The bitmap is built on first consult and reused: the composite draw path
+    // probes absent() every frame for every visible tile, so it must not walk
+    // the manifest (or grow any per-tile state) per probe.
+    expect(manifests()).toBe(1);
     mgr.destroy();
   });
 
-  it('treats a level missing from the geoms as absent (never consults the pyramid)', () => {
+  it('treats a level missing from the geoms, and out-of-grid tiles, as absent', () => {
     const { gl } = fakeGl();
-    let probes = 0;
-    const pyramid = {
-      getTile: () => Promise.resolve(new Float32Array(TILE_LEN)),
-      hasTile: () => {
-        probes++;
-        return true;
-      },
-    } as unknown as TilePyramid;
+    const { pyramid, manifests } = gapPyramid([{ tile_origin: [0, 0], tile_count: [8, 8] }]);
     const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
-    expect(mgr.absent(7, 0, 0)).toBe(true);
-    expect(probes).toBe(0);
+    expect(mgr.absent(7, 0, 0)).toBe(true); // no z=7 geom; manifest never consulted
+    expect(manifests()).toBe(0);
+    // Out-of-grid probes must not alias another tile's bit via y*nTilesX+x.
+    expect(mgr.absent(0, 8, 0)).toBe(true);
+    expect(mgr.absent(0, -1, 0)).toBe(true);
+    expect(mgr.absent(0, 0, 8)).toBe(true);
     mgr.destroy();
   });
 
   it('absent and has are disjoint views: a loaded tile is neither absent nor missing', async () => {
     const { gl } = fakeGl();
-    const mgr = new TileManager(gl, fakePyramid(), GEOMS, 200, () => {});
+    const { pyramid } = gapPyramid([{ tile_origin: [0, 0], tile_count: [8, 8] }]);
+    const mgr = new TileManager(gl, pyramid, GEOMS, 200, () => {});
     mgr.frame = 1;
     mgr.request(0, 0, 0);
     await settle();
