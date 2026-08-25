@@ -292,6 +292,14 @@ class TileParams:
     dither_method: int  # NO_DITHER | SUBTRACTIVE_DITHER_1 | _2
     zdither0: int  # ZDITHER0 seed
     tile_index: int  # 0-based row-major tile index = BINTABLE row = dither key
+    #: True when the tile uses the per-tile lossless GZIP fallback (empty
+    #: COMPRESSED_DATA, non-empty GZIP_COMPRESSED_DATA): cfitsio could not
+    #: quantize it — all-NaN (a shared-grid band's empty region) or constant —
+    #: so the bytes at :meth:`SupertileIndex.tile_byte_range` are the gzip of
+    #: the raw big-endian float32 pixels, and every RICE parameter above is
+    #: irrelevant. ``gzip.decompress`` + ``numpy.frombuffer(dtype='>f4')``
+    #: recovers the tile bit-exactly.
+    gzip_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -301,6 +309,8 @@ class _TileEntry:
     zscale: float
     zzero: float
     zblank: float
+    gzip_n_bytes: int
+    gzip_heap_offset: int
 
 
 _SUPPORTED_ZCMP = ("RICE_1", "GZIP_2")
@@ -448,11 +458,14 @@ class SupertileIndex:
         for r in range(layout.n_rows):
             row_off = r * layout.row_bytes
             n_bytes, heap_off = _read_descriptor(row_table, row_off + cd.offset, cd.kind)
-            gzip_n = 0
+            gzip_n, gzip_off = 0, 0
             if gzip_col is not None:
-                gzip_n, _ = _read_descriptor(row_table, row_off + gzip_col.offset, gzip_col.kind)
-            # A non-empty COMPRESSED_DATA with an also-non-empty GZIP fallback is a
-            # per-tile lossless fallback; flag empties at range time, not here.
+                gzip_n, gzip_off = _read_descriptor(
+                    row_table, row_off + gzip_col.offset, gzip_col.kind
+                )
+            # An empty COMPRESSED_DATA with a non-empty GZIP_COMPRESSED_DATA is the
+            # per-tile lossless fallback (unquantizable — all-NaN or constant — tile);
+            # tile_byte_range/tile_params route to it below.
             zscale = (
                 struct.unpack_from(">d", row_table, row_off + zscale_col.offset)[0]
                 if zscale_col is not None
@@ -474,6 +487,8 @@ class SupertileIndex:
                     zscale=zscale,
                     zzero=zzero,
                     zblank=zblank,
+                    gzip_n_bytes=gzip_n,
+                    gzip_heap_offset=gzip_off,
                 )
             )
         return entries
@@ -501,16 +516,24 @@ class SupertileIndex:
     def tile_byte_range(self, local_x: int, local_y: int) -> ByteRange:
         """Absolute byte range of a tile's compressed heap bytes — range-read this from R2.
 
-        Raises :class:`ValueError` for a tile with empty ``COMPRESSED_DATA`` (a
-        pyramid level never has one; only a per-tile GZIP fallback would, which
-        this display pipeline does not emit).
+        For a per-tile GZIP-fallback tile (empty ``COMPRESSED_DATA``, non-empty
+        ``GZIP_COMPRESSED_DATA`` — an unquantizable all-NaN or constant tile,
+        which shared-grid partial-coverage bands emit routinely) this is the
+        fallback cell's range; ``tile_params(...).gzip_fallback`` tells the
+        consumer how to decode it. Raises :class:`ValueError` only when both
+        cells are empty (a malformed file).
         """
         row = self._check_coords(local_x, local_y)
         entry = self._entries[row]
         if entry.n_bytes == 0:
+            if entry.gzip_n_bytes > 0:
+                return ByteRange(
+                    start=self._layout.heap_start + entry.gzip_heap_offset,
+                    length=entry.gzip_n_bytes,
+                )
             raise ValueError(
-                f"tile ({local_x}, {local_y}) has empty COMPRESSED_DATA — not a "
-                "range-readable RICE/GZIP tile (unexpected for a fitsgl pyramid)"
+                f"tile ({local_x}, {local_y}) has empty COMPRESSED_DATA and no GZIP "
+                "fallback — malformed fpack file"
             )
         return ByteRange(start=self._layout.heap_start + entry.heap_offset, length=entry.n_bytes)
 
@@ -530,6 +553,7 @@ class SupertileIndex:
             dither_method=self.dither_method,
             zdither0=self.zdither0,
             tile_index=row,
+            gzip_fallback=entry.n_bytes == 0 and entry.gzip_n_bytes > 0,
         )
 
 

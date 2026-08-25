@@ -23,6 +23,42 @@ export async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
 }
 
 /**
+ * Per-tile GZIP fallback decode (the tiled-image convention's lossless escape
+ * hatch): gunzip → big-endian float32, NO byte shuffle. cfitsio/astropy store a
+ * tile this way — raw pixels gzipped into the `GZIP_COMPRESSED_DATA` column,
+ * with `COMPRESSED_DATA` left empty — whenever lossy quantization fails for
+ * that one tile, which happens exactly when the tile has no quantizable signal:
+ * every pixel NaN (a band's empty region on a shared grid) or constant. The
+ * bytes are the tile's original IEEE-754 values in FITS (big-endian) order, so
+ * the decode is bit-exact and NaN patterns pass through untouched.
+ *
+ * @param bytes   the tile's gzip bytes (fpack GZIP_COMPRESSED_DATA cell)
+ * @param nPixels number of pixels in the tile (tile_width * tile_height)
+ */
+export async function decodeGzipFallbackTile(
+  bytes: Uint8Array,
+  nPixels: number,
+): Promise<Float32Array> {
+  const decompressed = await gunzip(bytes);
+  if (decompressed.byteLength !== nPixels * 4) {
+    throw new Error(
+      `GZIP fallback decode: gunzipped ${decompressed.byteLength} bytes, expected ` +
+        `${nPixels * 4} (${nPixels} float32). Non-float32 fallback tiles are not supported.`,
+    );
+  }
+  const view = new DataView(
+    decompressed.buffer,
+    decompressed.byteOffset,
+    decompressed.byteLength,
+  );
+  const floats = new Float32Array(nPixels);
+  for (let i = 0; i < nPixels; i++) {
+    floats[i] = view.getFloat32(i * 4, false); // false = big-endian
+  }
+  return floats;
+}
+
+/**
  * @param bytes   the tile's gzip bytes (fpack COMPRESSED_DATA cell)
  * @param nPixels number of pixels in the tile (tile_width * tile_height)
  */
