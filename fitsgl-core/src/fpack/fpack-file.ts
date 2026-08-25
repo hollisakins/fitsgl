@@ -21,7 +21,7 @@ import {
   type BinTableLayout,
 } from './bintable.js';
 import { decodeRiceTile } from './decode-rice.js';
-import { decodeGzip2Tile } from './decode-gzip2.js';
+import { decodeGzip2Tile, decodeGzipFallbackTile } from './decode-gzip2.js';
 import { ditherMethodFromZquantiz, NO_DITHER } from './dither.js';
 
 export type CompressionType = 'RICE_1' | 'GZIP_2';
@@ -110,6 +110,15 @@ export interface TileDecodeParams {
   ditherMethod: number;
   zdither0: number;
   tileIndex: number;
+  /**
+   * True when this tile uses the per-tile lossless GZIP fallback (empty
+   * COMPRESSED_DATA, non-empty GZIP_COMPRESSED_DATA): the tile could not be
+   * quantized — all-NaN (a band's empty region on a shared grid) or constant —
+   * so the writer gzipped the raw big-endian floats instead. The bytes paired
+   * with these params are then the GZIP_COMPRESSED_DATA cell, and decode goes
+   * through `decodeGzipFallbackTile` regardless of `compressionType`.
+   */
+  gzipFallback: boolean;
 }
 
 export class FpackFile {
@@ -335,18 +344,22 @@ export class FpackFile {
       ditherMethod: this.ditherMethod,
       zdither0: this.zdither0,
       tileIndex: row,
+      gzipFallback: entry.nBytes === 0 && entry.gzipNBytes > 0,
     };
   }
 
-  /** Range-fetch just the compressed heap bytes for tile (x, y). */
+  /**
+   * Range-fetch just the compressed heap bytes for tile (x, y): the
+   * COMPRESSED_DATA cell normally, or the GZIP_COMPRESSED_DATA cell for a
+   * per-tile lossless fallback (an unquantizable — all-NaN or constant — tile;
+   * `tileDecodeParams` flags it via `gzipFallback` so decode matches the bytes).
+   */
   async fetchCompressedTile(tileX: number, tileY: number, signal?: AbortSignal): Promise<Uint8Array> {
     const { entry } = await this.resolveTile(tileX, tileY);
     if (entry.nBytes === 0) {
       if (entry.gzipNBytes > 0) {
-        throw new Error(
-          `fpack ${this.url}: tile (${tileX}, ${tileY}) uses a per-tile GZIP fallback ` +
-            `(non-empty GZIP_COMPRESSED_DATA), which is not supported`,
-        );
+        const gzStart = this.layout.heapStart + entry.gzipHeapOffset;
+        return this.getBytes(gzStart, entry.gzipNBytes, signal);
       }
       throw new Error(`fpack ${this.url}: tile (${tileX}, ${tileY}) has empty COMPRESSED_DATA`);
     }
@@ -361,6 +374,9 @@ export class FpackFile {
    * browser-native `DecompressionStream`; the RICE_1 path is synchronous internally.
    */
   static async decodeTile(bytes: Uint8Array, params: TileDecodeParams): Promise<Float32Array> {
+    // Per-tile lossless fallback first: the bytes are the GZIP_COMPRESSED_DATA
+    // cell whatever the file-level ZCMPTYPE says.
+    if (params.gzipFallback) return decodeGzipFallbackTile(bytes, params.nPixels);
     if (params.compressionType === 'RICE_1') {
       const dither =
         params.ditherMethod === NO_DITHER

@@ -769,3 +769,53 @@ def test_plan_cutout_covers_full_sky_box_odd(odd_manifest):
         assert (col // ts, row // ts) in covered
         checked += 1
     assert checked >= 25
+
+
+def test_gzip_fallback_tiles_served_and_flagged(tmp_path):
+    """Unquantizable tiles (all-NaN or constant) take the per-tile lossless GZIP
+    fallback — empty COMPRESSED_DATA, gzip of the raw big-endian float32 pixels
+    in GZIP_COMPRESSED_DATA. Shared-grid bands that cover only part of their
+    field emit these routinely (the CAMPFIRE partial-filter-coverage case), so
+    the index must serve the fallback cell's byte range and flag it via
+    tile_params().gzip_fallback instead of raising."""
+    import gzip as _gzip
+
+    img = np.random.default_rng(7).normal(0.0, 1.0, (512, 512)).astype(np.float32)
+    img[0:256, 256:512] = np.nan  # tile (1,0): all NaN
+    img[256:512, 0:256] = 3.25  # tile (0,1): constant
+    hdu = fits.CompImageHDU(
+        data=img,
+        compression_type="RICE_1",
+        tile_shape=(256, 256),
+        quantize_level=8,
+        quantize_method=2,
+        dither_seed=99,
+    )
+    path = tmp_path / "fallback.fits.fz"
+    hdu.writeto(path, overwrite=True)
+    raw = path.read_bytes()
+
+    with fits.open(path, disable_image_compression=True) as hdul:
+        bt = hdul[1].data
+        # Sanity: rows 1 ((1,0)) and 2 ((0,1)) really took the fallback.
+        fallback_rows = [r for r in range(4) if np.asarray(bt["COMPRESSED_DATA"][r]).size == 0]
+        assert fallback_rows == [1, 2]
+        expected_gzip = {r: np.asarray(bt["GZIP_COMPRESSED_DATA"][r], dtype=np.uint8).tobytes() for r in fallback_rows}
+
+    idx = SupertileIndex.open_local(str(path))
+    for (lx, ly), row, want in (((1, 0), 1, np.nan), ((0, 1), 2, 3.25)):
+        params = idx.tile_params(lx, ly)
+        assert params.gzip_fallback is True
+        br = idx.tile_byte_range(lx, ly)
+        cell = raw[br.start : br.stop]
+        assert cell == expected_gzip[row]
+        vals = np.frombuffer(_gzip.decompress(cell), dtype=">f4")
+        assert vals.size == 256 * 256
+        if np.isnan(want):
+            assert bool(np.all(np.isnan(vals)))
+        else:
+            assert bool(np.all(vals == np.float32(want)))
+    # Quantized tiles are unaffected and not flagged.
+    for lx, ly in ((0, 0), (1, 1)):
+        assert idx.tile_params(lx, ly).gzip_fallback is False
+        assert idx.tile_byte_range(lx, ly).length > 0
