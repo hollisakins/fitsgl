@@ -521,3 +521,168 @@ def test_build_with_scratch_matches_and_leaves_no_litter(tmp_path, monkeypatch):
     # Transient never lands in (or lingers in) the output dir, and scratch is swept.
     assert not (tmp_path / "out_scratch" / NATIVE_NPY_NAME).exists()
     assert list(scratch.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# 13. The round-trip guard is per fpack tile, against the step the file recorded
+#     (ZSCALE), not one global noise sigma (issue #29).
+# --------------------------------------------------------------------------- #
+def _multi_depth_mosaic(seed=29):
+    """A synthetic mosaic with spatially varying depth: the bottom-right 256x256
+    corner is ~100x noisier than the rest (as when a placed-tile mosaic mixes
+    shallow and deep tiles). A global MAD sigma is dominated by the quiet area,
+    while the noisy corner's tile quantizes with a ~100x coarser step."""
+    image, header, _ = generate_synthetic_mosaic(seed=seed)  # quiet sigma = 0.05
+    rng = np.random.default_rng(seed)
+    image[768:, 768:] += rng.normal(0.0, 5.0, size=(256, 256)).astype(np.float32)
+    return image, header
+
+
+def _zscale_grid(path, tile_size=256):
+    """The compressed bintable's per-tile ZSCALE column as an (n_ty, n_tx) grid."""
+    with fits.open(path, disable_image_compression=True) as hdul:
+        h, w = int(hdul[1].header["ZNAXIS2"]), int(hdul[1].header["ZNAXIS1"])
+        n_ty, n_tx = -(-h // tile_size), -(-w // tile_size)
+        return np.array(hdul[1].data["ZSCALE"], dtype=np.float64).reshape(n_ty, n_tx)
+
+
+@pytest.fixture(scope="module")
+def multi_depth(tmp_path_factory):
+    d = tmp_path_factory.mktemp("depth")
+    image, header = _multi_depth_mosaic()
+    src = d / "depth.fits"
+    fits.PrimaryHDU(data=image, header=header).writeto(src, overwrite=True)
+    manifest = build_pyramid(src)  # must NOT raise: the data is fine (issue #29)
+    z0 = d / "depth_pyramid" / manifest.levels[0].filename
+    return {"image": image, "z0": z0, "readback": _read_image(z0), "zscale": _zscale_grid(z0)}
+
+
+def test_multi_depth_mosaic_would_fail_the_old_global_check(multi_depth):
+    """The fixture really reproduces #29: the noisy corner's legitimate error is
+    several times the 2 x global-MAD-sigma tolerance the guard used to apply."""
+    image, back = multi_depth["image"], multi_depth["readback"]
+    finite = np.isfinite(image)
+    max_err = float(np.abs(image[finite] - back[finite]).max())
+    assert max_err > 2.0 * estimate_noise(image)
+    # ...and that error is confined to the coarse-step corner tile, which quantized
+    # with a step far above the field's global noise.
+    zs = multi_depth["zscale"]
+    assert zs[3, 3] > 20 * np.median(zs[:3, :])
+    assert zs[3, 3] > 2.0 * estimate_noise(image)
+
+
+def test_roundtrip_error_within_half_step_of_each_tiles_zscale(multi_depth):
+    """The physical bound the guard rests on: every finite pixel is within half
+    its own tile's ZSCALE (plus float32 rounding) of the original."""
+    from fitsgl.build_pyramid import _tile_max
+
+    image, back, zs = multi_depth["image"], multi_depth["readback"], multi_depth["zscale"]
+    err = np.abs(image - back)
+    err[np.isnan(image)] = 0.0
+    tile_err = _tile_max(err, 256)
+    mag = np.abs(back)
+    mag[np.isnan(image)] = 0.0
+    tile_ulp = np.spacing(_tile_max(mag, 256).astype(np.float32))
+    assert (zs > 0).all()  # no lossless fallback in this fixture: every tile quantized
+    assert (tile_err <= 0.5 * zs + tile_ulp).all()
+    assert tile_err[3, 3] > 0.25 * zs[3, 3]  # and the bound is tight, not slack
+
+
+def test_verify_roundtrip_flags_a_multi_step_error_by_tile(multi_depth):
+    from fitsgl.build_pyramid import _verify_roundtrip
+
+    image, back, zs = multi_depth["image"], multi_depth["readback"], multi_depth["zscale"]
+    _verify_roundtrip(image, back, 0, 256, zs.reshape(-1))  # the real file passes
+
+    # A pixel a few steps off in tile (ty=2, tx=1) is real corruption: caught, and
+    # the message names the tile.
+    bad = back.copy()
+    y, x = 2 * 256 + 17, 1 * 256 + 40
+    assert np.isfinite(bad[y, x])
+    bad[y, x] += 3.0 * zs[2, 1]
+    with pytest.raises(RuntimeError, match=r"ty=2, tx=1"):
+        _verify_roundtrip(image, bad, 0, 256, zs.reshape(-1))
+
+    # A sub-step nudge stays within the one-step headroom (err <= 0.5 + 0.4 steps).
+    ok = back.copy()
+    ok[y, x] += 0.4 * zs[2, 1]
+    _verify_roundtrip(image, ok, 0, 256, zs.reshape(-1))
+
+
+def test_verify_roundtrip_still_rejects_nan_mask_changes(multi_depth):
+    from fitsgl.build_pyramid import _verify_roundtrip
+
+    image, back, zs = multi_depth["image"], multi_depth["readback"], multi_depth["zscale"]
+    bad = back.copy()
+    bad[5, 5] = np.nan
+    with pytest.raises(RuntimeError, match="NaN mask"):
+        _verify_roundtrip(image, bad, 0, 256, zs.reshape(-1))
+    # ZSCALE count that does not match the tile grid is a broken file, not a pass.
+    with pytest.raises(RuntimeError, match="ZSCALE entries"):
+        _verify_roundtrip(image, back, 0, 256, zs.reshape(-1)[:-1])
+
+
+def test_verify_roundtrip_rejects_finite_pixel_decoded_as_inf(multi_depth):
+    """A finite source pixel that reads back as +/-inf is corruption and must
+    raise. It must be caught BEFORE the tolerance math: an inf in the readback
+    makes the per-tile float32 ULP NaN, and a NaN ratio compares False against
+    the threshold, so without an explicit check it would pass silently."""
+    from fitsgl.build_pyramid import _verify_roundtrip
+
+    image, back, zs = multi_depth["image"], multi_depth["readback"], multi_depth["zscale"]
+    for bad_value in (np.inf, -np.inf):
+        bad = back.copy()
+        assert np.isfinite(bad[300, 300])
+        bad[300, 300] = bad_value
+        with pytest.raises(RuntimeError, match="infinite pixels changed"):
+            _verify_roundtrip(image, bad, 0, 256, zs.reshape(-1))
+
+
+def test_verify_roundtrip_infs_must_roundtrip_exactly():
+    """An inf in the source must come back as the same inf: a matching readback
+    passes (and does not poison neighbouring pixels' error via inf - inf = NaN),
+    while inf->finite, inf->NaN, or a sign flip raises."""
+    from fitsgl.build_pyramid import _verify_roundtrip
+
+    a = np.random.default_rng(2).normal(size=(256, 512)).astype(np.float32)
+    a[7, 7] = np.inf
+    a[9, 400] = -np.inf
+    _verify_roundtrip(a, a.copy(), 0, 256, np.zeros(2))
+    for y, x, value in ((7, 7, 1.0), (7, 7, -np.inf), (9, 400, np.nan)):
+        b = a.copy()
+        b[y, x] = value
+        with pytest.raises(RuntimeError, match="changed on round-trip"):
+            _verify_roundtrip(a, b, 0, 256, np.zeros(2))
+    # ...and a real error elsewhere in a tile that also holds an inf is still seen.
+    b = a.copy()
+    b[100, 100] += 1e-3
+    with pytest.raises(RuntimeError, match=r"ty=0, tx=0"):
+        _verify_roundtrip(a, b, 0, 256, np.zeros(2))
+
+
+def test_verify_roundtrip_lossless_file_is_exact():
+    """No ZSCALE column (or ZSCALE=0 on a GZIP-fallback tile) means lossless: the
+    tolerance collapses to float32 rounding, so a bit-exact readback passes and
+    any real difference fails."""
+    from fitsgl.build_pyramid import _verify_roundtrip
+
+    rng = np.random.default_rng(1)
+    a = rng.normal(size=(300, 700)).astype(np.float32)
+    a[10:20, 10:20] = np.nan
+    _verify_roundtrip(a, a.copy(), 0, 256, None)
+    _verify_roundtrip(a, a.copy(), 0, 256, np.zeros(2 * 3))
+    b = a.copy()
+    b[100, 100] += 1e-3
+    with pytest.raises(RuntimeError, match=r"ty=0, tx=0"):
+        _verify_roundtrip(a, b, 0, 256, None)
+
+
+def test_tile_max_handles_ragged_edges():
+    from fitsgl.build_pyramid import _tile_max
+
+    block = np.zeros((300, 700), dtype=np.float32)  # 2 x 3 tiles of 256, ragged
+    block[0, 0] = 1.0  # tile (0, 0)
+    block[299, 699] = 7.0  # partial corner tile (1, 2)
+    block[100, 600] = 3.0  # tile (0, 2)
+    assert _tile_max(block, 256).tolist() == [[1.0, 0.0, 3.0], [0.0, 0.0, 7.0]]
+    assert _tile_max(np.full((512, 256), 2.0), 256).tolist() == [[2.0], [2.0]]

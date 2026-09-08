@@ -10,9 +10,9 @@ dither seed is stored per level (ZDITHER0) so the browser can reverse it. The
 raw, lossless science mosaic is distributed separately, not by this pipeline.
 
 Every level shares a 256x256 fpack-internal tile size. Each file is written and
-then read back to verify the pixels round-trip within the quantization tolerance
-(and the NaN mask exactly); a failed round-trip raises rather than emitting
-broken output.
+then read back to verify the pixels round-trip within each fpack tile's own
+quantization step (``ZSCALE``, as recorded in the file) and the NaN mask exactly;
+a failed round-trip raises rather than emitting broken output.
 """
 
 from __future__ import annotations
@@ -273,8 +273,10 @@ def _supertile_blocks(n_tiles_x: int, n_tiles_y: int, k: int) -> list[tuple[int,
 def estimate_noise(data: np.ndarray) -> float:
     """Robust noise estimate (MAD-scaled) over finite pixels.
 
-    Used both to set the q>0 round-trip tolerance and by tests. MAD is robust
-    to the bright sources that would inflate a plain standard deviation.
+    Used by the display-stats code and by tests. MAD is robust to the bright
+    sources that would inflate a plain standard deviation. (It is deliberately
+    *not* the round-trip tolerance: one global sigma is the wrong kind of number
+    for a per-tile quantizer -- see :func:`_verify_roundtrip`.)
     """
     finite = data[np.isfinite(data)]
     if finite.size == 0:
@@ -284,57 +286,123 @@ def estimate_noise(data: np.ndarray) -> float:
     return float(1.4826 * mad)
 
 
-def quant_atol(data: np.ndarray) -> float:
-    """Absolute tolerance for a q=8 RICE round-trip.
+#: Per-tile round-trip tolerance, in units of that tile's quantization step
+#: (``ZSCALE``). The step is the largest error quantization can legitimately
+#: introduce: the encoder rounds ``(v - ZZERO)/ZSCALE`` (plus the subtractive
+#: dither offset, which the decoder removes again) to the nearest integer, so a
+#: correctly decoded pixel is within **half** a step of the original, plus the
+#: float32 rounding of the dequantized value. One full step is 2x headroom over
+#: that bound and still catches anything actually wrong -- a bad dither index,
+#: a mis-scaled tile, corrupt bytes -- since those are off by many steps.
+ROUNDTRIP_STEP_TOLERANCE = 1.0
 
-    The quantization step is ~noise_sigma/8, so the per-pixel error (including the
-    subtractive-dither residual) stays well under noise_sigma. We bound at two
-    noise_sigma: astropy drives the q=8 step from its own noise estimator, which
-    can run hotter than this robust MAD estimate (gradients/sources inflate it),
-    so a legitimate worst-case dither residual can sit just over one MAD-sigma.
-    2x absorbs that mismatch while still flagging gross corruption (many sigma).
-    A small floor handles degenerate noiseless inputs.
+
+def _tile_max(block: np.ndarray, tile_size: int) -> np.ndarray:
+    """Reduce a 2-D block to its per-tile maximum on a ``tile_size`` grid.
+
+    The block must start on a tile boundary; ragged bottom/right edges (partial
+    tiles) are handled by zero-padding, which is a no-op for a max of
+    non-negative values. Returns an ``(n_ty, n_tx)`` array.
     """
-    sigma = estimate_noise(data)
-    return max(sigma, 1e-6) * 2.0
+    h, w = block.shape
+    n_ty, n_tx = -(-h // tile_size), -(-w // tile_size)
+    if (h, w) != (n_ty * tile_size, n_tx * tile_size):
+        padded = np.zeros((n_ty * tile_size, n_tx * tile_size), dtype=block.dtype)
+        padded[:h, :w] = block
+        block = padded
+    return block.reshape(n_ty, tile_size, n_tx, tile_size).max(axis=(1, 3))
 
 
-def _verify_roundtrip(original: np.ndarray, readback: np.ndarray, z: int) -> None:
-    """Verify a written level reads back correctly; raise if not.
+def _verify_roundtrip(
+    original: np.ndarray,
+    readback: np.ndarray,
+    z: int,
+    tile_size: int,
+    zscale: np.ndarray | None,
+) -> None:
+    """Verify a written file reads back correctly; raise if not.
 
-    Every level is lossy RICE_1 q=8 (display-only). The NaN mask must round-trip
-    exactly (no finite<->NaN leakage), and finite pixels must match within the
-    quantization tolerance (~one noise sigma; the q=8 step is ~sigma/8).
+    Every level is lossy RICE_1 q=8 (display-only). The NaN mask (and any +/-inf)
+    must round-trip exactly (no finite<->non-finite leakage), and every finite
+    pixel must match within
+    :data:`ROUNDTRIP_STEP_TOLERANCE` steps of **its own tile's** quantization step
+    (``zscale``: one entry per fpack tile in the file's row-major tile order, i.e.
+    the compressed bintable's ``ZSCALE`` column; ``None`` when the file carries
+    no quantization column, i.e. it is lossless).
 
-    Done in row-blocks so a multi-GB level never materializes full-image
-    boolean-index temporaries (``original[finite]`` etc.), which would multiply
-    peak memory several-fold. The tolerance is estimated from a strided subsample
-    of the data — a robust MAD estimate needs only a sample, not every pixel.
+    The tolerance is per tile, not per file, because that is how the encoder
+    works: astropy/CFITSIO pick the step from each ``tile_size``-square tile's own
+    noise estimate. A mosaic assembled from tiles of different depth, or a tile
+    holding a bright source that inflates that estimate, legitimately carries
+    errors many times the *global* noise while sitting well inside its local step.
+    Comparing against the step the file actually recorded needs no noise model
+    and cannot false-fail on correct data (issue #29). A ``ZSCALE`` of 0 marks a
+    tile astropy fell back to lossless GZIP on (all-NaN, constant, or out of
+    range); its tolerance is then only float32 rounding.
+
+    Done in tile-row-aligned blocks so a multi-GB level never materializes
+    full-image temporaries.
     """
     if original.shape != readback.shape:
         raise RuntimeError(f"z={z}: round-trip shape {readback.shape} != {original.shape}")
 
-    flat = np.asarray(original).reshape(-1)
-    stride = max(1, flat.size // 1_000_000)
-    atol = quant_atol(flat[::stride])
+    h, w = int(original.shape[0]), int(original.shape[1])
+    n_ty, n_tx = _tile_count((h, w), tile_size)
+    if zscale is None:
+        zscale = np.zeros(n_ty * n_tx)
+    zscale = np.asarray(zscale, dtype=np.float64).reshape(-1)
+    if zscale.size != n_ty * n_tx:
+        raise RuntimeError(
+            f"z={z}: file has {zscale.size} ZSCALE entries for a {n_ty}x{n_tx} tile grid"
+        )
+    zscale = zscale.reshape(n_ty, n_tx)
 
-    cols = original.shape[1]
-    block = max(1, 8_000_000 // max(1, cols))  # ~8M pixels per row-block
-    max_err = 0.0
-    for r0 in range(0, original.shape[0], block):
+    # ~8M pixels per block, rounded to whole tile rows so tiles never straddle blocks.
+    tile_rows = max(1, (8_000_000 // max(1, w)) // tile_size)
+    block = tile_rows * tile_size
+    worst_ratio = 0.0  # max over tiles of err / tolerance
+    worst = (0.0, 0.0, 0, 0)  # (err, tol, ty, tx) of that tile, for the message
+    for r0 in range(0, h, block):
         o = np.asarray(original[r0 : r0 + block], dtype=np.float32)
         b = np.asarray(readback[r0 : r0 + block], dtype=np.float32)
         o_nan = np.isnan(o)
         if not np.array_equal(o_nan, np.isnan(b)):
             raise RuntimeError(f"z={z}: NaN mask changed on round-trip (NaN handling broken)")
-        finite = ~o_nan
-        if finite.any():
-            err = np.abs(o[finite] - b[finite])
-            if err.size:
-                max_err = max(max_err, float(err.max()))
-    if max_err > atol:
+        # Infinities must round-trip exactly too, and a finite pixel must never
+        # decode as +/-inf: that is corruption, and it must be rejected HERE, before
+        # the tolerance math -- an inf in ``mag`` makes ``np.spacing`` NaN, and a NaN
+        # ratio compares False against everything, so it would pass silently.
+        o_inf = np.isinf(o)
+        if not np.array_equal(o_inf, np.isinf(b)) or not np.array_equal(o[o_inf], b[o_inf]):
+            raise RuntimeError(
+                f"z={z}: infinite pixels changed on round-trip "
+                f"(finite<->inf leakage or sign flip; decode corrupt)"
+            )
+        nonfinite = o_nan | o_inf
+        with np.errstate(invalid="ignore"):  # inf - inf = NaN at pixels zeroed just below
+            err = np.abs(o - b)
+        err[nonfinite] = 0.0
+        mag = np.abs(b)
+        mag[nonfinite] = 0.0
+        ty0 = r0 // tile_size
+        tile_err = _tile_max(err, tile_size)
+        # One float32 ULP at the tile's brightest pixel covers the rounding of the
+        # dequantized double into float32 (only matters when the step is tiny next
+        # to the pixel value: a very bright source, or a lossless ZSCALE=0 tile).
+        tile_ulp = np.spacing(_tile_max(mag, tile_size))
+        tile_tol = ROUNDTRIP_STEP_TOLERANCE * zscale[ty0 : ty0 + tile_err.shape[0]] + tile_ulp
+        ratio = tile_err / tile_tol
+        i = int(np.argmax(ratio))
+        if ratio.flat[i] > worst_ratio:
+            worst_ratio = float(ratio.flat[i])
+            ty, tx = divmod(i, tile_err.shape[1])
+            worst = (float(tile_err[ty, tx]), float(tile_tol[ty, tx]), ty0 + ty, tx)
+    if worst_ratio > 1.0:
+        err, tol, ty, tx = worst
         raise RuntimeError(
-            f"z={z}: lossy round-trip exceeded tolerance (max_err={max_err:.6g} > atol={atol:.6g})"
+            f"z={z}: lossy round-trip exceeded tolerance at fpack tile (ty={ty}, tx={tx}): "
+            f"max_err={err:.6g} > {tol:.6g} "
+            f"({ROUNDTRIP_STEP_TOLERANCE:g} x ZSCALE={zscale[ty, tx]:.6g} + float32 ulp)"
         )
 
 
@@ -464,19 +532,24 @@ def _write_supertile(
     )
     fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(out_path, overwrite=True)
 
+    # Read the ACTUAL compression keyword so the manifest hint can never drift from
+    # the file, assert the heap descriptors did not silently overflow, and pull the
+    # per-tile quantization steps (ZSCALE) the round-trip check is measured against
+    # (a fixed-width table column -- this does not touch the compressed heap).
+    with fits.open(out_path, disable_image_compression=True) as hdul:
+        bintable_header = hdul[1].header
+        zcmptype = str(bintable_header["ZCMPTYPE"])
+        _check_descriptor_overflow(bintable_header, task.z)
+        zscale = None
+        if task.verify and "ZSCALE" in hdul[1].columns.names:
+            zscale = np.array(hdul[1].data["ZSCALE"], dtype=np.float64)
+
     # Read back and verify the lossy round-trip before declaring it good (a second
     # decode of this supertile); skippable (verify=False) when memory is tight.
     if task.verify:
         with fits.open(out_path) as hdul:
             readback = np.asarray(hdul[1].data)
-        _verify_roundtrip(sub, readback, task.z)
-
-    # Read the ACTUAL compression keyword so the manifest hint can never drift from
-    # the file, and assert the heap descriptors did not silently overflow.
-    with fits.open(out_path, disable_image_compression=True) as hdul:
-        bintable_header = hdul[1].header
-        zcmptype = str(bintable_header["ZCMPTYPE"])
-        _check_descriptor_overflow(bintable_header, task.z)
+        _verify_roundtrip(sub, readback, task.z, task.tile_size, zscale)
     return zcmptype
 
 
