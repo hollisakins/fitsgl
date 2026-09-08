@@ -322,8 +322,9 @@ def _verify_roundtrip(
 ) -> None:
     """Verify a written file reads back correctly; raise if not.
 
-    Every level is lossy RICE_1 q=8 (display-only). The NaN mask must round-trip
-    exactly (no finite<->NaN leakage), and every finite pixel must match within
+    Every level is lossy RICE_1 q=8 (display-only). The NaN mask (and any +/-inf)
+    must round-trip exactly (no finite<->non-finite leakage), and every finite
+    pixel must match within
     :data:`ROUNDTRIP_STEP_TOLERANCE` steps of **its own tile's** quantization step
     (``zscale``: one entry per fpack tile in the file's row-major tile order, i.e.
     the compressed bintable's ``ZSCALE`` column; ``None`` when the file carries
@@ -367,10 +368,22 @@ def _verify_roundtrip(
         o_nan = np.isnan(o)
         if not np.array_equal(o_nan, np.isnan(b)):
             raise RuntimeError(f"z={z}: NaN mask changed on round-trip (NaN handling broken)")
-        err = np.abs(o - b)
-        err[o_nan] = 0.0
+        # Infinities must round-trip exactly too, and a finite pixel must never
+        # decode as +/-inf: that is corruption, and it must be rejected HERE, before
+        # the tolerance math -- an inf in ``mag`` makes ``np.spacing`` NaN, and a NaN
+        # ratio compares False against everything, so it would pass silently.
+        o_inf = np.isinf(o)
+        if not np.array_equal(o_inf, np.isinf(b)) or not np.array_equal(o[o_inf], b[o_inf]):
+            raise RuntimeError(
+                f"z={z}: infinite pixels changed on round-trip "
+                f"(finite<->inf leakage or sign flip; decode corrupt)"
+            )
+        nonfinite = o_nan | o_inf
+        with np.errstate(invalid="ignore"):  # inf - inf = NaN at pixels zeroed just below
+            err = np.abs(o - b)
+        err[nonfinite] = 0.0
         mag = np.abs(b)
-        mag[o_nan] = 0.0
+        mag[nonfinite] = 0.0
         ty0 = r0 // tile_size
         tile_err = _tile_max(err, tile_size)
         # One float32 ULP at the tile's brightest pixel covers the rounding of the

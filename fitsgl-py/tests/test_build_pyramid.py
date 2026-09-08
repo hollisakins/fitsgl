@@ -622,6 +622,44 @@ def test_verify_roundtrip_still_rejects_nan_mask_changes(multi_depth):
         _verify_roundtrip(image, back, 0, 256, zs.reshape(-1)[:-1])
 
 
+def test_verify_roundtrip_rejects_finite_pixel_decoded_as_inf(multi_depth):
+    """A finite source pixel that reads back as +/-inf is corruption and must
+    raise. It must be caught BEFORE the tolerance math: an inf in the readback
+    makes the per-tile float32 ULP NaN, and a NaN ratio compares False against
+    the threshold, so without an explicit check it would pass silently."""
+    from fitsgl.build_pyramid import _verify_roundtrip
+
+    image, back, zs = multi_depth["image"], multi_depth["readback"], multi_depth["zscale"]
+    for bad_value in (np.inf, -np.inf):
+        bad = back.copy()
+        assert np.isfinite(bad[300, 300])
+        bad[300, 300] = bad_value
+        with pytest.raises(RuntimeError, match="infinite pixels changed"):
+            _verify_roundtrip(image, bad, 0, 256, zs.reshape(-1))
+
+
+def test_verify_roundtrip_infs_must_roundtrip_exactly():
+    """An inf in the source must come back as the same inf: a matching readback
+    passes (and does not poison neighbouring pixels' error via inf - inf = NaN),
+    while inf->finite, inf->NaN, or a sign flip raises."""
+    from fitsgl.build_pyramid import _verify_roundtrip
+
+    a = np.random.default_rng(2).normal(size=(256, 512)).astype(np.float32)
+    a[7, 7] = np.inf
+    a[9, 400] = -np.inf
+    _verify_roundtrip(a, a.copy(), 0, 256, np.zeros(2))
+    for y, x, value in ((7, 7, 1.0), (7, 7, -np.inf), (9, 400, np.nan)):
+        b = a.copy()
+        b[y, x] = value
+        with pytest.raises(RuntimeError, match="changed on round-trip"):
+            _verify_roundtrip(a, b, 0, 256, np.zeros(2))
+    # ...and a real error elsewhere in a tile that also holds an inf is still seen.
+    b = a.copy()
+    b[100, 100] += 1e-3
+    with pytest.raises(RuntimeError, match=r"ty=0, tx=0"):
+        _verify_roundtrip(a, b, 0, 256, np.zeros(2))
+
+
 def test_verify_roundtrip_lossless_file_is_exact():
     """No ZSCALE column (or ZSCALE=0 on a GZIP-fallback tile) means lossless: the
     tolerance collapses to float32 rounding, so a bit-exact readback passes and
