@@ -67,6 +67,12 @@ import {
   type ResolvedMarker,
 } from '../overlay/markers.js';
 import { packInstances, packOne } from '../overlay/pack.js';
+import {
+  resolveTarget,
+  targetMarker,
+  type ResolvedTarget,
+  type TargetInput,
+} from '../overlay/target.js';
 import { GridIndex } from '../overlay/spatial-index.js';
 import { broadPhaseWorldRadius, pickMarker, wasClick } from '../overlay/hit-test.js';
 import { OverlayRenderer } from '../overlay/overlay-renderer.js';
@@ -158,6 +164,9 @@ const KEY_PAN_FRACTION = 0.15;
  * tile.frag). Keep in sync with the clearColor call.
  */
 const BG_COLOR: readonly [number, number, number] = [0, 0, 0];
+
+/** Shared empty instance payload for clearing a single-instance overlay pass. */
+const EMPTY_INSTANCES = new Float32Array(0);
 
 /**
  * Read-only viewer state reported once per drawn frame. The viewer renders on
@@ -546,6 +555,11 @@ export class FitsViewer {
   private grid = new GridIndex([]);
   private readonly popup: OverlayPopup;
   private markerHandlers: MarkerHandlers;
+  // ---- go-to target: one sky-locked reticle, drawn by its own single-instance
+  // pass so it is never touched by a host's replace-all `setMarkers`, never
+  // hit-tested, and never widens the marker broad phase (see overlay/target.ts).
+  private readonly targetOverlay: OverlayRenderer;
+  private target: ResolvedTarget | null = null;
   // ---- region overlays (issue #16) ---------------------------------------
   private readonly regionRenderer: RegionRenderer;
   private readonly regions = new RegionStore();
@@ -712,6 +726,7 @@ export class FitsViewer {
     // Overlay subsystem (M3): the instanced marker renderer + a reused DOM popup.
     // The marker store/grid stay empty until the host adds markers.
     this.overlay = new OverlayRenderer(gl);
+    this.targetOverlay = new OverlayRenderer(gl);
     this.regionRenderer = new RegionRenderer(gl);
     this.popup = new OverlayPopup();
     this.markerHandlers = {
@@ -1456,6 +1471,39 @@ export class FitsViewer {
     this.requestRender();
   }
 
+  // ---- go-to target (sky-locked crosshair) --------------------------------
+
+  /**
+   * Pin the target reticle at a sky (`ra`/`dec`, ICRS deg) or pixel (`x`/`y`,
+   * 0-based array) position, or clear it with null. The glyph is drawn in the
+   * overlay pass, so it stays registered with the pixels under pan/zoom/North-up
+   * and keeps a constant CSS-pixel size; it is included in `exportPNG`.
+   *
+   * This does NOT move the camera — pair it with `setCenter`/`setZoom` for a
+   * "jump to coordinate". A target that cannot be placed (sky position with no
+   * WCS, or a non-finite projection) clears it, which `getTarget` reports.
+   * A coordinate outside the mosaic is still pinned (see `insideImage`).
+   *
+   * The target is host chrome, not catalog data: it is never hit-tested and is
+   * untouched by `setMarkers`/`clearMarkers`. It survives `setSource` (a band or
+   * RGB switch) but not a viewer rebuild, so a host that recreates the viewer
+   * re-pushes it after the new one is ready.
+   */
+  setTarget(target: TargetInput | null): void {
+    this.target =
+      target === null
+        ? null
+        : resolveTarget(target, this.wcs, { width: this.nativeW, height: this.nativeH });
+    if (this.target === null) this.targetOverlay.setInstances(EMPTY_INSTANCES, 0);
+    else this.targetOverlay.setInstances(packOne(targetMarker(this.target)), 1);
+    this.requestRender();
+  }
+
+  /** The pinned target (resolved world + sky + style), or null when none is set. */
+  getTarget(): ResolvedTarget | null {
+    return this.target;
+  }
+
   // ---- read-side accessors (deep-links, PNG export, overlays, split-view) --
 
   /**
@@ -1585,6 +1633,7 @@ export class FitsViewer {
     for (const m of this.bandManagers) m.destroy();
     this.clearColormapTexture();
     this.overlay.destroy(); // marker program, VAO, instance + quad buffers
+    this.targetOverlay.destroy(); // the reticle's own program/VAO/buffers
     this.regionRenderer.destroy(); // rect + polygon programs, VAOs, buffers
     this.popup.destroy(); // remove the popup DOM node
     this.gl.deleteProgram(this.program);
@@ -1944,6 +1993,8 @@ export class FitsViewer {
     };
     this.regionRenderer.draw(overlayView);
     this.overlay.draw(overlayView);
+    // The go-to reticle paints last so it is legible over a dense catalog.
+    this.targetOverlay.draw(overlayView);
 
     if (this.onFrame !== undefined) {
       try {

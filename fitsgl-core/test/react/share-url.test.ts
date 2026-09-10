@@ -13,6 +13,7 @@ const sample: ShareState = {
   s: 'log',
   cm: 'viridis',
   n: 1,
+  t: [150.111111, -2.222222],
 };
 
 describe('share-url encode/decode', () => {
@@ -32,6 +33,11 @@ describe('share-url encode/decode', () => {
         ['F444W', 1, 0, 0],
       ],
     };
+    expect(decodeShareHash(`#v=${encodeShareState(s)}`)).toEqual(s);
+  });
+
+  it('round-trips a pinned go-to target on its own', () => {
+    const s: ShareState = { t: [10.5, -30.25] };
     expect(decodeShareHash(`#v=${encodeShareState(s)}`)).toEqual(s);
   });
 

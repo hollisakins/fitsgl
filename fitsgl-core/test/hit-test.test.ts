@@ -34,6 +34,10 @@ describe('glyphContains', () => {
     expect(glyphContains('circle', 3, 4, 5)).toBe(true); // dist 5 == half
     expect(glyphContains('circle', 4, 4, 5)).toBe(false); // dist 5.66 > 5
     expect(glyphContains('point', 0, 5, 5)).toBe(true);
+    // The go-to reticle is never in the marker store, but the shape falls through
+    // to the disc test like `point`/`circle` rather than getting a special case.
+    expect(glyphContains('cross', 3, 4, 5)).toBe(true);
+    expect(glyphContains('cross', 4, 4, 5)).toBe(false);
     // box: corner (5,5) is inside (Chebyshev 5 <= 5) where the disc would exclude it.
     expect(glyphContains('box', 5, 5, 5)).toBe(true);
     expect(glyphContains('box', 6, 0, 5)).toBe(false);

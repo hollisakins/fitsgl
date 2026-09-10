@@ -46,6 +46,8 @@ import type {
   RegionPatch,
   ResolvedMarker,
   ResolvedRegion,
+  ResolvedTarget,
+  TargetInput,
   TilePyramid,
   TilePyramidOptions,
   ViewerConfig,
@@ -93,6 +95,16 @@ export interface FitsViewerHandle {
   removeRegion(id: string): boolean;
   /** Remove all regions. */
   clearRegions(): void;
+  /**
+   * Pin the sky-locked go-to reticle at `{ra, dec}` (ICRS deg) or `{x, y}`
+   * (0-based array px), or clear it with null. Does not move the camera — pair it
+   * with `setCenter`/`setZoom`. The target is not reapplied automatically after a
+   * band-set change rebuilds the viewer (markers aren't either): re-push it from
+   * `onReady`.
+   */
+  setTarget(target: TargetInput | null): void;
+  /** The pinned target, or null (none set / unplaceable / before load). */
+  getTarget(): ResolvedTarget | null;
   /** Auto-stretch to the data in view; resolves null before the first frame. */
   autoStretch(pLo?: number, pHi?: number): Promise<AutoStretchResult | null>;
   /** Centre + zoom so the whole mosaic is visible. */
@@ -331,6 +343,8 @@ const FitsViewerComponent = forwardRef<FitsViewerHandle, FitsViewerProps>(functi
       updateRegion: (id, patch) => viewerRef.current?.updateRegion(id, patch) ?? false,
       removeRegion: (id) => viewerRef.current?.removeRegion(id) ?? false,
       clearRegions: () => viewerRef.current?.clearRegions(),
+      setTarget: (t) => viewerRef.current?.setTarget(t),
+      getTarget: () => viewerRef.current?.getTarget() ?? null,
       autoStretch: (pLo, pHi) => viewerRef.current?.autoStretch(pLo, pHi) ?? Promise.resolve(null),
       fitToImage: () => viewerRef.current?.fitToImage(),
       setCenter: (x, y) => viewerRef.current?.setCenter(x, y),

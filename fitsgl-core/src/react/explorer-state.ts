@@ -18,7 +18,9 @@
 
 import {
   fitsglConfigFromDataset,
+  parseSkyCoord,
   rainbowWeights,
+  skyToPix,
   DEFAULT_TRILOGY_PARAMS,
   MAX_BANDS,
   type BandWeight,
@@ -26,6 +28,7 @@ import {
   type DatasetManifest,
   type FitsglConfig,
   type StretchMode,
+  type TanWcs,
   type TrilogyParams,
   type TrilogyStats,
   type ViewerConfig,
@@ -112,6 +115,52 @@ export interface ExplorerState {
   graticule: boolean;
   /** Active cursor mode (left tool rail). `'ruler'` measures distance + PA on drag. */
   tool: PointerToolMode;
+  /**
+   * The pinned go-to target (ICRS deg), or null. View state rather than a
+   * per-frame readout: it changes once per jump, must survive the viewer rebuild a
+   * band-set change triggers, and rides in a shared view link.
+   */
+  target: { ra: number; dec: number } | null;
+}
+
+/** A planned "go to coordinate" jump: where to centre, and the zoom to snap to. */
+export interface GoToPlan {
+  /** The parsed sky position (ICRS deg) — what the reticle is pinned to. */
+  ra: number;
+  dec: number;
+  /** The world (native-pixel) position to centre on. */
+  x: number;
+  y: number;
+  /**
+   * The zoom to apply, or null to leave it alone. Non-null only when the view is
+   * zoomed out past native: a jump should not throw away a chosen zoom, but
+   * arriving below 1:1 would put the target in an unreadably coarse view.
+   */
+  zoom: number | null;
+}
+
+/**
+ * Plan a jump to a free-form coordinate string (`parseSkyCoord` accepts decimal
+ * degrees, colon/space sexagesimal, and h-m-s forms). Pure: the caller applies the
+ * plan to the viewer and pins the target.
+ *
+ * Null when the text doesn't parse, there is no usable WCS, or the position does
+ * not project to a finite pixel (e.g. the antipode of the tangent point). A
+ * position that projects outside the mosaic is a valid plan — the reticle marks
+ * where it is, and the host can flag it.
+ */
+export function planGoTo(text: string, wcs: TanWcs | null, currentZoom: number): GoToPlan | null {
+  const parsed = parseSkyCoord(text);
+  if (parsed === null || wcs === null) return null;
+  const px = skyToPix(wcs, parsed.ra, parsed.dec);
+  if (!Number.isFinite(px.x) || !Number.isFinite(px.y)) return null;
+  return {
+    ra: parsed.ra,
+    dec: parsed.dec,
+    x: px.x,
+    y: px.y,
+    zoom: Number.isFinite(currentZoom) && currentZoom < 1 ? 1 : null,
+  };
 }
 
 /** A band's grid group, defaulting to 0 (one group / single-grid dataset). */
@@ -219,6 +268,7 @@ export function defaultExplorerState(
     overlay: false,
     graticule: false,
     tool: 'pan',
+    target: null,
   };
 }
 

@@ -33,6 +33,8 @@ export interface ShareState {
   n?: 0 | 1;
   /** Coordinate grid (graticule): 1 on, 0 off. */
   g?: 0 | 1;
+  /** Pinned go-to target [raDeg, decDeg] (the sky-locked crosshair). */
+  t?: [number, number];
 }
 
 /** UTF-8-safe base64url (no `+`/`/`/`=`), so band names with any character survive. */

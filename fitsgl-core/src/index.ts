@@ -127,6 +127,9 @@ export {
   parseColor,
   parseCatalogCSV,
   CATALOG_VERSION,
+  DEFAULT_TARGET_SIZE,
+  DEFAULT_TARGET_EDGE,
+  DEFAULT_TARGET_COLOR,
 } from './overlay/index.js';
 export type {
   MarkerInput,
@@ -137,6 +140,8 @@ export type {
   MarkerHandlers,
   ColorInput,
   ColorTuple,
+  TargetInput,
+  ResolvedTarget,
 } from './overlay/index.js';
 
 // Region overlays (issue #16) — world-sized, rotatable rectangle + polygon glyphs
