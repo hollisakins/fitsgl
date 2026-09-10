@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, act, fireEvent, waitFor } from '@testing-library/react';
 
 /**
@@ -10,12 +10,20 @@ import { render, act, fireEvent, waitFor } from '@testing-library/react';
  * (grouping, config derivation) is covered in explorer-state.test.ts.
  */
 const h = vi.hoisted(() => {
+  // `getWcs` reads a mutable holder the test file fills with a real
+  // astropy-generated fixture WCS after the imports settle (a hoisted factory
+  // runs before them), so the go-to path exercises true sky->pixel math.
+  const wcsRef: { current: unknown } = { current: null };
   const core = {
     setStretch: vi.fn(),
     setChannelStretch: vi.fn(),
     setStretchMode: vi.fn(),
     autoStretch: vi.fn(async () => null),
     visibleHistogram: vi.fn(async () => null),
+    setCenter: vi.fn(),
+    setZoom: vi.fn(),
+    getWcs: vi.fn(() => wcsRef.current),
+    getCameraState: vi.fn(() => ({ centerX: 0, centerY: 0, zoom: 0.5 })),
   };
   const handle = {
     setMarkers: vi.fn(() => [] as string[]),
@@ -24,6 +32,8 @@ const h = vi.hoisted(() => {
     removeMarker: vi.fn(() => true),
     clearMarkers: vi.fn(),
     setTool: vi.fn(),
+    setTarget: vi.fn(),
+    getTarget: vi.fn(() => ({ insideImage: true })),
     autoStretch: vi.fn(async () => null),
     fitToImage: vi.fn(),
     setCenter: vi.fn(),
@@ -31,7 +41,7 @@ const h = vi.hoisted(() => {
     getViewer: () => core,
     getPyramids: () => null,
   };
-  return { core, handle };
+  return { core, handle, wcsRef };
 });
 
 vi.mock('../../src/react/index.js', async () => {
@@ -49,9 +59,26 @@ vi.mock('../../src/react/index.js', async () => {
   return { FitsViewer };
 });
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { FitsExplorer } from '../../src/react/explorer.js';
 import type { ExplorerBand } from '../../src/react/explorer-state.js';
-import type { FitsglConfig } from '../../src/index.js';
+import { encodeShareState } from '../../src/react/share-url.js';
+import { parseWcs, type FitsglConfig, type TanWcs } from '../../src/index.js';
+
+interface WcsConfig {
+  name: string;
+  wcs: Record<string, unknown>;
+  p2w: Array<{ x0: number; y0: number; ra: number; dec: number }>;
+}
+const FIX_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
+const wcsFix = JSON.parse(readFileSync(join(FIX_DIR, 'wcs_fixtures.json'), 'utf8')) as {
+  configs: WcsConfig[];
+};
+const GOTO_FIX = wcsFix.configs.find((c) => c.name === 'rolled_30') as WcsConfig;
+const GOTO_WCS = parseWcs(GOTO_FIX.wcs) as TanWcs;
+h.wcsRef.current = GOTO_WCS;
 
 const BANDS: ExplorerBand[] = [
   { name: 'f150w', tiles: ['/f150w.json'], gridGroup: 0, label: 'F150W' },
@@ -91,6 +118,11 @@ const activeChip = (root: HTMLElement): string | null =>
 
 beforeEach(() => {
   vi.clearAllMocks();
+  window.location.hash = '';
+});
+
+afterEach(() => {
+  window.location.hash = '';
 });
 
 describe('<FitsExplorer>', () => {
@@ -160,6 +192,121 @@ describe('<FitsExplorer>', () => {
     await openComposite(container);
     expect(button(container, 'R = subaru_r').disabled).toBe(true); // cross-grid greyed
     expect(button(container, 'R = f150w').disabled).toBe(false);
+  });
+
+  describe('go to coordinates', () => {
+    const at = GOTO_FIX.p2w[12];
+    const coord = `${at.ra} ${at.dec}`;
+    const gotoInput = (root: HTMLElement): HTMLInputElement =>
+      root.querySelector('.fgl-goto-in') as HTMLInputElement;
+
+    const openBox = async (root: HTMLElement): Promise<HTMLInputElement> => {
+      act(() => {
+        fireEvent.click(button(root, 'Go to coordinates'));
+      });
+      await waitFor(() => expect(root.querySelector('.fgl-goto-float')).not.toBeNull());
+      return gotoInput(root);
+    };
+
+    it('opens the floating box from the tool rail, focused', async () => {
+      const { container } = render(<FitsExplorer bands={BANDS} />);
+      await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+      expect(container.querySelector('.fgl-goto-float')).toBeNull(); // closed by default
+      const input = await openBox(container);
+      expect(document.activeElement).toBe(input);
+    });
+
+    it('opens on the G shortcut', async () => {
+      const { container } = render(<FitsExplorer bands={BANDS} />);
+      await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+      act(() => {
+        fireEvent.keyDown(window, { key: 'g' });
+      });
+      await waitFor(() => expect(container.querySelector('.fgl-goto-float')).not.toBeNull());
+    });
+
+    it('recenters, snaps to native, pins the target, and shows it in the status bar', async () => {
+      const { container } = render(<FitsExplorer bands={BANDS} />);
+      await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+      const input = await openBox(container);
+      act(() => {
+        fireEvent.change(input, { target: { value: coord } });
+        fireEvent.keyDown(input, { key: 'Enter' });
+      });
+      await waitFor(() => expect(h.core.setCenter).toHaveBeenCalled());
+      const [cx, cy] = h.core.setCenter.mock.calls[0] as [number, number];
+      expect(cx).toBeCloseTo(at.x0 + 0.5, 4);
+      expect(cy).toBeCloseTo(at.y0 + 0.5, 4);
+      // The fake camera reports zoom 0.5, so the jump snaps up to native 1:1.
+      expect(h.core.setZoom).toHaveBeenCalledWith(1);
+      await waitFor(() =>
+        expect(h.handle.setTarget).toHaveBeenCalledWith(
+          expect.objectContaining({ ra: expect.any(Number), dec: expect.any(Number) }),
+        ),
+      );
+      const pinned = h.handle.setTarget.mock.calls.at(-1)?.[0] as { ra: number; dec: number };
+      expect(pinned.ra).toBeCloseTo(at.ra, 4);
+      expect(pinned.dec).toBeCloseTo(at.dec, 4);
+      await waitFor(() => expect(container.textContent).toContain('target'));
+    });
+
+    it('flags unreadable input without moving the camera', async () => {
+      const { container } = render(<FitsExplorer bands={BANDS} />);
+      await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+      const input = await openBox(container);
+      act(() => {
+        fireEvent.change(input, { target: { value: 'somewhere nice' } });
+        fireEvent.keyDown(input, { key: 'Enter' });
+      });
+      await waitFor(() => expect(container.querySelector('.fgl-goto-in.err')).not.toBeNull());
+      expect(container.querySelector('.fgl-goto-hint.err')?.textContent).toContain('RA/Dec');
+      expect(h.core.setCenter).not.toHaveBeenCalled();
+    });
+
+    it('clears the pinned target on Escape', async () => {
+      const { container } = render(<FitsExplorer bands={BANDS} />);
+      await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+      const input = await openBox(container);
+      act(() => {
+        fireEvent.change(input, { target: { value: coord } });
+        fireEvent.keyDown(input, { key: 'Enter' });
+      });
+      await waitFor(() => expect(h.handle.setTarget).toHaveBeenCalled());
+      act(() => {
+        fireEvent.keyDown(window, { key: 'Escape' });
+      });
+      // The window handler ignores events from form fields, so Escape in the box
+      // is handled by the input itself; both paths end with a cleared target.
+      await waitFor(() => expect(h.handle.setTarget).toHaveBeenLastCalledWith(null));
+      expect(container.querySelector('.fgl-goto-float')).toBeNull();
+    });
+
+    it('clears the target on Escape from inside the input', async () => {
+      const { container } = render(<FitsExplorer bands={BANDS} />);
+      await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+      const input = await openBox(container);
+      act(() => {
+        fireEvent.change(input, { target: { value: coord } });
+        fireEvent.keyDown(input, { key: 'Enter' });
+      });
+      await waitFor(() => expect(h.handle.setTarget).toHaveBeenCalled());
+      act(() => {
+        fireEvent.keyDown(input, { key: 'Escape' });
+      });
+      await waitFor(() => expect(h.handle.setTarget).toHaveBeenLastCalledWith(null));
+      expect(container.querySelector('.fgl-goto-float')).toBeNull();
+    });
+
+    it('pins a target carried by a shared view link', async () => {
+      window.location.hash = `#v=${encodeShareState({ t: [at.ra, at.dec] })}`;
+      const { container } = render(<FitsExplorer bands={BANDS} />);
+      await waitFor(() => expect(container.querySelector('[data-testid="viewer"]')).not.toBeNull());
+      await waitFor(() =>
+        expect(h.handle.setTarget).toHaveBeenCalledWith({ ra: at.ra, dec: at.dec }),
+      );
+      // A shared target does NOT move the camera on its own (that's the `c` field).
+      expect(h.core.setCenter).not.toHaveBeenCalled();
+    });
   });
 
   it('toggles single↔RGB via the band-rail RGB toggle (and reveals Composite)', async () => {

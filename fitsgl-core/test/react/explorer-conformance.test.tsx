@@ -33,6 +33,10 @@ const h = vi.hoisted(() => {
     setStretchMode: vi.fn(),
     autoStretch: vi.fn(async () => null),
     visibleHistogram: vi.fn(async () => null),
+    setCenter: vi.fn(),
+    setZoom: vi.fn(),
+    getWcs: vi.fn(() => null),
+    getCameraState: vi.fn(() => ({ centerX: 0, centerY: 0, zoom: 0.5 })),
   };
   const handle = {
     setMarkers: vi.fn(() => [] as string[]),
@@ -41,6 +45,8 @@ const h = vi.hoisted(() => {
     removeMarker: vi.fn(() => true),
     clearMarkers: vi.fn(),
     setTool: vi.fn(),
+    setTarget: vi.fn(),
+    getTarget: vi.fn(() => ({ insideImage: true })),
     autoStretch: vi.fn(async () => null),
     fitToImage: vi.fn(),
     setCenter: vi.fn(),

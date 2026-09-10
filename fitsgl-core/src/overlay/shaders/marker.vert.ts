@@ -37,7 +37,7 @@ uniform float u_pixelRatio;
 out vec2 v_local;          // buffer px from the glyph centre (for the SDF)
 out float v_radius;        // glyph radius, buffer px
 out float v_edge;          // stroke width, buffer px
-flat out int v_shape;      // 0 point, 1 circle, 2 box
+flat out int v_shape;      // 0 point, 1 circle, 2 box, 3 cross
 out vec4 v_color;
 
 // Mirror of view-transform.ts applyMat2(m, x, y).

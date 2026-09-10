@@ -17,6 +17,7 @@ import {
   isBandSelectableForRgb,
   isTrilogyComposite,
   parseLayoutState,
+  planGoTo,
   rainbowAction,
   rgbActiveGroup,
   serializeLayoutState,
@@ -27,6 +28,22 @@ import {
   type ExplorerState,
 } from '../../src/react/explorer-state.js';
 import type { DatasetBand, DatasetManifest, FitsglConfig } from '../../src/index.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { parseWcs, type TanWcs } from '../../src/index.js';
+
+interface WcsConfig {
+  name: string;
+  wcs: Record<string, unknown>;
+  p2w: Array<{ x0: number; y0: number; ra: number; dec: number }>;
+}
+const FIX_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
+const wcsFix = JSON.parse(readFileSync(join(FIX_DIR, 'wcs_fixtures.json'), 'utf8')) as {
+  configs: WcsConfig[];
+};
+const GOTO_FIX = wcsFix.configs.find((c) => c.name === 'rolled_30') as WcsConfig;
+const GOTO_WCS = parseWcs(GOTO_FIX.wcs) as TanWcs;
 
 const band = (name: string, gridGroup = 0): ExplorerBand => ({
   name,
@@ -436,5 +453,63 @@ describe('layout state (chrome persistence)', () => {
     expect(partial.shelved).toBe(d.shelved);
     expect(partial.collapsed.view).toBe(false);
     expect(partial.collapsed).not.toHaveProperty('bogus');
+  });
+});
+
+describe('defaultExplorerState — go-to target', () => {
+  it('starts with no pinned target', () => {
+    expect(defaultExplorerState(BANDS).target).toBeNull();
+  });
+
+  it('is ignored by config derivation (the target is chrome, not a render input)', () => {
+    const base = defaultExplorerState(BANDS);
+    const pinned: ExplorerState = { ...base, target: { ra: 150, dec: 2 } };
+    expect(deriveViewerConfig(BANDS, pinned)).toEqual(deriveViewerConfig(BANDS, base));
+  });
+});
+
+describe('planGoTo', () => {
+  const at = GOTO_FIX.p2w[12];
+
+  it('maps a decimal RA/Dec to the fixture pixel', () => {
+    const plan = planGoTo(`${at.ra} ${at.dec}`, GOTO_WCS, 2);
+    expect(plan?.x).toBeCloseTo(at.x0 + 0.5, 4);
+    expect(plan?.y).toBeCloseTo(at.y0 + 0.5, 4);
+    expect(plan?.ra).toBeCloseTo(at.ra, 4);
+  });
+
+  it('maps sexagesimal input to the same pixel as its decimal form', () => {
+    const hours = at.ra / 15;
+    const hh = Math.floor(hours);
+    const mm = Math.floor((hours - hh) * 60);
+    const ss = ((hours - hh) * 60 - mm) * 60;
+    const sign = at.dec < 0 ? '-' : '+';
+    const ad = Math.abs(at.dec);
+    const dd = Math.floor(ad);
+    const dm = Math.floor((ad - dd) * 60);
+    const ds = ((ad - dd) * 60 - dm) * 60;
+    const text = `${hh}:${mm}:${ss.toFixed(4)} ${sign}${dd}:${dm}:${ds.toFixed(3)}`;
+    const plan = planGoTo(text, GOTO_WCS, 2);
+    expect(plan?.x).toBeCloseTo(at.x0 + 0.5, 2);
+    expect(plan?.y).toBeCloseTo(at.y0 + 0.5, 2);
+  });
+
+  it('snaps to native only when the view is zoomed out below it', () => {
+    expect(planGoTo(`${at.ra} ${at.dec}`, GOTO_WCS, 0.5)?.zoom).toBe(1);
+    expect(planGoTo(`${at.ra} ${at.dec}`, GOTO_WCS, 1)?.zoom).toBeNull();
+    expect(planGoTo(`${at.ra} ${at.dec}`, GOTO_WCS, 4)?.zoom).toBeNull();
+  });
+
+  it('plans a jump to a position off the image (the reticle still marks it)', () => {
+    const far = planGoTo(`${(at.ra + 3) % 360} ${at.dec + 3}`, GOTO_WCS, 2);
+    expect(far).not.toBeNull();
+    expect(Number.isFinite(far?.x)).toBe(true);
+  });
+
+  it('returns null on unparseable text or a missing WCS', () => {
+    expect(planGoTo('somewhere nice', GOTO_WCS, 1)).toBeNull();
+    expect(planGoTo('', GOTO_WCS, 1)).toBeNull();
+    expect(planGoTo('400 99', GOTO_WCS, 1)).toBeNull(); // out-of-range RA/Dec
+    expect(planGoTo(`${at.ra} ${at.dec}`, null, 1)).toBeNull();
   });
 });

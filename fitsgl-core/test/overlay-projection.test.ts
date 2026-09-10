@@ -97,9 +97,15 @@ describe('marker shaders — structural pins (no headless WebGL2 to render again
   it('the fragment shader branches on the SHAPE_IDS contract and writes straight alpha', () => {
     expect(MARKER_FRAG.startsWith('#version 300 es')).toBe(true);
     expect(MARKER_FRAG).toContain('precision highp float');
-    expect(SHAPE_IDS).toEqual({ point: 0, circle: 1, box: 2 });
+    expect(SHAPE_IDS).toEqual({ point: 0, circle: 1, box: 2, cross: 3 });
+    expect(MARKER_FRAG).toContain('v_shape == 3'); // cross (the go-to reticle)
     expect(MARKER_FRAG).toContain('v_shape == 2'); // box
     expect(MARKER_FRAG).toContain('v_shape == 1'); // circle (point is the else)
+    // Branch order must follow the id chain, so a shape swap is caught here.
+    expect(MARKER_FRAG.indexOf('v_shape == 3')).toBeLessThan(MARKER_FRAG.indexOf('v_shape == 2'));
+    // The reticle's defining feature: arms stop short of the centre, so the
+    // targeted pixel is never painted over.
+    expect(MARKER_FRAG).toContain('float gap = ');
     expect(MARKER_FRAG).toContain('v_color.a * coverage'); // straight (non-premultiplied) alpha
     expect(MARKER_FRAG).not.toContain('sampler2D'); // procedural; never reads a stale tile texture
   });

@@ -69,8 +69,25 @@ A deployed dataset is a static directory served over HTTP with byte-range suppor
 
 `<FitsExplorer>` is a complete viewer: a WebGL2 canvas plus a built-in control
 panel (single/RGB band picker, stretch, colormap, black/white-point sliders with
-live histograms, north-up, catalog overlay) and a status bar. Point it at a
+live histograms, north-up, catalog overlay), a left tool rail (pan, ruler, go to
+coordinates, fit, save PNG, FITS header) and a status bar. Point it at a
 `fitsgl.json` and it's interactive out of the box.
+
+**Go to a coordinate.** The rail's ⌖ button (or the `G` key) opens a box over the
+image; Enter reads a free-form RA/Dec (decimal degrees, `10:00:00 +02:12:00`,
+`10h00m00s +02d12m00s`, …), recenters there, zooms in to native if the view was
+zoomed out past it, and pins a crosshair on that sky position. The crosshair stays
+pinned through pan, zoom and north-up, and appears in an exported PNG; `Escape`
+clears it. A position off the mosaic is still pinned, flagged `outside image`.
+Coordinates only — there is no object-name resolution.
+
+**Keyboard.** `1`–`9` pick a band, `M` toggles the ruler, `G` opens the go-to box,
+`Escape` returns to pan and clears the crosshair. Over the canvas: `+`/`-` zoom,
+`0`/`F` fit, `N` north-up, arrows pan.
+
+**Share a view.** Right-click the image for "Copy view link", which encodes the
+current bands, stretch, colormap, camera (sky-anchored) and pinned crosshair into
+the URL hash. Links are built only on demand, so panning never rewrites the URL.
 
 ```tsx
 import { useEffect, useState } from 'react';
@@ -185,6 +202,8 @@ interface FitsViewerHandle {
   updateMarker(id: string, patch: MarkerPatch): boolean;
   removeMarker(id: string): boolean;
   clearMarkers(): void;
+  setTarget(target: TargetInput | null): void; // pin/clear the go-to crosshair
+  getTarget(): ResolvedTarget | null;
   autoStretch(pLo?: number, pHi?: number): Promise<AutoStretchResult | null>;
   fitToImage(): void;
   setCenter(x: number, y: number): void;
@@ -195,7 +214,21 @@ interface FitsViewerHandle {
 ```
 
 Markers are deliberately *not* a controlled prop — push them through the handle (a
-10–20k-element array prop would diff on every render).
+10–20k-element array prop would diff on every render). The same is true of the
+go-to crosshair, and neither is reapplied automatically when a band-set change
+rebuilds the viewer: re-push both from `onReady`.
+
+A "jump to coordinate" in custom chrome is three calls — parse, centre, pin:
+
+```ts
+const plan = parseSkyCoord(text);                       // free-form RA/Dec
+const wcs = handle.current?.getViewer()?.getWcs() ?? null;
+if (plan !== null && wcs !== null) {
+  const px = skyToPix(wcs, plan.ra, plan.dec);
+  handle.current?.setCenter(px.x, px.y);
+  handle.current?.setTarget({ ra: plan.ra, dec: plan.dec });
+}
+```
 
 The `./react` subpath also exports the pure config-derivation helpers
 (`defaultExplorerState`, `deriveViewerConfig`, `explorerBandsFromConfig`,
@@ -279,6 +312,12 @@ reachable in React via `handle.getViewer()`):
 - `setCenter(x, y)`, `setZoom(zoom)`, `fitToImage()`.
 - marker mutation: `setMarkers`, `addMarkers`, `updateMarker`, `removeMarker`,
   `clearMarkers`, `setMarkerHandlers`.
+- `setTarget(target | null)` / `getTarget()` — the go-to crosshair: one sky- (or
+  pixel-) locked reticle, drawn in the overlay pass (so it tracks pan/zoom/north-up
+  at a constant CSS-pixel size and is included in `exportPNG`). It never moves the
+  camera, is never hit-tested, and is untouched by `setMarkers`/`clearMarkers`. A
+  sky target needs a WCS; one that can't be placed clears it, which `getTarget`
+  reports. `getTarget().insideImage` says whether it landed on the mosaic.
 - `get sourceMode` → `'single' | 'rgb' | 'multiband'`; `get isRgb`,
   `get isNorthUp`; `destroy()`.
 
@@ -325,10 +364,14 @@ A non-exhaustive tour of `@fitsgl/core`:
   `isBandSelectableForRgb`, `rgbActiveGroup`, `groupBands`, `hasZscalePreset`.
 - **Colormaps:** `COLORMAP_NAMES`, `COLORMAP_SIZE`, `isColormapName`,
   `colormapRGB`.
-- **WCS:** `parseWcs`, `pixToSky`, `skyToPix`, `formatRA`, `formatDec` (types
-  `TanWcs`, `SkyCoord`, `PixelCoord`).
+- **WCS:** `parseWcs`, `pixToSky`, `skyToPix`, `parseSkyCoord` (free-form RA/Dec
+  for a go-to box), `formatRA`, `formatDec`, `formatSeparation`,
+  `angularSeparationDeg`, `positionAngleDeg` (types `TanWcs`, `SkyCoord`,
+  `PixelCoord`).
 - **Overlays:** `parseCatalogCSV`, `MARKER_SHAPES`, `isMarkerShape`, `parseColor`,
-  `CATALOG_VERSION` (types `MarkerInput`, `ResolvedMarker`, `MarkerEvent`, …).
+  `CATALOG_VERSION` (types `MarkerInput`, `ResolvedMarker`, `MarkerEvent`, …), plus
+  the go-to crosshair's `DEFAULT_TARGET_SIZE`/`DEFAULT_TARGET_EDGE`/
+  `DEFAULT_TARGET_COLOR` (types `TargetInput`, `ResolvedTarget`).
 - **Range fetch:** `httpRangeFetch`, type `RangeFetcher`.
 - `Camera` and its types, for advanced camera math.
 

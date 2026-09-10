@@ -44,7 +44,6 @@ import {
   formatRA,
   formatSeparation,
   parseCatalogCSV,
-  parseSkyCoord,
   pixToSky,
   skyToPix,
   type BandHistogram,
@@ -75,6 +74,7 @@ import {
   isBandSelectableForRgb,
   isTrilogyComposite,
   parseLayoutState,
+  planGoTo,
   rainbowAction,
   rgbActiveGroup,
   serializeLayoutState,
@@ -143,6 +143,15 @@ function applyShareToState(
   }
   if (u.n === 0 || u.n === 1) next.northUp = u.n === 1;
   if (u.g === 0 || u.g === 1) next.graticule = u.g === 1;
+  if (
+    Array.isArray(u.t) &&
+    u.t.length === 2 &&
+    u.t.every(fin) &&
+    u.t[0] >= 0 && u.t[0] <= 360 &&
+    u.t[1] >= -90 && u.t[1] <= 90
+  ) {
+    next.target = { ra: u.t[0], dec: u.t[1] };
+  }
   return next;
 }
 
@@ -950,6 +959,12 @@ const IconRuler = (): JSX.Element => (
     </g>
   </svg>
 );
+const IconTarget = (): JSX.Element => (
+  <svg {...ICON}>
+    <circle cx="8" cy="8" r="3.2" />
+    <path d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3" />
+  </svg>
+);
 const IconFit = (): JSX.Element => (
   <svg {...ICON}>
     <path d="M2.5 5.5v-3h3M13.5 5.5v-3h-3M2.5 10.5v3h3M13.5 10.5v3h-3" />
@@ -1020,6 +1035,8 @@ function ToolButton({
 function ToolRail({
   tool,
   onTool,
+  gotoOpen,
+  onGoto,
   onFit,
   onSavePng,
   onHeader,
@@ -1027,6 +1044,8 @@ function ToolRail({
 }: {
   tool: PointerToolMode;
   onTool: (mode: PointerToolMode) => void;
+  gotoOpen: boolean;
+  onGoto: () => void;
   onFit: () => void;
   onSavePng: () => void;
   onHeader: () => void;
@@ -1044,6 +1063,9 @@ function ToolRail({
       </div>
       <div className="fgl-toolfill" />
       <div className="fgl-toolgroup">
+        <ToolButton on={gotoOpen} label="Go to coordinates" shortcut="G" onClick={onGoto}>
+          <IconTarget />
+        </ToolButton>
         <ToolButton label="Fit to view" onClick={onFit}>
           <IconFit />
         </ToolButton>
@@ -1249,21 +1271,6 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const handle = useRef<FitsViewerHandle>(null);
   const getViewer = useCallback((): FitsViewerCore | null => handle.current?.getViewer() ?? null, []);
 
-  // "Go to" a sky position (RA/Dec, any common format): recenter, and zoom in to
-  // native if currently zoomed out. Returns false on an unparseable/out-of-frame
-  // coordinate so the box can flag it. No name resolution — coordinates only.
-  const goTo = useCallback((text: string): boolean => {
-    const parsed = parseSkyCoord(text);
-    const v = handle.current?.getViewer() ?? null;
-    const wcs = v?.getWcs() ?? null;
-    if (parsed === null || v === null || wcs === null) return false;
-    const px = skyToPix(wcs, parsed.ra, parsed.dec);
-    if (!Number.isFinite(px.x) || !Number.isFinite(px.y)) return false;
-    v.setCenter(px.x, px.y);
-    if (v.getCameraState().zoom < 1) v.setZoom(1);
-    return true;
-  }, []);
-
   // Accept either the turnkey `config` (a FitsglConfig) or the loose
   // `bands`/`defaultView`/`catalog`/`title` props; `config` wins when present.
   const bands = useMemo<ExplorerBand[]>(
@@ -1321,6 +1328,31 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   const [limits, setLimits] = useState<Record<string, { min: number; max: number }>>({});
   const [histos, setHistos] = useState<Record<string, BandHistogram>>(() => precomputedHistos(bands));
   const [markers, setMarkers] = useState<MarkerInput[]>(Array.isArray(catalogSource) ? catalogSource : []);
+  // The floating "go to" box (chrome, not view state — never shared or persisted).
+  const [gotoOpen, setGotoOpen] = useState(false);
+  // Whether the pinned target landed on the mosaic, read back from the engine (it
+  // owns the native bounds). Null when no target is pinned.
+  const [targetInside, setTargetInside] = useState<boolean | null>(null);
+
+  // "Go to" a sky position (RA/Dec, any common format): recenter, zoom in to
+  // native if currently zoomed out, and PIN the target reticle there so the place
+  // stays marked while you pan and zoom around it. The plan is pure
+  // (`planGoTo`); this is just the imperative apply + the state write. Reports why
+  // it failed so the box can say so. No name resolution — coordinates only.
+  const goTo = useCallback((text: string): GoToStatus => {
+    const v = handle.current?.getViewer() ?? null;
+    const wcs = v?.getWcs() ?? null;
+    if (v === null || wcs === null) return 'no-wcs';
+    const plan = planGoTo(text, wcs, v.getCameraState().zoom);
+    if (plan === null) return 'bad-input';
+    v.setCenter(plan.x, plan.y);
+    if (plan.zoom !== null) v.setZoom(plan.zoom);
+    setState((st) => ({ ...st, target: { ra: plan.ra, dec: plan.dec } }));
+    return 'ok';
+  }, []);
+  const clearTarget = useCallback((): void => {
+    setState((st) => (st.target === null ? st : { ...st, target: null }));
+  }, []);
 
   useEffect(ensureStyles, []);
 
@@ -1361,7 +1393,8 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
   // Keyboard shortcuts: 1–9 select a band (drops RGB→single for fast blink
-  // inspection); M toggles the ruler; Esc returns to pan / closes the overlay.
+  // inspection); M toggles the ruler; G opens the go-to box; Esc returns to pan,
+  // clears the pinned target, and closes the overlay.
   // Suppressed while typing in a field or when a modifier is held. Re-subscribed on
   // a band-inventory change so the number→band map stays current.
   useEffect(() => {
@@ -1383,8 +1416,12 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
       } else if (e.key === 'm' || e.key === 'M') {
         e.preventDefault();
         setState((s) => ({ ...s, tool: s.tool === 'ruler' ? 'pan' : 'ruler' }));
+      } else if (e.key === 'g' || e.key === 'G') {
+        e.preventDefault();
+        setGotoOpen(true);
       } else if (e.key === 'Escape') {
-        setState((s) => (s.tool === 'pan' ? s : { ...s, tool: 'pan' }));
+        setState((s) => (s.tool === 'pan' && s.target === null ? s : { ...s, tool: 'pan', target: null }));
+        setGotoOpen(false);
         setNarrowOpen(false);
       }
     };
@@ -1427,6 +1464,16 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
     if (state.overlay) h.setMarkers(markers);
     else h.clearMarkers();
   }, [state.overlay, markers, readyTick]);
+
+  // Push the pinned target (and re-push after a reload — a band-set change rebuilds
+  // the viewer, which starts with no reticle). The engine resolves it against the
+  // live WCS, so read back whether it actually landed on the mosaic.
+  useEffect(() => {
+    const h = handle.current;
+    if (h === null || readyTick === 0) return;
+    h.setTarget(state.target);
+    setTargetInside(state.target === null ? null : h.getTarget()?.insideImage ?? null);
+  }, [state.target, readyTick]);
 
   // The measure tool (ruler): a PointerTool (the Phase 0 seam) that turns a
   // left-drag into a measured line. Endpoints + the derived distance/PA live in the
@@ -1697,6 +1744,7 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
         });
       }
     }
+    if (state.target !== null) s.t = [r(state.target.ra, 6), r(state.target.dec, 6)];
     const v = handle.current?.getViewer() ?? null;
     const wcs = v?.getWcs() ?? null;
     const cam = v?.getCameraState() ?? null;
@@ -1944,10 +1992,6 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
         disabled={markers.length === 0}
         onToggle={() => setState((s) => ({ ...s, overlay: !s.overlay }))}
       />
-      <div className="fgl-sub">
-        <span className="fgl-cap">Go to</span>
-        <GotoBox onGo={goTo} />
-      </div>
     </>
   );
 
@@ -1980,6 +2024,8 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
         <ToolRail
           tool={state.tool}
           onTool={(t) => setState((s) => ({ ...s, tool: t }))}
+          gotoOpen={gotoOpen}
+          onGoto={() => setGotoOpen((o) => !o)}
           onFit={() => handle.current?.fitToImage()}
           onSavePng={savePng}
           onHeader={() => setHeaderOpen(true)}
@@ -2015,6 +2061,15 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
               {state.tool === 'ruler' && <RulerOverlay getViewer={getViewer} store={readout} />}
               <FitsLoadingField active={loading} />
             </FitsViewer>
+            {gotoOpen && (
+              <GotoOverlay
+                target={state.target}
+                targetInside={targetInside}
+                onGo={goTo}
+                onClear={clearTarget}
+                onClose={() => setGotoOpen(false)}
+              />
+            )}
           </div>
         </div>
         {inspectorMode === 'docked' && (
@@ -2068,6 +2123,15 @@ export function FitsExplorer(props: FitsExplorerProps): JSX.Element {
           <i>tool</i>
           <b>{state.tool}</b>
         </span>
+        {state.target !== null && (
+          <span
+            className="fgl-item coord"
+            title={targetInside === false ? 'target is outside the image' : undefined}
+          >
+            <i>target{targetInside === false ? '*' : ''}</i>
+            <b>{`${formatRA(state.target.ra)} ${formatDec(state.target.dec)}`}</b>
+          </span>
+        )}
         <span className="fgl-spacer" />
         <StatusReadout store={readout} />
       </div>
@@ -2099,35 +2163,87 @@ function emitReadout(store: ReadoutStore): void {
   for (const l of store.listeners) l();
 }
 
-/** "Go to coordinates" box: parses RA/Dec on Enter/Go and recenters via `onGo`,
- *  flashing an error border when the input doesn't parse or is off the image. */
-function GotoBox({ onGo }: { onGo: (text: string) => boolean }): JSX.Element {
+/** Why a `goTo` attempt failed (drives the box's hint), or `'ok'`. */
+export type GoToStatus = 'ok' | 'bad-input' | 'no-wcs';
+
+/**
+ * The floating "go to coordinates" box, over the image (the rail's ⌖ button and
+ * the `G` key open it). Enter recenters and pins the reticle; Escape clears the
+ * pinned target and closes. Escape is handled on the input itself because the
+ * window-level shortcut handler deliberately ignores events from form fields.
+ */
+function GotoOverlay({
+  target,
+  targetInside,
+  onGo,
+  onClear,
+  onClose,
+}: {
+  target: { ra: number; dec: number } | null;
+  targetInside: boolean | null;
+  onGo: (text: string) => GoToStatus;
+  onClear: () => void;
+  onClose: () => void;
+}): JSX.Element {
   const [text, setText] = useState('');
-  const [err, setErr] = useState(false);
+  const [status, setStatus] = useState<GoToStatus>('ok');
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
   const submit = (): void => {
     if (text.trim() === '') return;
-    setErr(!onGo(text));
+    setStatus(onGo(text));
   };
+  const err = status !== 'ok';
+  const hint =
+    status === 'bad-input'
+      ? 'Could not read that as RA/Dec.'
+      : status === 'no-wcs'
+        ? 'This band has no usable WCS.'
+        : target === null
+          ? null
+          : `${formatRA(target.ra)} ${formatDec(target.dec)}${targetInside === false ? '  ·  outside image' : ''}`;
   return (
-    <div className="fgl-goto">
-      <input
-        className={`fgl-goto-in${err ? ' err' : ''}`}
-        type="text"
-        value={text}
-        placeholder="RA Dec — e.g. 10:00:00 +02:12:00"
-        spellCheck={false}
-        autoComplete="off"
-        onChange={(e) => {
-          setText(e.target.value);
-          setErr(false);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') submit();
-        }}
-      />
-      <button type="button" className="fgl-goto-btn" onClick={submit}>
-        Go
-      </button>
+    <div className="fgl-goto-float" role="dialog" aria-label="Go to coordinates">
+      <div className="fgl-goto">
+        <input
+          ref={inputRef}
+          className={`fgl-goto-in${err ? ' err' : ''}`}
+          type="text"
+          value={text}
+          placeholder="RA Dec — e.g. 10:00:00 +02:12:00"
+          spellCheck={false}
+          autoComplete="off"
+          aria-label="RA and Dec"
+          onChange={(e) => {
+            setText(e.target.value);
+            setStatus('ok');
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              submit();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              onClear();
+              onClose();
+            }
+          }}
+          // Don't let a scroll over the box zoom the image underneath.
+          onWheel={(e) => e.stopPropagation()}
+        />
+        <button type="button" className="fgl-goto-btn" onClick={submit}>
+          Go
+        </button>
+        <button type="button" className="fgl-goto-x" aria-label="Close" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      {hint !== null && (
+        <div className={`fgl-goto-hint${err ? ' err' : ''}`}>{hint}</div>
+      )}
     </div>
   );
 }
@@ -2616,7 +2732,14 @@ const STYLE_CSS = `
 .fgl-switch::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:var(--dim);transition:.18s;}
 .fgl-tg.on .fgl-switch{background:var(--gold);border-color:var(--gold);}
 .fgl-tg.on .fgl-switch::after{left:17px;background:#161003;}
-.fgl-goto{display:flex;gap:6px;}
+.fgl-goto-float{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:5;
+  width:min(390px,calc(100% - 24px));padding:7px;background:var(--win);border:1px solid var(--line2);
+  border-radius:6px;box-shadow:0 8px 28px rgba(0,0,0,.5);}
+.fgl-goto-hint{margin:5px 2px 1px;font-size:9.5px;letter-spacing:.05em;color:var(--dim);}
+.fgl-goto-hint.err{color:#c4543b;}
+.fgl-goto-x{background:transparent;border:none;color:var(--dim);font-size:17px;line-height:1;cursor:pointer;padding:0 3px;}
+.fgl-goto-x:hover{color:var(--gold);}
+.fgl-goto{display:flex;gap:6px;align-items:center;}
 .fgl-goto-in{flex:1;min-width:0;background:var(--inset);border:1px solid var(--line2);border-radius:4px;color:var(--text);
   font-family:var(--mono);font-size:11px;padding:7px 8px;outline:none;}
 .fgl-goto-in::placeholder{color:var(--dim);opacity:.7;}

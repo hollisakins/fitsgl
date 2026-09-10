@@ -37,6 +37,8 @@ const h = vi.hoisted(() => {
     removeRegion = vi.fn(() => true);
     clearRegions = vi.fn();
     setRegionHandlers = vi.fn();
+    setTarget = vi.fn();
+    getTarget = vi.fn(() => null as unknown);
     autoStretch = vi.fn(() => Promise.resolve(null));
     fitToImage = vi.fn();
     setCenter = vi.fn();
@@ -243,6 +245,21 @@ describe('<FitsViewer> imperative handle', () => {
     expect(viewer.clearMarkers).toHaveBeenCalled();
   });
 
+  it('proxies the go-to target to the live viewer', async () => {
+    const ref = createRef<FitsViewerHandle>();
+    render(<FitsViewer config={single()} ref={ref} />);
+    await waitFor(() => expect(h.instances).toHaveLength(1));
+    const viewer = h.instances[0];
+    act(() => {
+      ref.current?.setTarget({ ra: 150, dec: 2 });
+      ref.current?.getTarget();
+      ref.current?.setTarget(null);
+    });
+    expect(viewer.setTarget).toHaveBeenNthCalledWith(1, { ra: 150, dec: 2 });
+    expect(viewer.setTarget).toHaveBeenNthCalledWith(2, null);
+    expect(viewer.getTarget).toHaveBeenCalled();
+  });
+
   it('no-ops (and returns empty) for marker calls before the viewer is ready', () => {
     const ref = createRef<FitsViewerHandle>();
     // Never resolve the load, so the viewer is never constructed.
@@ -252,6 +269,8 @@ describe('<FitsViewer> imperative handle', () => {
     expect(ref.current?.setMarkers([{ ra: 1, dec: 2 }])).toEqual([]);
     expect(ref.current?.updateMarker('x', {})).toBe(false);
     expect(ref.current?.getViewer()).toBe(null);
+    expect(ref.current?.getTarget()).toBe(null);
+    ref.current?.setTarget({ ra: 1, dec: 2 }); // no throw
     warn.mockRestore();
   });
 });

@@ -22,12 +22,16 @@
 
 import { pixToSky, skyToPix, type TanWcs } from '../wcs/tan.js';
 
-/** The three v1.0 marker glyphs (roadmap: simple shapes only). */
-export const MARKER_SHAPES = ['point', 'circle', 'box'] as const;
+/**
+ * The v1.0 marker glyphs (roadmap: simple shapes only). `cross` is the reticle
+ * the "go to coordinate" target uses — four arms around a centre gap plus a thin
+ * ring, so the pixel under the target stays visible.
+ */
+export const MARKER_SHAPES = ['point', 'circle', 'box', 'cross'] as const;
 export type MarkerShape = (typeof MARKER_SHAPES)[number];
 
 /** Shape ids: the integer the instance buffer carries and the frag shader branches on. */
-export const SHAPE_IDS: Record<MarkerShape, number> = { point: 0, circle: 1, box: 2 };
+export const SHAPE_IDS: Record<MarkerShape, number> = { point: 0, circle: 1, box: 2, cross: 3 };
 
 /** RGBA in [0, 1]. The resolved form every marker carries. */
 export type ColorTuple = readonly [number, number, number, number];
@@ -51,10 +55,10 @@ export interface MarkerInput {
   x?: number;
   y?: number;
   shape?: MarkerShape;
-  /** Glyph diameter / box side in CSS px. */
+  /** Glyph diameter / box side / cross arm-to-arm span, in CSS px. */
   size?: number;
   color?: ColorInput;
-  /** Stroke width (CSS px) for `circle`/`box`; ignored for filled `point`. */
+  /** Stroke width (CSS px) for `circle`/`box`/`cross`; ignored for filled `point`. */
   edgeWidth?: number;
   /** Arbitrary per-marker payload, surfaced on hover/click and in the tooltip. */
   data?: Record<string, unknown>;

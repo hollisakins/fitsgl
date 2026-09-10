@@ -18,6 +18,8 @@ import {
   loadViewerSource,
   resolveDatasetBandUrl,
   parseCatalogCSV,
+  parseSkyCoord,
+  skyToPix,
   formatRA,
   formatDec,
   type BandConfig,
@@ -196,6 +198,34 @@ async function main(): Promise<void> {
   });
   controls.setViewer(viewer);
 
+  // Go-to parity for the vanilla stack: `G` prompts for a coordinate, recenters and
+  // pins the crosshair; Escape clears it. The React explorer has a proper box for
+  // this — here a prompt is enough to eyeball the engine primitive against tiles.
+  const onGotoKey = (e: KeyboardEvent): void => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    if (t instanceof HTMLElement && (t.tagName === 'INPUT' || t.tagName === 'SELECT')) return;
+    if (e.key === 'Escape') {
+      viewer.setTarget(null);
+      return;
+    }
+    if (e.key !== 'g' && e.key !== 'G') return;
+    const wcs = viewer.getWcs();
+    if (wcs === null) return;
+    const text = window.prompt('Go to RA Dec (e.g. 10:00:00 +02:12:00)');
+    if (text === null) return;
+    const sky = parseSkyCoord(text);
+    if (sky === null) {
+      window.alert(`Could not read "${text}" as RA/Dec.`);
+      return;
+    }
+    const px = skyToPix(wcs, sky.ra, sky.dec);
+    viewer.setCenter(px.x, px.y);
+    if (viewer.getCameraState().zoom < 1) viewer.setZoom(1);
+    viewer.setTarget({ ra: sky.ra, dec: sky.dec });
+  };
+  window.addEventListener('keydown', onGotoKey);
+
   // Optional region-overlay demo (issue #16): `?regions=1` drops a few world-sized,
   // rotatable rects + a polygon at the view centre so the new glyph class can be
   // eyeballed against real tiles (dashed stroke, fill alpha, rotation, hit-test).
@@ -216,6 +246,7 @@ async function main(): Promise<void> {
   // released on navigation (beforeunload) and on Vite hot-module replacement
   // (import.meta.hot.dispose), which would otherwise leak across reloads.
   const teardown = (): void => {
+    window.removeEventListener('keydown', onGotoKey);
     controls.destroy();
     viewer.destroy();
     for (const p of pyramids.values()) p.destroy();

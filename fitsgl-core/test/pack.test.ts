@@ -52,6 +52,12 @@ describe('instance packing — the byte-layout source of truth', () => {
     expect(d[OFFSET_COLOR + 3]).toBeCloseTo(0.4, 6);
   });
 
+  it('packs the cross (go-to reticle) glyph as shape id 3', () => {
+    const d = packOne(marker({ shape: 'cross', size: 28, edgeWidth: 1.5 }));
+    expect(d[OFFSET_STYLE + 1]).toBe(SHAPE_IDS.cross);
+    expect(d[OFFSET_STYLE + 1]).toBe(3);
+  });
+
   it('packInstances interleaves markers contiguously', () => {
     const a = marker({ id: 'a', x: 1, y: 2, shape: 'point' });
     const b = marker({ id: 'b', x: 3, y: 4, shape: 'circle' });

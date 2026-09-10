@@ -213,6 +213,13 @@ describe('MarkerStore', () => {
   });
 
   it('SHAPE_IDS is the frag-shader branch contract', () => {
-    expect(SHAPE_IDS).toEqual({ point: 0, circle: 1, box: 2 });
+    expect(SHAPE_IDS).toEqual({ point: 0, circle: 1, box: 2, cross: 3 });
+  });
+
+  it('accepts the cross (go-to reticle) glyph as a shape', () => {
+    expect(isMarkerShape('cross')).toBe(true);
+    const store = new MarkerStore();
+    store.add([{ id: 'x', x: 1, y: 2, shape: 'cross' }], null);
+    expect(store.get('x')?.shape).toBe('cross');
   });
 });

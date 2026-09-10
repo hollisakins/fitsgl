@@ -34,6 +34,19 @@ export type {
 
 export { parseCatalogCSV, CATALOG_VERSION } from './catalog.js';
 
+// The go-to target: one sky-locked reticle the viewer pins at a coordinate. Kept
+// out of the marker store on purpose (never hit-tested, never replaced by a host's
+// `setMarkers`) — see `target.ts`.
+export {
+  resolveTarget,
+  targetMarker,
+  TARGET_ID,
+  DEFAULT_TARGET_SIZE,
+  DEFAULT_TARGET_EDGE,
+  DEFAULT_TARGET_COLOR,
+} from './target.js';
+export type { TargetInput, ResolvedTarget } from './target.js';
+
 // Pure helpers exposed for advanced hosts/tools (also covered by /internal intent).
 export { packInstances, packOne, INSTANCE_FLOATS, INSTANCE_STRIDE_BYTES } from './pack.js';
 export { GridIndex } from './spatial-index.js';
