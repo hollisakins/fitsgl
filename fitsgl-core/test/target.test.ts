@@ -100,6 +100,24 @@ describe('resolveTarget — insideImage', () => {
     expect(resolveTarget({ x: 100, y: 9000 }, null, IMAGE)?.insideImage).toBe(false);
   });
 
+  it('excludes the upper bounds, matching CursorInfo.insideImage', () => {
+    // The world domain is half-open: `[0, W) x [0, H)`. World W is the outer corner
+    // of the last pixel, where the viewer's cursor readout and tile-sampling gate
+    // (`world.x < nativeW`) find nothing, so a target there must read as outside or
+    // the host would suppress its "outside image" hint over unsamplable ground.
+    // Reachable from a pixel target: x = W - 0.5 resolves to world W exactly.
+    expect(resolveTarget({ x: IMAGE.width - 0.5, y: 100 }, null, IMAGE)?.x).toBe(IMAGE.width);
+    expect(resolveTarget({ x: IMAGE.width - 0.5, y: 100 }, null, IMAGE)?.insideImage).toBe(false);
+    expect(resolveTarget({ x: 100, y: IMAGE.height - 0.5 }, null, IMAGE)?.insideImage).toBe(false);
+    // The lower bound stays inclusive: world 0 is the first pixel's outer corner
+    // and samples pixel 0, exactly as the viewer's `world.x >= 0` allows.
+    expect(resolveTarget({ x: -0.5, y: 0 }, null, IMAGE)?.insideImage).toBe(true);
+    // The last samplable pixel's centre is inside.
+    expect(
+      resolveTarget({ x: IMAGE.width - 1, y: IMAGE.height - 1 }, null, IMAGE)?.insideImage,
+    ).toBe(true);
+  });
+
   it('is false when the image size is unknown — a target off the image is still placed', () => {
     const t = resolveTarget({ x: 100, y: 100 }, null, null);
     expect(t).not.toBeNull();

@@ -53,9 +53,12 @@ export interface ResolvedTarget {
   readonly color: ColorTuple;
   readonly edgeWidth: number;
   /**
-   * Whether the target lands within the mosaic's native bounds. A coordinate off
-   * the image is still a valid target (the reticle marks where it is on the sky, so
-   * a host can say "outside image" and offer fit-to-view) — false, never a drop.
+   * Whether the target lands within the mosaic's native bounds — the half-open
+   * world domain `[0, width) x [0, height)`, matching `CursorInfo.insideImage` and
+   * the viewer's tile-sampling gate (world `width` is the outer corner of the last
+   * pixel, so no pixel is samplable there). A coordinate off the image is still a
+   * valid target (the reticle marks where it is on the sky, so a host can say
+   * "outside image" and offer fit-to-view) — false, never a drop.
    */
   readonly insideImage: boolean;
 }
@@ -101,7 +104,7 @@ export function resolveTarget(
         ? input.edgeWidth
         : DEFAULT_TARGET_EDGE,
     insideImage:
-      image !== null && world.x >= 0 && world.x <= image.width && world.y >= 0 && world.y <= image.height,
+      image !== null && world.x >= 0 && world.x < image.width && world.y >= 0 && world.y < image.height,
   };
 }
 
