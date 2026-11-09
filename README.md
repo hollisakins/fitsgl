@@ -13,15 +13,11 @@ serves static files, and share a link.
 [![CI](https://github.com/hollisakins/fitsgl/actions/workflows/ci.yml/badge.svg)](https://github.com/hollisakins/fitsgl/actions/workflows/ci.yml)
 [![npm: @fitsgl/core](https://img.shields.io/npm/v/@fitsgl/core?label=%40fitsgl%2Fcore)](https://www.npmjs.com/package/@fitsgl/core)
 
-<!--
-  HERO: replace this comment with a screenshot or short GIF of the viewer on
-  real data, e.g.
-
-  <p align="center">
-    <a href="https://<live-example-url>"><img src="docs/assets/hero.png" width="860" alt="FitsGL viewer showing an RGB JWST mosaic"></a>
-    <br><em>Live example: <a href="https://<live-example-url>">COSMOS-Web in FitsGL</a></em>
-  </p>
--->
+<p align="center">
+  <img src="docs/assets/hero.jpg" width="900" alt="The FitsGL viewer zoomed into the COSMOS-Web JWST/NIRCam mosaic: a weighted six-band Trilogy composite, with the band rail, inspector panel, and a status bar reading out per-band pixel values and sky coordinates under the cursor.">
+  <br><sub>COSMOS-Web NIRCam composite (22 bands at 30 mas/pixel), streamed tile by tile from
+  <code>tiles.campfire-jwst.org</code> into the stock viewer. Nothing here was pre-rendered.</sub>
+</p>
 
 ## Why
 
