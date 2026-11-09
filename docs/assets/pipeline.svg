@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 934 230" width="934" height="230" role="img" aria-label="FitsGL pipeline: FITS mosaics are tiled by fitsgl build into fpacked pyramids, hosted on any static server or CDN, and decoded and rendered in the browser with WebGL2.">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7d8590"/>
+    </marker>
+    <style>
+      .box { fill: rgba(125,133,144,0.10); stroke: #7d8590; stroke-width: 1.5; rx: 10; }
+      .accent { fill: rgba(212,160,23,0.14); stroke: #d4a017; }
+      .title { font: 600 15px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #7d8590; }
+      .title.hi { fill: #c99700; }
+      .body { font: 12.5px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #7d8590; }
+      .mono { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #7d8590; }
+      .edge { stroke: #7d8590; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+      .label { font: 11.5px ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #7d8590; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <!-- 1. Input -->
+  <rect class="box" x="16" y="50" width="200" height="130"/>
+  <text class="title" x="32" y="78">FITS mosaics</text>
+  <text class="body" x="32" y="102">One file per band</text>
+  <text class="body" x="32" y="120">(JWST, HST, ground-based)</text>
+  <text class="body" x="32" y="146">Multi-GB mosaics are fine.</text>
+  <text class="body" x="32" y="164">Raw science data stays put.</text>
+
+  <!-- 2. Build -->
+  <rect class="box accent" x="258" y="50" width="200" height="130"/>
+  <text class="title hi" x="274" y="78">fitsgl build</text>
+  <text class="body" x="274" y="102">Multi-resolution pyramid,</text>
+  <text class="body" x="274" y="120">each level a standard</text>
+  <text class="mono" x="274" y="140">fpack .fits.fz</text>
+  <text class="body" x="274" y="164">+ manifest + bundled viewer</text>
+
+  <!-- 3. Host -->
+  <rect class="box" x="500" y="50" width="200" height="130"/>
+  <text class="title" x="516" y="78">Any static host</text>
+  <text class="body" x="516" y="102">Cloudflare R2 / S3 + CDN,</text>
+  <text class="body" x="516" y="120">a department web server,</text>
+  <text class="body" x="516" y="138">your laptop for previews.</text>
+  <text class="body" x="516" y="164">No backend to run.</text>
+
+  <!-- 4. Browser -->
+  <rect class="box accent" x="742" y="50" width="176" height="130"/>
+  <text class="title hi" x="758" y="78">Browser</text>
+  <text class="body" x="758" y="102">Range requests fetch</text>
+  <text class="body" x="758" y="120">only the visible tiles,</text>
+  <text class="body" x="758" y="138">RICE-decoded in workers,</text>
+  <text class="body" x="758" y="164">rendered with WebGL2.</text>
+
+  <!-- Edges -->
+  <path class="edge" d="M 216 115 L 256 115"/>
+  <path class="edge" d="M 458 115 L 498 115"/>
+  <path class="edge" d="M 700 115 L 740 115"/>
+
+  <text class="label" x="236" y="104">tile</text>
+  <text class="label" x="478" y="104">deploy</text>
+  <text class="label" x="720" y="104">stream</text>
+
+  <!-- Footer -->
+  <text class="label" x="467" y="212">Real float pixels end to end: the viewer reads values, WCS and headers from the same FITS tiles a server-side cutout would.</text>
+</svg>
